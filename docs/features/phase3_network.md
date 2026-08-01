@@ -32,6 +32,18 @@ back on the same socket in a trailing 8-byte frame (client computes GiB/s
 from received-side count). Server handles clients sequentially; exits on
 shutdown frame.
 
+The bandwidth window runs from the first write until the trailing count
+arrives, not until half-close: bytes still in flight when the client stops
+writing are part of the transfer, and crediting them for free would inflate
+high-BDP links. Counting on the receiver is what makes `bytes_sent` mean
+bytes that actually landed. `serve` binds 0.0.0.0, sets TCP_NODELAY on both
+ends, logs and skips a client that dies mid-session, and returns Ok only on
+the shutdown frame; the client modes print their report as one JSON line on
+stdout while `serve` prints nothing. Connects are bounded by a 10s timeout,
+so an unreachable peer errors instead of stalling its round. Percentiles are
+nearest-rank over the sorted sample vector, which makes p50 ≤ p99 ≤ max hold
+by construction.
+
 ## Scheduling invariants (schedule.rs)
 - `tournament_rounds(n)`: every unordered pair exactly once; no host twice
   in a round; round count n-1 (even n) / n (odd n); pairs `(a,b)` a<b.
