@@ -91,7 +91,7 @@ Features Index:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
       overlay, run history, terminal table, exit codes.
-    entry_points: [report.rs, orchestrator/collect.rs]
+    entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
     doc: docs/features/reporting.md
 ```
