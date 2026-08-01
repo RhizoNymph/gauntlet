@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "=1.0.104"
+# NCCL unique-id transport (128 raw bytes -> JSON string); gpu-only.
+base64 = { version = "=0.22.1", optional = true }
 clap = { version = "=4.6.5", features = ["derive"] }
 comfy-table = "=7.2.2"
 core_affinity = "=0.8.3"
@@ -18,6 +20,8 @@ cudarc = { version = "=0.19.8", optional = true, default-features = false, featu
     # runs an older driver stack than CUDA 12.4.
     "cuda-12040",
 ] }
+# f16/bf16 host-side conversion for the reduced-precision GEMMs; gpu-only.
+half = { version = "=2.7.1", optional = true }
 openssh = { version = "=0.11.6", features = ["native-mux"] }
 openssh-sftp-client = "=0.15.7"
 rayon = "=1.12.0"
@@ -32,7 +36,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [features]
 default = ["gpu"]
-gpu = ["dep:cudarc"]
+gpu = ["dep:cudarc", "dep:half", "dep:base64"]
 
 [profile.release]
 lto = true
