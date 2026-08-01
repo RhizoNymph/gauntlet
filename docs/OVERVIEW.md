@@ -14,10 +14,11 @@ Overview:
   subsystems:
     orchestrator: >
       Runs on the operator's machine (`gauntlet run`). Tokio task per host,
-      persistent ssh sessions via the `openssh` crate (ControlMaster
-      multiplexing, respects ~/.ssh/config). Deploys the agent (scp of the
-      statically-linked self, skipped when remote hash matches), drives the
-      phase schedule, aggregates results over an mpsc channel.
+      persistent ssh sessions via the `openssh` crate (native-mux
+      ControlMaster multiplexing, respects ~/.ssh/config). Deploys the agent
+      (sftp upload of the running binary, staged then renamed, skipped when
+      the remote sha256 matches), drives the phase schedule, aggregates
+      results over an mpsc channel into a single lock-free collector task.
     agent: >
       Same binary in `gauntlet agent` mode, executed on each node. Built for
       glibc (static musl cannot dlopen, which cudarc requires; a musl build
@@ -84,7 +85,7 @@ Features Index:
       mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
       -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
       t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, orchestrator/schedule.rs]
+    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
   reporting:
