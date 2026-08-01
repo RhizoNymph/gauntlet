@@ -365,6 +365,7 @@ dependencies = [
  "comfy-table",
  "core_affinity",
  "cudarc",
+ "libc",
  "openssh",
  "openssh-sftp-client",
  "rayon",
