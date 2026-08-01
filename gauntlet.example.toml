@@ -1,0 +1,33 @@
+# Example fleet config for `gauntlet run -c gauntlet.toml`.
+
+[ssh]
+# user = "ubuntu"              # default: ~/.ssh/config resolution
+# key = "~/.ssh/id_ed25519"
+remote_dir = "~/.gauntlet"
+connect_timeout_secs = 10
+max_concurrent = 32
+
+# Hosts: bare strings or tables with labels.
+hosts = [
+    "10.0.0.1",
+    "10.0.0.2",
+    { addr = "10.0.0.3", labels = { rack = "r2", role = "trainer" } },
+]
+
+[tests]
+phases = ["inventory", "cpu_mem", "gpu", "network"]
+phase_timeout_secs = 900
+gemm_secs = 30
+gemm_dim = 8192
+gemm_dtypes = ["f32", "bf16", "f16"]
+disk_paths = ["/tmp"]
+net_port_base = 29500
+
+[thresholds]
+mad_k = 4.0
+# Optional absolute floors/ceilings, keyed "<test>.<metric>":
+# [thresholds.absolute."gpu_gemm_perf.gflops_bf16"]
+# min = 500000.0
+
+[nccl]
+# socket_ifname = "eth0"       # NCCL_SOCKET_IFNAME for multi-homed nodes

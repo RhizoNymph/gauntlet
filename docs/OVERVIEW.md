@@ -19,11 +19,13 @@ Overview:
       statically-linked self, skipped when remote hash matches), drives the
       phase schedule, aggregates results over an mpsc channel.
     agent: >
-      Same binary in `gauntlet agent` mode, executed on each node. Static musl
-      build; zero node-side dependencies. GPU tests use cudarc, which dlopens
-      libcuda/libcublas/libnccl at runtime (no build-time CUDA toolchain, no
-      node install beyond the driver stack). Emits JSON-lines events over
-      stdout. Has a peer mode for two-sided network tests (listen / connect).
+      Same binary in `gauntlet agent` mode, executed on each node. Built for
+      glibc (static musl cannot dlopen, which cudarc requires; a musl build
+      only makes sense with --no-default-features). GPU tests use cudarc with
+      dynamic-loading + the cuda-12040 API baseline: libcuda/libcublas/libnccl
+      are dlopened at runtime (no build-time CUDA toolchain, no node install
+      beyond the driver stack). Emits JSON-lines events over stdout. Has peer
+      (two-sided TCP tests) and nccl subcommand modes.
     scheduler: >
       Phase DAG. Phases 0-2 are embarrassingly parallel across nodes. Phase 3
       pairwise tests use round-robin tournament scheduling: n-1 rounds of n/2
@@ -41,6 +43,15 @@ Overview:
     and agent; protocol is versioned and the agent announces its version first.
 
 Features Index:
+  bootstrap:
+    description: >
+      `gauntlet bootstrap`: connectivity check, arch check, agent deploy,
+      capability probe (agent probe -> InventorySnapshot), optional --tune
+      (GPU persistence mode, performance governor). Renders a host x check
+      readiness matrix; idempotent.
+    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
+    depends_on: []
+    doc: docs/features/bootstrap.md
   phase0_inventory:
     description: >
       Inventory and sanity: kernel/driver/CUDA/NIC-firmware/MTU/governor/NUMA
