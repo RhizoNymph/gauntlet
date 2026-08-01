@@ -1,0 +1,161 @@
+mod common;
+
+use gauntlet::proto::{
+    AgentEvent, InventorySnapshot, LogLevel, MetricRecord, PROTO_VERSION, Phase, ProtoError, Scope,
+    TestId, TestOutcome, Unit, consistency_fields, decode_event, encode_event, expect_hello,
+};
+
+fn sample_inventory() -> InventorySnapshot {
+    InventorySnapshot {
+        hostname: "node1".into(),
+        kernel: "6.8.0".into(),
+        cpu_model: "EPYC 9654".into(),
+        logical_cores: 192,
+        numa_nodes: 2,
+        mem_total_bytes: 1 << 40,
+        cpu_governor: Some("performance".into()),
+        clock_offset_ms: Some(0.03),
+        nvidia_driver: Some("560.35.03".into()),
+        cuda_version: Some("12.6".into()),
+        gpus: vec![],
+        nics: vec![],
+        ib_ports: vec![],
+        xid_errors: vec![79],
+    }
+}
+
+#[test]
+fn events_round_trip() {
+    let events = vec![
+        AgentEvent::Hello {
+            proto_version: PROTO_VERSION,
+            hostname: "node1".into(),
+        },
+        AgentEvent::PhaseStart {
+            phase: Phase::CpuMem,
+        },
+        AgentEvent::Inventory {
+            snapshot: sample_inventory(),
+        },
+        AgentEvent::Metric {
+            record: MetricRecord {
+                test: TestId::MemBandwidth,
+                scope: Scope::Numa { node: 1 },
+                name: "triad".into(),
+                value: 210.5,
+                unit: Unit::GibPerSec,
+            },
+        },
+        AgentEvent::Outcome {
+            test: TestId::CpuCorrectness,
+            scope: Scope::Core { id: 17 },
+            outcome: TestOutcome::Failed {
+                reason: "checksum mismatch after 412 rounds".into(),
+            },
+        },
+        AgentEvent::Log {
+            level: LogLevel::Warn,
+            message: "chrony not found".into(),
+        },
+        AgentEvent::PhaseEnd {
+            phase: Phase::CpuMem,
+        },
+        AgentEvent::Fatal {
+            message: "boom".into(),
+        },
+    ];
+    for event in events {
+        let line = encode_event(&event);
+        assert!(!line.contains('\n'), "one event per line: {line}");
+        let back = decode_event(&line).expect("round trip");
+        assert_eq!(back, event);
+    }
+}
+
+/// Wire-format stability: this exact JSON must keep decoding. Breaking this
+/// test means PROTO_VERSION must be bumped.
+#[test]
+fn wire_format_is_stable() {
+    let line = r#"{"event":"metric","test":"gpu_gemm_perf","scope":{"kind":"gpu","index":3},"name":"gflops_bf16","value":712000.0,"unit":"gflops"}"#;
+    let event = decode_event(line).expect("stable wire format");
+    match event {
+        AgentEvent::Metric { record } => {
+            assert_eq!(record.test, TestId::GpuGemmPerf);
+            assert_eq!(record.scope, Scope::Gpu { index: 3 });
+            assert_eq!(record.name, "gflops_bf16");
+            assert_eq!(record.unit, Unit::Gflops);
+        }
+        other => panic!("expected metric, got {other:?}"),
+    }
+}
+
+#[test]
+fn hello_validation() {
+    let ok = AgentEvent::Hello {
+        proto_version: PROTO_VERSION,
+        hostname: "n1".into(),
+    };
+    assert_eq!(expect_hello(&ok).expect("valid hello"), "n1");
+
+    let stale = AgentEvent::Hello {
+        proto_version: PROTO_VERSION + 1,
+        hostname: "n1".into(),
+    };
+    assert!(matches!(
+        expect_hello(&stale),
+        Err(ProtoError::VersionMismatch { .. })
+    ));
+
+    let not_hello = AgentEvent::PhaseStart {
+        phase: Phase::Inventory,
+    };
+    assert!(matches!(
+        expect_hello(&not_hello),
+        Err(ProtoError::MissingHello { .. })
+    ));
+}
+
+#[test]
+fn malformed_lines_error() {
+    assert!(decode_event("not json").is_err());
+    assert!(decode_event(r#"{"event":"warp"}"#).is_err());
+}
+
+#[test]
+fn consistency_fields_cover_version_skew_sources() {
+    let inv = sample_inventory();
+    let fields = consistency_fields(&inv);
+    assert_eq!(fields.get("kernel").map(String::as_str), Some("6.8.0"));
+    assert_eq!(
+        fields.get("nvidia_driver").map(String::as_str),
+        Some("560.35.03")
+    );
+    assert_eq!(fields.get("cuda_version").map(String::as_str), Some("12.6"));
+    assert_eq!(fields.get("gpu_count").map(String::as_str), Some("0"));
+}
+
+#[test]
+fn event_sink_is_thread_safe_and_line_delimited() {
+    let (sink, buf) = common::capturing_sink();
+    let sink = std::sync::Arc::new(sink);
+    std::thread::scope(|scope| {
+        for thread_id in 0..8u32 {
+            let sink = sink.clone();
+            scope.spawn(move || {
+                for i in 0..50u32 {
+                    sink.metric(MetricRecord {
+                        test: TestId::CpuGflops,
+                        scope: Scope::Core {
+                            id: thread_id * 100 + i,
+                        },
+                        name: "gflops".into(),
+                        value: 42.0,
+                        unit: Unit::Gflops,
+                    });
+                }
+            });
+        }
+    });
+    let events = common::decode_events(&buf);
+    assert_eq!(events.len(), 400, "no torn or interleaved lines");
+}

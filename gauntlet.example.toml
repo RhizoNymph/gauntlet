@@ -1,18 +1,19 @@
 # Example fleet config for `gauntlet run -c gauntlet.toml`.
 
+# Hosts: bare strings or tables with labels. Must appear before any [table]
+# header (top-level TOML key).
+hosts = [
+    "10.0.0.1",
+    "10.0.0.2",
+    { addr = "10.0.0.3", labels = { rack = "r2", role = "trainer" } },
+]
+
 [ssh]
 # user = "ubuntu"              # default: ~/.ssh/config resolution
 # key = "~/.ssh/id_ed25519"
 remote_dir = "~/.gauntlet"
 connect_timeout_secs = 10
 max_concurrent = 32
-
-# Hosts: bare strings or tables with labels.
-hosts = [
-    "10.0.0.1",
-    "10.0.0.2",
-    { addr = "10.0.0.3", labels = { rack = "r2", role = "trainer" } },
-]
 
 [tests]
 phases = ["inventory", "cpu_mem", "gpu", "network"]
