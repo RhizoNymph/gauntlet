@@ -211,13 +211,13 @@ fn disk_run_scopes_by_path() {
     let mut saw_read = false;
     let mut saw_write = false;
     for event in &events {
-        if let AgentEvent::Metric { record } = event {
-            if record.test == TestId::DiskIo {
-                assert!(matches!(&record.scope, Scope::Disk { path } if !path.is_empty()));
-                assert_eq!(record.unit, Unit::GibPerSec);
-                saw_read |= record.name == "seq_read";
-                saw_write |= record.name == "seq_write";
-            }
+        if let AgentEvent::Metric { record } = event
+            && record.test == TestId::DiskIo
+        {
+            assert!(matches!(&record.scope, Scope::Disk { path } if !path.is_empty()));
+            assert_eq!(record.unit, Unit::GibPerSec);
+            saw_read |= record.name == "seq_read";
+            saw_write |= record.name == "seq_write";
         }
     }
     assert!(saw_read && saw_write, "both directions reported");

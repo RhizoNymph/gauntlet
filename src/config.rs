@@ -198,7 +198,7 @@ impl FleetConfig {
                 return Err(ConfigError::DuplicateHost { addr: host.addr });
             }
         }
-        if !(self.thresholds.mad_k > 0.0) {
+        if self.thresholds.mad_k.is_nan() || self.thresholds.mad_k <= 0.0 {
             return Err(ConfigError::BadMadK {
                 got: self.thresholds.mad_k,
             });

@@ -60,8 +60,10 @@ fn fleet() -> (FleetConfig, BTreeMap<String, HostObservations>) {
             _ => 200.0 + i as f64, // healthy spread
         };
         let kernel = if *name == "n3" { "6.9.0" } else { "6.8.0" };
-        let mut obs = HostObservations::default();
-        obs.inventory = Some(inventory(name, kernel));
+        let mut obs = HostObservations {
+            inventory: Some(inventory(name, kernel)),
+            ..HostObservations::default()
+        };
         obs.metrics.push(node_metric(
             TestId::MemBandwidth,
             "triad",

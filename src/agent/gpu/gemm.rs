@@ -33,10 +33,15 @@ use crate::agent::EventSink;
 use crate::proto::{GemmDtype, GpuTaskSpec, MetricRecord, Scope, TestId, TestOutcome, Unit};
 
 /// Per-dtype residual tolerance for correctness classification.
+///
+/// tf32 inputs are not host-rounded (FAST_TF32 is a permission, not a
+/// guarantee), so a healthy tensor-core GEMM carries the in-kernel 10-bit
+/// mantissa rounding: ~1e-3 at gemm_dim 2048. The tolerance leaves ~2x
+/// headroom over that while staying an order of magnitude under f16.
 pub fn residual_tolerance(dtype: GemmDtype) -> f64 {
     match dtype {
         GemmDtype::F32 => 1e-5,
-        GemmDtype::Tf32 => 5e-4,
+        GemmDtype::Tf32 => 2e-3,
         GemmDtype::Bf16 => 5e-2,
         GemmDtype::F16 => 5e-3,
     }

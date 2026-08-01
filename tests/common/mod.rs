@@ -1,4 +1,9 @@
 //! Shared helpers for integration tests.
+//
+// Each test binary compiles this module independently and none uses every
+// helper, so per-binary dead-code analysis would flag whichever ones it
+// skipped.
+#![allow(dead_code)]
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
