@@ -22,7 +22,8 @@ started, finished)`:
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any outliers/violations; else Clean. Exit codes 2/1/0.
+   any test outcome is Failed or any outliers/violations exist; else Clean.
+   Exit codes 2/1/0.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
 over the finish timestamp and the host set (deterministic, no rand dep).

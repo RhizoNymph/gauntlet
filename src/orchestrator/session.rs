@@ -233,6 +233,9 @@ impl HostSession {
     ) -> Result<ExitStatus> {
         let mut command = self.session.command(self.agent_path.clone());
         command
+            // The deployed binary is the full multi-command CLI; node-side
+            // modes all live under its `agent` subcommand.
+            .arg("agent")
             .args(args.iter().copied())
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
@@ -317,6 +320,9 @@ impl HostSession {
     ) -> Result<RemoteOutput> {
         let mut command = self.session.command(self.agent_path.clone());
         command
+            // The deployed binary is the full multi-command CLI; node-side
+            // modes all live under its `agent` subcommand.
+            .arg("agent")
             .args(args.iter().copied())
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
@@ -361,6 +367,7 @@ impl HostSession {
     pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
         let mut command = Arc::clone(&self.session).arc_command(self.agent_path.clone());
         command
+            .arg("agent")
             .args(args.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())

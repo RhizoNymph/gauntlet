@@ -40,7 +40,11 @@ use crate::proto::{GemmDtype, GpuTaskSpec, MetricRecord, Scope, TestId, TestOutc
 /// headroom over that while staying an order of magnitude under f16.
 pub fn residual_tolerance(dtype: GemmDtype) -> f64 {
     match dtype {
-        GemmDtype::F32 => 1e-5,
+        // Accumulation error grows ~sqrt(K): a healthy GPU shows ~2.4e-5 at
+        // gemm_dim 4096 (identical across nodes — it is deterministic
+        // rounding, not hardware). 1e-4 keeps headroom to dim ~16k while
+        // still catching real corruption, which is orders of magnitude off.
+        GemmDtype::F32 => 1e-4,
         GemmDtype::Tf32 => 2e-3,
         GemmDtype::Bf16 => 5e-2,
         GemmDtype::F16 => 5e-3,

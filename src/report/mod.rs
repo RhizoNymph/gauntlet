@@ -87,7 +87,7 @@ pub struct NodeRoofline {
 pub enum Verdict {
     /// 0: all hosts completed, no outliers, no violations.
     Clean,
-    /// 1: completed with outliers or threshold violations.
+    /// 1: completed with failed tests, outliers, or threshold violations.
     Stragglers,
     /// 2: at least one host failed to complete.
     HostFailures,
@@ -233,6 +233,11 @@ pub fn verdict(results: &RunResults) -> Verdict {
     if !results.fleet.failed_hosts.is_empty() {
         return Verdict::HostFailures;
     }
+    let has_failed_tests = results.hosts.values().any(|obs| {
+        obs.outcomes
+            .iter()
+            .any(|(_, _, outcome)| matches!(outcome, crate::proto::TestOutcome::Failed { .. }))
+    });
     let has_outliers = results
         .fleet
         .outliers
@@ -243,7 +248,7 @@ pub fn verdict(results: &RunResults) -> Verdict {
         .threshold_violations
         .values()
         .any(|violators| !violators.is_empty());
-    if has_outliers || has_violations {
+    if has_failed_tests || has_outliers || has_violations {
         Verdict::Stragglers
     } else {
         Verdict::Clean
