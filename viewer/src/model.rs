@@ -438,7 +438,13 @@ fn roofline_stats(roofline: &NodeRoofline) -> Vec<(String, String)> {
 /// Unit-aware value rendering shared by the table and detail cards.
 pub fn format_value(unit: Unit, value: f64) -> String {
     match unit {
-        Unit::Gflops => format!("{value:.0} GFLOPS"),
+        Unit::Gflops => {
+            if value.abs() >= 10.0 {
+                format!("{value:.0} GFLOPS")
+            } else {
+                format!("{value:.2} GFLOPS")
+            }
+        }
         Unit::GibPerSec => format!("{value:.2} GiB/s"),
         Unit::Micros => format!("{value:.1} µs"),
         Unit::Millis => format!("{value:.2} ms"),

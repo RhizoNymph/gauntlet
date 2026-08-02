@@ -392,6 +392,7 @@ fn deviation_is_computed_for_unflagged_rows() {
 fn format_value_uses_unit_labels() {
     assert_eq!(format_value(Unit::GibPerSec, 1.234), "1.23 GiB/s");
     assert_eq!(format_value(Unit::Gflops, 620.4), "620 GFLOPS");
+    assert_eq!(format_value(Unit::Gflops, 0.42), "0.42 GFLOPS");
     assert_eq!(format_value(Unit::Micros, 88.25), "88.2 µs");
     assert_eq!(format_value(Unit::Celsius, 71.0), "71 °C");
     assert_eq!(format_value(Unit::Mhz, 2520.0), "2520 MHz");

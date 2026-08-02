@@ -23,6 +23,9 @@ struct Args {
     /// Fleet config passed to `gauntlet run` for GUI-launched runs.
     #[arg(long, default_value = "gauntlet.toml")]
     config: PathBuf,
+    /// Start in diff mode (vs the previous run, until a baseline is pinned).
+    #[arg(long)]
+    diff: bool,
 }
 
 fn main() -> Result<()> {
@@ -37,6 +40,7 @@ fn main() -> Result<()> {
         }
     }
     let config_path = args.config;
+    let start_in_diff = args.diff;
 
     Application::new().run(move |cx: &mut App| {
         cx.on_window_closed(|cx| {
@@ -64,6 +68,7 @@ fn main() -> Result<()> {
                     runs_dir.clone(),
                     config_path.clone(),
                     initial_file.clone(),
+                    start_in_diff,
                     cx,
                 )
             })

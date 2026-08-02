@@ -107,13 +107,19 @@ impl RootView {
                             row.child(chip(OK, "no regressions".into()))
                         })
                         .when(warned > 0, |row| {
-                            row.child(chip(WARN, format!("{warned} nodes >5% worse")))
+                            row.child(chip(WARN, format!("{} >5% worse", nodes_label(warned))))
                         })
                         .when(failed > 0, |row| {
-                            row.child(chip(BAD, format!("{failed} nodes >15% worse")))
+                            row.child(chip(BAD, format!("{} >15% worse", nodes_label(failed))))
                         })
                         .when(regressed_links > 0, |row| {
-                            row.child(chip(WARN, format!("{regressed_links} links regressed")))
+                            row.child(chip(
+                                WARN,
+                                format!(
+                                    "{regressed_links} link{} regressed",
+                                    if regressed_links == 1 { "" } else { "s" }
+                                ),
+                            ))
                         }),
                 );
         } else {
@@ -431,6 +437,10 @@ fn render_row(row: &MetricRow, delta: Option<&RowDelta>, diff_mode: bool) -> Div
         .child(cell_subject(row.subject.clone()))
         .child(cell_value(format_value(row.unit, row.value)).text_color(rgb(value_color)))
         .child(cell_dev(last_text).text_color(rgb(last_color)))
+}
+
+fn nodes_label(count: usize) -> String {
+    format!("{count} node{}", if count == 1 { "" } else { "s" })
 }
 
 fn issues_list(issues: &[Issue], empty_text: &str) -> Div {

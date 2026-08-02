@@ -98,6 +98,7 @@ impl RootView {
         runs_dir: PathBuf,
         config_path: PathBuf,
         initial_file: Option<PathBuf>,
+        start_in_diff: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let poll = cx.spawn(async move |this, cx| {
@@ -117,7 +118,7 @@ impl RootView {
             current_fingerprint: None,
             pinned_baseline: None,
             baseline: None,
-            diff_enabled: false,
+            diff_enabled: start_in_diff,
             diff: None,
             selection: None,
             graph_bounds: None,
@@ -135,6 +136,7 @@ impl RootView {
                 }
             }
         }
+        view.refresh_diff();
         view
     }
 
