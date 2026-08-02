@@ -11,7 +11,8 @@ use gpui::{
 use gauntlet::proto::Unit;
 
 use super::{
-    BAD, MUTED, OK, PANEL, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN, severity_color,
+    BAD, BG, MUTED, OK, PANEL, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN,
+    severity_color,
 };
 use crate::diff::RowDelta;
 use crate::model::{EdgeView, Issue, MetricRow, NodeView, Severity, format_value};
@@ -123,23 +124,37 @@ impl RootView {
                         }),
                 );
         } else {
-            let count =
-                |severity: Severity| vm.nodes.iter().filter(|n| n.severity == severity).count();
-            let (healthy, warned, failed) = (
-                count(Severity::Ok),
-                count(Severity::Warn),
-                count(Severity::Bad),
-            );
+            // Chips split by cause: performance findings vs version skew,
+            // so "outliers" never means "merely unpatched".
+            let healthy = vm
+                .nodes
+                .iter()
+                .filter(|n| n.severity == Severity::Ok)
+                .count();
+            let perf_warned = vm
+                .nodes
+                .iter()
+                .filter(|n| n.perf_severity == Severity::Warn)
+                .count();
+            let failed = vm
+                .nodes
+                .iter()
+                .filter(|n| n.perf_severity == Severity::Bad)
+                .count();
+            let skewed = vm.nodes.iter().filter(|n| n.skew).count();
             card = card.child(title("fleet overview")).child(
                 div()
                     .flex()
                     .gap_2()
                     .child(chip(OK, format!("{healthy} healthy")))
-                    .when(warned > 0, |row| {
-                        row.child(chip(WARN, format!("{warned} outliers")))
+                    .when(perf_warned > 0, |row| {
+                        row.child(chip(WARN, format!("{perf_warned} perf outliers")))
                     })
                     .when(failed > 0, |row| {
                         row.child(chip(BAD, format!("{failed} failed")))
+                    })
+                    .when(skewed > 0, |row| {
+                        row.child(chip(WARN, format!("{skewed} version skew")))
                     }),
             );
         }
@@ -194,18 +209,28 @@ impl RootView {
             (&node.issues, "no findings")
         };
 
+        let hollow = !self.diff_active() && node.skew_only();
+        let dot = if hollow {
+            div()
+                .w(px(12.0))
+                .h(px(12.0))
+                .rounded_full()
+                .bg(rgb(BG))
+                .border_1()
+                .border_color(rgb(severity_color(severity)))
+        } else {
+            div()
+                .w(px(12.0))
+                .h(px(12.0))
+                .rounded_full()
+                .bg(rgb(severity_color(severity)))
+        };
         let mut card = div().flex().flex_col().gap_2().p_3().child(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(
-                    div()
-                        .w(px(12.0))
-                        .h(px(12.0))
-                        .rounded_full()
-                        .bg(rgb(severity_color(severity))),
-                )
+                .child(dot)
                 .child(title(
                     node.hostname.clone().unwrap_or_else(|| node.host.clone()),
                 ))

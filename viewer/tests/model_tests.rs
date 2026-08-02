@@ -130,6 +130,8 @@ fn fatal_error_marks_node_bad() {
     assert_eq!(vm.verdict, Verdict::HostFailures);
     let n = node(&vm, "a");
     assert_eq!(n.severity, Severity::Bad);
+    assert_eq!(n.perf_severity, Severity::Bad);
+    assert!(!n.skew && !n.skew_only());
     assert!(
         n.issues
             .iter()
@@ -250,6 +252,9 @@ fn consistency_dissent_marks_node_warn() {
 
     let c = node(&vm, "c");
     assert_eq!(c.severity, Severity::Warn);
+    assert_eq!(c.perf_severity, Severity::Ok, "skew is not a perf finding");
+    assert!(c.skew);
+    assert!(c.skew_only());
     assert!(c.issues.iter().any(|(s, text)| {
         *s == Severity::Warn && text.contains("kernel") && text.contains("5.15.0")
     }));
@@ -411,4 +416,41 @@ fn run_metadata_is_projected() {
     let vm = ViewModel::new(&results);
     assert_eq!(vm.run_id, results.run_id);
     assert_eq!(vm.wall_secs, 60);
+}
+
+#[test]
+fn outlier_plus_skew_is_not_skew_only() {
+    let config = config("hosts = [\"a\", \"b\", \"c\", \"d\"]\n[thresholds]\nmad_k = 3.0\n");
+    let mut hosts = BTreeMap::new();
+    for (host, gflops, kernel) in [
+        ("a", 100.0, "6.1.0"),
+        ("b", 101.0, "6.1.0"),
+        ("c", 102.0, "6.1.0"),
+        // d is both a performance straggler and a kernel dissenter.
+        ("d", 50.0, "5.15.0"),
+    ] {
+        let mut obs = HostObservations::default();
+        obs.metrics.push(metric(
+            TestId::CpuGflops,
+            Scope::Node,
+            "gflops_allcore",
+            gflops,
+            Unit::Gflops,
+        ));
+        obs.inventory = Some(inventory(&format!("node-{host}"), kernel));
+        hosts.insert(host.to_string(), obs);
+    }
+    let vm = ViewModel::new(&results(&config, hosts));
+
+    let d = node(&vm, "d");
+    assert_eq!(d.severity, Severity::Warn);
+    assert_eq!(d.perf_severity, Severity::Warn);
+    assert!(d.skew);
+    assert!(
+        !d.skew_only(),
+        "a slow *and* skewed node is not ring-styled"
+    );
+    let a = node(&vm, "a");
+    assert_eq!(a.perf_severity, Severity::Ok);
+    assert!(!a.skew && a.severity == Severity::Ok);
 }

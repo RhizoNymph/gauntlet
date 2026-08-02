@@ -29,9 +29,13 @@ connected fleet graph plus a quantitative metric table.
   baseline run (pinned via the sidebar, else the previous finished run);
   the table's deviation column becomes Δ% vs baseline.
 - Fleet graph: nodes on a ring, one edge per host pair. Node color encodes
-  host health (green ok / amber outlier-or-skew / red failed); edge color
-  encodes pairwise-path health the same way. Edge midpoints show worst-case
-  direction bandwidth.
+  host health: green ok, amber = performance outlier or threshold
+  violation, red = failed/errored. Nodes whose only findings are version
+  skew (inventory consistency dissent) render as hollow amber rings — the
+  fleet-card chips split the same way ("perf outliers" vs "version skew"),
+  so skew never masquerades as a straggler. Edge color encodes
+  pairwise-path health; edge midpoints show worst-case direction
+  bandwidth.
 - Click a node or edge to see its findings (issues, roofline digest,
   per-direction bandwidth/RTT) and filter the metric table to that subject.
 - Metric table: every fleet-comparable metric with per-sample deviation from

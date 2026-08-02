@@ -30,10 +30,25 @@ pub struct NodeView {
     pub host: String,
     /// Hostname reported by inventory, when the host got that far.
     pub hostname: Option<String>,
+    /// Worst finding of any kind; `max(perf_severity, skew as Warn)`.
     pub severity: Severity,
+    /// Worst *performance* finding (errors, failed tests, outliers,
+    /// threshold violations) — version skew excluded, so a node that is
+    /// merely unpatched stays `Ok` here.
+    pub perf_severity: Severity,
+    /// Any inventory consistency dissent (kernel/driver/VBIOS/... skew).
+    pub skew: bool,
     pub issues: Vec<Issue>,
     /// Roofline digest: (label, formatted value) pairs.
     pub stats: Vec<(String, String)>,
+}
+
+impl NodeView {
+    /// The node's only findings are version skew: rendered as a hollow
+    /// ring rather than a solid warning fill.
+    pub fn skew_only(&self) -> bool {
+        self.skew && self.perf_severity == Severity::Ok
+    }
 }
 
 /// A per-direction reading on an undirected edge; `from_a` was measured by
@@ -122,6 +137,8 @@ impl ViewModel {
                         host: host.clone(),
                         hostname: obs.inventory.as_ref().map(|inv| inv.hostname.clone()),
                         severity: Severity::Ok,
+                        perf_severity: Severity::Ok,
+                        skew: false,
                         issues: Vec::new(),
                         stats: results
                             .calibration
@@ -228,9 +245,8 @@ impl ViewModel {
         for (field, finding) in &results.fleet.consistency {
             for (host, value) in &finding.dissenters {
                 if let Some(node) = nodes.get_mut(host) {
-                    note(
+                    note_skew(
                         node,
-                        Severity::Warn,
                         format!(
                             "inventory {field}: {value:?} (majority {:?})",
                             finding.majority_value
@@ -267,9 +283,18 @@ impl ViewModel {
     }
 }
 
+/// Record a performance finding (error, failed test, outlier, violation).
 fn note(node: &mut NodeView, severity: Severity, text: String) {
     node.severity = node.severity.max(severity);
+    node.perf_severity = node.perf_severity.max(severity);
     node.issues.push((severity, text));
+}
+
+/// Record version skew: warns the node without touching `perf_severity`.
+fn note_skew(node: &mut NodeView, text: String) {
+    node.skew = true;
+    node.severity = node.severity.max(Severity::Warn);
+    node.issues.push((Severity::Warn, text));
 }
 
 fn bump(edge: &mut EdgeView, severity: Severity, text: String) {
