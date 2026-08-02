@@ -48,7 +48,7 @@ pub struct HostReadiness {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReadinessCheck {
-    /// "connectivity", "arch", "deploy", "gpu_driver", "clock_sync",
+    /// "connectivity", "arch", "deploy", "gpu_driver", "gpu_libs", "clock_sync",
     /// "persistence_mode", "governor", ...
     pub name: String,
     pub status: CheckStatus,
@@ -283,11 +283,42 @@ fn arch_check(uname_machine: &str, local_arch: &str) -> ReadinessCheck {
 fn readiness_checks(inventory: &InventorySnapshot) -> Vec<ReadinessCheck> {
     vec![
         gpu_driver_check(inventory),
+        gpu_libs_check(inventory),
         clock_sync_check(inventory),
         ib_ports_check(inventory),
         governor_check(inventory),
         persistence_mode_check(inventory),
     ]
+}
+
+/// Runtime loadability of the GPU library stack, from the agent's dlopen
+/// probe. Only advisory: the run degrades per phase, but an operator wants
+/// to know *before* the run that the NCCL sweep has nothing to work with.
+fn gpu_libs_check(inventory: &InventorySnapshot) -> ReadinessCheck {
+    if inventory.gpus.is_empty() {
+        return ReadinessCheck::ok("gpu_libs", "no GPUs (n/a)");
+    }
+    let missing: Vec<&str> = inventory
+        .gpu_libs
+        .iter()
+        .filter(|(_, available)| !**available)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if inventory.gpu_libs.is_empty() {
+        ReadinessCheck::warn("gpu_libs", "agent reported no library probe data")
+    } else if missing.is_empty() {
+        ReadinessCheck::ok("gpu_libs", "cuda, cublas, nccl loadable")
+    } else {
+        let phases: &str = if missing == ["nccl"] {
+            "NCCL sweep unavailable"
+        } else {
+            "GPU phases will fail"
+        };
+        ReadinessCheck::warn(
+            "gpu_libs",
+            format!("not loadable: {}; {phases}", missing.join(", ")),
+        )
+    }
 }
 
 fn gpu_driver_check(inventory: &InventorySnapshot) -> ReadinessCheck {
@@ -560,6 +591,10 @@ mod tests {
                 link_downed_count: Some(0),
             }],
             xid_errors: Vec::new(),
+            gpu_libs: [("cuda", true), ("cublas", true), ("nccl", true)]
+                .into_iter()
+                .map(|(name, ok)| (name.to_string(), ok))
+                .collect(),
         }
     }
 
@@ -697,5 +732,60 @@ mod tests {
     fn details_are_flattened_to_one_line() {
         let check = ReadinessCheck::fail("deploy", "boom:\n  caused by:\n    no space left");
         assert_eq!(check.detail, "boom: caused by: no space left");
+    }
+
+    #[test]
+    fn gpu_libs_na_without_gpus() {
+        let mut inv = inventory();
+        inv.gpus.clear();
+        inv.gpu_libs.clear();
+        assert_eq!(gpu_libs_check(&inv).status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn gpu_libs_missing_nccl_warns_about_the_sweep() {
+        let mut inv = inventory();
+        inv.gpus.push(gpu(0, Some(true)));
+        inv.gpu_libs = [
+            ("cuda".to_string(), true),
+            ("cublas".to_string(), true),
+            ("nccl".to_string(), false),
+        ]
+        .into_iter()
+        .collect();
+        let check = gpu_libs_check(&inv);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("nccl"), "{}", check.detail);
+        assert!(check.detail.contains("NCCL sweep"), "{}", check.detail);
+    }
+
+    #[test]
+    fn gpu_libs_missing_cuda_warns_about_gpu_phases() {
+        let mut inv = inventory();
+        inv.gpus.push(gpu(0, Some(true)));
+        inv.gpu_libs = [
+            ("cuda".to_string(), false),
+            ("cublas".to_string(), false),
+            ("nccl".to_string(), false),
+        ]
+        .into_iter()
+        .collect();
+        let check = gpu_libs_check(&inv);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("GPU phases"), "{}", check.detail);
+    }
+
+    #[test]
+    fn gpu_libs_all_loadable_is_ok() {
+        let mut inv = inventory();
+        inv.gpus.push(gpu(0, Some(true)));
+        inv.gpu_libs = [
+            ("cuda".to_string(), true),
+            ("cublas".to_string(), true),
+            ("nccl".to_string(), true),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(gpu_libs_check(&inv).status, CheckStatus::Ok);
     }
 }

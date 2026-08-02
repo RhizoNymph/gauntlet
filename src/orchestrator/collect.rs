@@ -52,7 +52,7 @@ impl Collector {
                 debug!(host = host_addr, ?phase, "phase end");
             }
             AgentEvent::Inventory { snapshot } => {
-                host.inventory = Some(snapshot);
+                host.inventory = Some(*snapshot);
             }
             AgentEvent::Metric { record } => {
                 host.metrics.push(record);
@@ -124,6 +124,7 @@ mod tests {
             nics: Vec::new(),
             ib_ports: Vec::new(),
             xid_errors: Vec::new(),
+            gpu_libs: Default::default(),
         }
     }
 
@@ -133,7 +134,7 @@ mod tests {
         collector.ingest(
             "a",
             AgentEvent::Inventory {
-                snapshot: snapshot(),
+                snapshot: Box::new(snapshot()),
             },
         );
         collector.ingest(

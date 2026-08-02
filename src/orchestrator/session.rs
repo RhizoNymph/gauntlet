@@ -37,11 +37,22 @@ impl RemoteOutput {
         } else {
             self.stdout.trim()
         };
-        let first = text.lines().next().unwrap_or("").trim();
-        if first.is_empty() {
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let first = lines.next().unwrap_or("");
+        // A Rust panic banner carries its message on the *next* line; keeping
+        // only the header would drop the one part worth reading.
+        let summary = if first.starts_with("thread '") && first.contains("panicked at") {
+            match lines.next() {
+                Some(message) => format!("panicked: {message}"),
+                None => first.to_string(),
+            }
+        } else {
+            first.to_string()
+        };
+        if summary.is_empty() {
             format!("exit {}", exit_code(&self.status))
         } else {
-            format!("exit {}: {first}", exit_code(&self.status))
+            format!("exit {}: {summary}", exit_code(&self.status))
         }
     }
 }
@@ -520,5 +531,39 @@ mod tests {
         assert_eq!(single_quote("a'b"), "'a'\\''b'");
         assert_eq!(single_quote("$(rm -rf /)"), "'$(rm -rf /)'");
         assert_eq!(shell_path("~/$x`y`"), "\"$HOME/\\$x\\`y\\`\"");
+    }
+
+    #[test]
+    fn detail_surfaces_the_panic_message_line() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = RemoteOutput {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: String::new(),
+            stderr: "thread 'main' (123) panicked at cudarc-0.19.8/src/lib.rs:200:5:\n\
+                     Unable to dynamically load the \"nccl\" shared library\n\
+                     note: run with RUST_BACKTRACE=1"
+                .to_string(),
+        };
+        let detail = output.detail();
+        assert!(detail.contains("panicked:"), "{detail}");
+        assert!(detail.contains("nccl"), "{detail}");
+        assert!(
+            !detail.contains("lib.rs:200"),
+            "header line must be replaced: {detail}"
+        );
+    }
+
+    #[test]
+    fn detail_keeps_ordinary_first_lines() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = RemoteOutput {
+            status: std::process::ExitStatus::from_raw(2 << 8),
+            stdout: String::new(),
+            stderr: "error: unrecognized subcommand 'probe'\nUsage: gauntlet ...".to_string(),
+        };
+        assert_eq!(
+            output.detail(),
+            "exit 2: error: unrecognized subcommand 'probe'"
+        );
     }
 }

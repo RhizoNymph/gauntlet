@@ -42,7 +42,9 @@ pub enum AgentEvent {
         phase: Phase,
     },
     Inventory {
-        snapshot: InventorySnapshot,
+        /// Boxed: the snapshot dwarfs every other variant, and events move
+        /// through channels by value.
+        snapshot: Box<InventorySnapshot>,
     },
     Metric {
         #[serde(flatten)]
@@ -202,6 +204,11 @@ pub struct InventorySnapshot {
     pub ib_ports: Vec<IbPortInventory>,
     /// Xid error codes seen in the kernel log since boot.
     pub xid_errors: Vec<u32>,
+    /// Runtime-loadability of the GPU library stack ("cuda", "cublas",
+    /// "nccl" -> dlopen succeeded). This is what the GPU/NCCL phases will
+    /// actually experience, unlike ldconfig or nvidia-smi presence.
+    #[serde(default)]
+    pub gpu_libs: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -353,19 +360,36 @@ pub fn expect_hello(first: &AgentEvent) -> Result<String, ProtoError> {
     }
 }
 
+fn absent() -> String {
+    "(absent)".to_string()
+}
+
 /// Consistency-relevant fields extracted from an inventory, keyed by field
 /// name. Fleet analysis flags any host whose value differs from the majority.
 pub fn consistency_fields(inv: &InventorySnapshot) -> BTreeMap<String, String> {
     let mut fields = BTreeMap::new();
     fields.insert("kernel".into(), inv.kernel.clone());
     fields.insert("cpu_model".into(), inv.cpu_model.clone());
-    if let Some(driver) = &inv.nvidia_driver {
-        fields.insert("nvidia_driver".into(), driver.clone());
-    }
-    if let Some(cuda) = &inv.cuda_version {
-        fields.insert("cuda_version".into(), cuda.clone());
-    }
+    // Present-vs-absent is itself a skew signal (one node with a driver the
+    // others lack), so Option fields dissent through a sentinel instead of
+    // being skipped.
+    fields.insert(
+        "nvidia_driver".into(),
+        inv.nvidia_driver.clone().unwrap_or_else(absent),
+    );
+    fields.insert(
+        "cuda_version".into(),
+        inv.cuda_version.clone().unwrap_or_else(absent),
+    );
     fields.insert("gpu_count".into(), inv.gpus.len().to_string());
+    if !inv.gpus.is_empty() {
+        for (lib, available) in &inv.gpu_libs {
+            fields.insert(
+                format!("lib:{lib}"),
+                if *available { "present" } else { "absent" }.to_string(),
+            );
+        }
+    }
     if let Some(gpu) = inv.gpus.first() {
         fields.insert("gpu_model".into(), gpu.name.clone());
         fields.insert("vbios".into(), gpu.vbios.clone());

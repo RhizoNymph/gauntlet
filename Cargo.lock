@@ -380,6 +380,7 @@ dependencies = [
  "cudarc",
  "half",
  "libc",
+ "libloading",
  "openssh",
  "openssh-sftp-client",
  "rayon",

@@ -28,6 +28,15 @@ fn inventory_reflects_this_machine() {
     for nic in &snapshot.nics {
         assert!(nic.mtu >= 68, "impossible MTU {} on {}", nic.mtu, nic.name);
     }
+    // The dlopen probe must always report all three libraries, whatever
+    // their availability on this machine.
+    for lib in ["cuda", "cublas", "nccl"] {
+        assert!(
+            snapshot.gpu_libs.contains_key(lib),
+            "gpu_libs missing {lib}: {:?}",
+            snapshot.gpu_libs
+        );
+    }
 }
 
 #[test]

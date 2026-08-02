@@ -351,7 +351,7 @@ async fn node_phase(
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((addr, Some(inventory))) => {
-                inventories.insert(addr, inventory);
+                inventories.insert(addr, *inventory);
             }
             Ok((_, None)) => {}
             Err(error) => warn!(%error, ?phase, "host task did not complete"),
@@ -633,10 +633,41 @@ async fn nccl_sweep(
     sink: &ObservationSink,
 ) {
     let gpu_hosts = gpu_bearing_hosts(sessions, inventories).await;
-    let Some(rank0) = gpu_hosts.first() else {
+    if gpu_hosts.is_empty() {
         info!("no GPU-bearing hosts; skipping the NCCL sweep");
         return;
-    };
+    }
+    // The inventory dlopen probe knows whether libnccl actually loads. A
+    // fleet without the NCCL stack skips the sweep as a structural finding
+    // (visible in the inventory/consistency/bootstrap output) instead of
+    // manufacturing a host failure out of a loader panic. Hosts predating
+    // the probe (empty map) are given the benefit of the doubt.
+    let nccl_hosts: Vec<_> = gpu_hosts
+        .iter()
+        .filter(|session| {
+            inventories
+                .get(session.addr())
+                .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+    if nccl_hosts.is_empty() {
+        warn!(
+            gpu_hosts = gpu_hosts.len(),
+            "libnccl is not loadable on any GPU-bearing host; skipping the NCCL sweep"
+        );
+        return;
+    }
+    if nccl_hosts.len() < gpu_hosts.len() {
+        warn!(
+            with_nccl = nccl_hosts.len(),
+            without_nccl = gpu_hosts.len() - nccl_hosts.len(),
+            "some GPU-bearing hosts lack a loadable libnccl and are excluded from the sweep"
+        );
+    }
+    let gpu_hosts = nccl_hosts;
+    let rank0 = &gpu_hosts[0];
     let world_size = gpu_hosts.len() as u32;
 
     let generate = match serde_json::to_string(&NcclDirective::GenerateId) {

@@ -33,7 +33,9 @@ Only these produce a Fail (i.e. a non-zero exit):
   with no IB ports warns).
 
 Everything else is advisory: `gpu_driver` (missing driver, no GPUs, or Xid
-errors since boot), `governor` (anything but `performance`),
+errors since boot), `gpu_libs` (dlopen probe: any of libcuda/libcublas/
+libnccl not loadable on a GPU-bearing node warns — nccl-only absence calls
+out that the NCCL sweep is unavailable; n/a without GPUs), `governor` (anything but `performance`),
 `persistence_mode` (off on any GPU; reported `ok`/n-a when the node has no
 GPUs), and both `tune_*` steps.
 

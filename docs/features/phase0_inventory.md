@@ -31,6 +31,13 @@ never an error; only unreadable /proc fails)
   `timedatectl show`, which exposes no offset at all.
 - Xid errors: `journalctl -k --no-pager -o cat` grep for "NVRM: Xid"
   (fallback /var/log/kern.log), codes deduplicated and sorted ascending.
+- GPU library stack: dlopen probe (libloading) for libcuda / libcublas /
+  libnccl with soname fallbacks per CUDA major -> `gpu_libs` map
+  ("cuda"/"cublas"/"nccl" -> bool). This measures what the GPU/NCCL phases
+  will actually experience; handles are leaked deliberately (some driver
+  stacks misbehave under dlclose; the agent is short-lived). Feeds the
+  bootstrap `gpu_libs` readiness check, the orchestrator's NCCL-sweep
+  gating, and (on GPU-bearing hosts) consistency fields `lib:<name>`.
 
 ## Probe execution model
 Every external command runs through one bounded helper: stdin `/dev/null`,

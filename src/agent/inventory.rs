@@ -36,7 +36,7 @@ const GPU_QUERY: &str = concat!(
 
 /// Collect the snapshot and emit it as an event.
 pub fn run(sink: &EventSink) -> Result<()> {
-    let snapshot = collect()?;
+    let snapshot = Box::new(collect()?);
     sink.emit(&AgentEvent::Inventory { snapshot });
     Ok(())
 }
@@ -71,6 +71,7 @@ pub fn collect() -> Result<InventorySnapshot> {
         nics: probe_nics(),
         ib_ports: probe_ib_ports(),
         xid_errors: probe_xid_errors(),
+        gpu_libs: probe_gpu_libs(),
     })
 }
 
@@ -392,6 +393,44 @@ fn parse_duration_ms(raw: &str) -> Option<f64> {
         "us" | "µs" => Some(value / 1000.0),
         "ns" => Some(value / 1_000_000.0),
         _ => None,
+    }
+}
+
+/// Attempt to dlopen each GPU-stack library the benchmark phases depend on,
+/// under the same process environment they will run in. Soname fallbacks
+/// cover the CUDA major versions in the field.
+fn probe_gpu_libs() -> std::collections::BTreeMap<String, bool> {
+    const CANDIDATES: [(&str, &[&str]); 3] = [
+        ("cuda", &["libcuda.so.1", "libcuda.so"]),
+        (
+            "cublas",
+            &[
+                "libcublas.so.13",
+                "libcublas.so.12",
+                "libcublas.so.11",
+                "libcublas.so",
+            ],
+        ),
+        ("nccl", &["libnccl.so.2", "libnccl.so"]),
+    ];
+    CANDIDATES
+        .into_iter()
+        .map(|(name, sonames)| (name.to_string(), sonames.iter().any(|so| dlopen_works(so))))
+        .collect()
+}
+
+fn dlopen_works(soname: &str) -> bool {
+    // SAFETY: loading runs the library's initializers; these are the standard
+    // NVIDIA runtime libraries, whose initializers are safe to run (the GPU
+    // phases load exactly the same objects). The handle is deliberately
+    // leaked: some driver stacks misbehave under dlclose, and the agent
+    // process is short-lived anyway.
+    match unsafe { libloading::Library::new(soname) } {
+        Ok(library) => {
+            std::mem::forget(library);
+            true
+        }
+        Err(_) => false,
     }
 }
 

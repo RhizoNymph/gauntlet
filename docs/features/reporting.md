@@ -18,7 +18,10 @@ started, finished)`:
    (offending sample keys; only non-empty groups inserted).
 4. `proto::consistency_fields` majority vote → `fleet.consistency`
    (fields where ≥1 host dissents; majority = most common value, ties
-   broken by the lexicographically smallest value).
+   broken by the lexicographically smallest value). Optional fields
+   (nvidia_driver, cuda_version) report "(absent)" rather than being
+   skipped, so present-vs-absent skew dissents; `lib:<name>` fields carry
+   the dlopen probe results on GPU-bearing hosts.
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if

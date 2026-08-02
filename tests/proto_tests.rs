@@ -21,6 +21,7 @@ fn sample_inventory() -> InventorySnapshot {
         nics: vec![],
         ib_ports: vec![],
         xid_errors: vec![79],
+        gpu_libs: std::collections::BTreeMap::new(),
     }
 }
 
@@ -35,7 +36,7 @@ fn events_round_trip() {
             phase: Phase::CpuMem,
         },
         AgentEvent::Inventory {
-            snapshot: sample_inventory(),
+            snapshot: Box::new(sample_inventory()),
         },
         AgentEvent::Metric {
             record: MetricRecord {
@@ -158,4 +159,54 @@ fn event_sink_is_thread_safe_and_line_delimited() {
     });
     let events = common::decode_events(&buf);
     assert_eq!(events.len(), 400, "no torn or interleaved lines");
+}
+
+#[test]
+fn consistency_marks_absent_optional_fields() {
+    let mut inv = sample_inventory();
+    inv.nvidia_driver = None;
+    inv.cuda_version = None;
+    let fields = consistency_fields(&inv);
+    assert_eq!(
+        fields.get("nvidia_driver").map(String::as_str),
+        Some("(absent)"),
+        "absence must dissent against present values"
+    );
+    assert_eq!(
+        fields.get("cuda_version").map(String::as_str),
+        Some("(absent)")
+    );
+}
+
+#[test]
+fn consistency_includes_gpu_libs_only_on_gpu_hosts() {
+    let mut inv = sample_inventory();
+    inv.gpu_libs = [("nccl".to_string(), false), ("cuda".to_string(), true)]
+        .into_iter()
+        .collect();
+    // No GPUs: library state is noise, not skew.
+    assert!(
+        !consistency_fields(&inv)
+            .keys()
+            .any(|k| k.starts_with("lib:"))
+    );
+
+    inv.gpus.push(gauntlet::proto::GpuInventory {
+        index: 0,
+        name: "H100".into(),
+        uuid: "u".into(),
+        vbios: "v".into(),
+        mem_total_bytes: 1,
+        ecc_volatile_errors: None,
+        remapped_rows_pending: None,
+        pcie_gen_current: None,
+        pcie_gen_max: None,
+        pcie_width_current: None,
+        pcie_width_max: None,
+        nvlinks_active: None,
+        persistence_mode: None,
+    });
+    let fields = consistency_fields(&inv);
+    assert_eq!(fields.get("lib:nccl").map(String::as_str), Some("absent"));
+    assert_eq!(fields.get("lib:cuda").map(String::as_str), Some("present"));
 }

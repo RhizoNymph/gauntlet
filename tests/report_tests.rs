@@ -36,6 +36,7 @@ fn inventory(host: &str, kernel: &str) -> InventorySnapshot {
         nics: vec![],
         ib_ports: vec![],
         xid_errors: vec![],
+        gpu_libs: BTreeMap::new(),
     }
 }
 
