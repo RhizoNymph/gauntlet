@@ -21,6 +21,7 @@ fn entry(run_id: &str, live: bool) -> RunEntry {
         verdict: Some(Verdict::Clean),
         hosts: 3,
         started_epoch_secs: 0,
+        modified: None,
     }
 }
 
@@ -118,6 +119,7 @@ fn results(run_id: &str, started: u64) -> RunResults {
         schema_version: SCHEMA_VERSION,
         run_id: run_id.into(),
         started_epoch_secs: started,
+        debug_build: false,
         finished_epoch_secs: started + 60,
         hosts: BTreeMap::new(),
         fleet: FleetAnalysis::default(),

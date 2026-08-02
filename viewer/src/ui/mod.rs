@@ -1,6 +1,7 @@
 //! gpui shell: theme constants, selection and run state, the root view,
 //! and the 1s poll loop that powers live tailing.
 
+pub mod bootstrap;
 pub mod graph;
 pub mod sidebar;
 pub mod table;
@@ -10,6 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use gauntlet::orchestrator::bootstrap::BootstrapReport;
 use gauntlet::report::{self, Verdict};
 use gpui::{
     Bounds, Context, Div, FontWeight, IntoElement, ParentElement, Pixels, Render, Styled, Task,
@@ -35,6 +37,9 @@ pub const SELECT: u32 = 0xcba6f7;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Basename of the log file GUI-launched runs write into the runs dir.
 pub const RUN_LOG_NAME: &str = "gauntlet-run.log";
+/// Dot-prefixed so the run scanner ignores them.
+pub const BOOTSTRAP_JSON_NAME: &str = ".bootstrap.json";
+pub const BOOTSTRAP_LOG_NAME: &str = ".bootstrap.log";
 
 pub fn severity_color(severity: Severity) -> u32 {
     match severity {
@@ -61,6 +66,20 @@ pub enum Selection {
     Edge(String, String),
 }
 
+/// What kind of gauntlet child process the GUI is managing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildKind {
+    Run,
+    Bootstrap,
+}
+
+/// What occupies the center pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CenterView {
+    Graph,
+    Bootstrap,
+}
+
 /// The run currently on screen.
 pub struct LoadedRun {
     pub entry: RunEntry,
@@ -85,11 +104,17 @@ pub struct RootView {
     /// Window bounds of the graph pane, recorded from the previous frame's
     /// canvas prepaint; node chips and hit-testing need it.
     pub graph_bounds: Option<Bounds<Pixels>>,
-    child: Option<Child>,
+    child: Option<(ChildKind, Child)>,
+    /// The run id the GUI's own launch produced, once its partial appears;
+    /// cancel uses it to clean up the orphaned partial file.
+    launched_run_id: Option<String>,
     /// Status line under the run button (spawn results, load errors).
     pub note: Option<(Severity, String)>,
     /// Jump to the next live run that appears (set when a run is launched).
     auto_follow: bool,
+    /// Last bootstrap readiness report, shown in the center pane.
+    pub bootstrap_report: Option<BootstrapReport>,
+    center: CenterView,
     _poll: Task<()>,
 }
 
@@ -123,11 +148,22 @@ impl RootView {
             selection: None,
             graph_bounds: None,
             child: None,
+            launched_run_id: None,
             note: None,
             auto_follow: false,
+            bootstrap_report: None,
+            center: CenterView::Graph,
             _poll: poll,
         };
         view.runs = runs::scan(&view.runs_dir, &mut view.scan_cache);
+        // A previous bootstrap outlives viewer restarts; land on it when
+        // there is nothing else to show yet.
+        view.bootstrap_report = std::fs::read_to_string(view.runs_dir.join(BOOTSTRAP_JSON_NAME))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        if view.bootstrap_report.is_some() && view.runs.is_empty() {
+            view.center = CenterView::Bootstrap;
+        }
         match initial_file {
             Some(path) => view.load_external(&path),
             None => {
@@ -178,6 +214,7 @@ impl RootView {
                     verdict: Some(report::verdict(&results)),
                     hosts: results.hosts.len(),
                     started_epoch_secs: results.started_epoch_secs,
+                    modified: None,
                 };
                 self.set_current(entry, &results);
             }
@@ -291,6 +328,9 @@ impl RootView {
                 self.load_run(&live);
                 changed = true;
             }
+            if matches!(self.child, Some((ChildKind::Run, _))) {
+                self.launched_run_id = Some(live.run_id.clone());
+            }
             self.auto_follow = false;
         }
 
@@ -302,18 +342,19 @@ impl RootView {
 
     // -- launching runs ----------------------------------------------------
 
-    pub fn run_in_flight(&self) -> bool {
-        self.child.is_some()
+    pub fn child_kind(&self) -> Option<ChildKind> {
+        self.child.as_ref().map(|(kind, _)| *kind)
     }
 
     pub fn start_run(&mut self, cx: &mut Context<Self>) {
         if self.child.is_some() {
             return;
         }
-        match self.spawn_gauntlet() {
+        match self.spawn_run() {
             Ok(child) => {
-                self.child = Some(child);
+                self.child = Some((ChildKind::Run, child));
                 self.auto_follow = true;
+                self.center = CenterView::Graph;
                 self.note = Some((Severity::Ok, "run started".into()));
             }
             Err(error) => {
@@ -323,16 +364,77 @@ impl RootView {
         cx.notify();
     }
 
-    fn spawn_gauntlet(&self) -> anyhow::Result<Child> {
-        use anyhow::Context as _;
-        // Prefer the gauntlet binary next to this one; fall back to PATH.
+    pub fn start_bootstrap(&mut self, cx: &mut Context<Self>) {
+        if self.child.is_some() {
+            return;
+        }
+        match self.spawn_bootstrap() {
+            Ok(child) => {
+                self.child = Some((ChildKind::Bootstrap, child));
+                self.note = Some((Severity::Ok, "bootstrap started".into()));
+            }
+            Err(error) => {
+                self.note = Some((
+                    Severity::Bad,
+                    format!("failed to start bootstrap: {error:#}"),
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Kill the child process. A cancelled run leaves an orphaned partial
+    /// snapshot behind (the orchestrator never got to clean it up), so
+    /// remove it and fall back to the newest finished run.
+    pub fn cancel_child(&mut self, cx: &mut Context<Self>) {
+        let Some((kind, mut child)) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        match kind {
+            ChildKind::Run => {
+                self.auto_follow = false;
+                if let Some(run_id) = self.launched_run_id.take() {
+                    let partial = self.runs_dir.join(format!("{run_id}.partial.json"));
+                    let _ = std::fs::remove_file(&partial);
+                    let was_viewing = self
+                        .current
+                        .as_ref()
+                        .is_some_and(|c| c.entry.run_id == run_id && c.entry.live);
+                    self.runs = runs::scan(&self.runs_dir, &mut self.scan_cache);
+                    if was_viewing {
+                        if let Some(next) = self.runs.iter().find(|e| !e.live).cloned() {
+                            self.load_run(&next);
+                        } else {
+                            self.current = None;
+                        }
+                    }
+                }
+                self.note = Some((Severity::Warn, "run cancelled".into()));
+            }
+            ChildKind::Bootstrap => {
+                self.note = Some((Severity::Warn, "bootstrap cancelled".into()));
+            }
+        }
+        self.refresh_diff();
+        cx.notify();
+    }
+
+    /// The gauntlet binary next to this one, falling back to PATH.
+    fn gauntlet_program() -> PathBuf {
         let sibling = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(|dir| dir.join("gauntlet")));
-        let program = match sibling {
+        match sibling {
             Some(path) if path.exists() => path,
             _ => PathBuf::from("gauntlet"),
-        };
+        }
+    }
+
+    fn spawn_run(&self) -> anyhow::Result<Child> {
+        use anyhow::Context as _;
+        let program = Self::gauntlet_program();
         std::fs::create_dir_all(&self.runs_dir)
             .with_context(|| format!("creating {}", self.runs_dir.display()))?;
         let log_path = self.runs_dir.join(RUN_LOG_NAME);
@@ -350,30 +452,94 @@ impl RootView {
             .with_context(|| format!("spawning {}", program.display()))
     }
 
+    fn spawn_bootstrap(&self) -> anyhow::Result<Child> {
+        use anyhow::Context as _;
+        let program = Self::gauntlet_program();
+        std::fs::create_dir_all(&self.runs_dir)
+            .with_context(|| format!("creating {}", self.runs_dir.display()))?;
+        let json_path = self.runs_dir.join(BOOTSTRAP_JSON_NAME);
+        let json = std::fs::File::create(&json_path)
+            .with_context(|| format!("creating {}", json_path.display()))?;
+        let log_path = self.runs_dir.join(BOOTSTRAP_LOG_NAME);
+        let log = std::fs::File::create(&log_path)
+            .with_context(|| format!("creating {}", log_path.display()))?;
+        Command::new(&program)
+            .arg("bootstrap")
+            .arg("--config")
+            .arg(&self.config_path)
+            .arg("--json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(json))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .with_context(|| format!("spawning {}", program.display()))
+    }
+
     fn poll_child(&mut self) -> bool {
-        let Some(child) = &mut self.child else {
+        let Some((kind, child)) = &mut self.child else {
             return false;
         };
+        let kind = *kind;
         match child.try_wait() {
             Ok(None) => false,
             Ok(Some(status)) => {
                 self.child = None;
-                self.note = Some(match status.code() {
-                    Some(0) => (Severity::Ok, "run finished: clean".into()),
-                    Some(1) => (Severity::Warn, "run finished: stragglers".into()),
-                    Some(2) => (Severity::Bad, "run finished: host failures".into()),
-                    code => (
-                        Severity::Bad,
-                        format!("run exited abnormally ({code:?}) — see {RUN_LOG_NAME}"),
-                    ),
-                });
+                match kind {
+                    ChildKind::Run => {
+                        self.launched_run_id = None;
+                        self.note = Some(match status.code() {
+                            Some(0) => (Severity::Ok, "run finished: clean".into()),
+                            Some(1) => (Severity::Warn, "run finished: stragglers".into()),
+                            Some(2) => (Severity::Bad, "run finished: host failures".into()),
+                            code => (
+                                Severity::Bad,
+                                format!("run exited abnormally ({code:?}) — see {RUN_LOG_NAME}"),
+                            ),
+                        });
+                    }
+                    ChildKind::Bootstrap => self.finish_bootstrap(status.success()),
+                }
                 true
             }
             Err(error) => {
                 self.child = None;
-                self.note = Some((Severity::Bad, format!("lost track of run: {error}")));
+                self.note = Some((Severity::Bad, format!("lost track of child: {error}")));
                 true
             }
+        }
+    }
+
+    fn finish_bootstrap(&mut self, all_ready: bool) {
+        let path = self.runs_dir.join(BOOTSTRAP_JSON_NAME);
+        let report = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<BootstrapReport>(&text).ok());
+        match report {
+            Some(report) => {
+                self.note = Some(if all_ready {
+                    (Severity::Ok, "bootstrap: all hosts ready".into())
+                } else {
+                    (Severity::Warn, "bootstrap: some hosts not ready".into())
+                });
+                self.bootstrap_report = Some(report);
+                self.center = CenterView::Bootstrap;
+            }
+            None => {
+                self.note = Some((
+                    Severity::Bad,
+                    format!("bootstrap produced no readiness report — see {BOOTSTRAP_LOG_NAME}"),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn show_graph(&mut self) {
+        self.center = CenterView::Graph;
+    }
+
+    pub(super) fn show_bootstrap(&mut self) {
+        if self.bootstrap_report.is_some() {
+            self.center = CenterView::Bootstrap;
         }
     }
 
@@ -448,6 +614,19 @@ impl RootView {
                             .border_color(rgb(color))
                             .child(verdict_text),
                     );
+                if vm.debug_build {
+                    header = header.child(
+                        div()
+                            .px_2()
+                            .py(px(1.0))
+                            .rounded_md()
+                            .text_size(px(11.0))
+                            .text_color(rgb(BAD))
+                            .border_1()
+                            .border_color(rgb(BAD))
+                            .child("debug build"),
+                    );
+                }
                 if run.entry.live {
                     header = header.child(
                         div()
@@ -518,7 +697,9 @@ impl Render for RootView {
             .min_h(px(0.0))
             .flex()
             .child(self.render_sidebar(cx));
-        if self.current.is_some() {
+        if self.center == CenterView::Bootstrap && self.bootstrap_report.is_some() {
+            row = row.child(self.render_bootstrap_pane(cx));
+        } else if self.current.is_some() {
             row = row.child(self.render_graph(cx)).child(self.render_side(cx));
         } else {
             row = row.child(
@@ -528,7 +709,7 @@ impl Render for RootView {
                     .items_center()
                     .justify_center()
                     .text_color(rgb(MUTED))
-                    .child("no runs yet — press ▶ run gauntlet"),
+                    .child("no runs yet — press ▶ run gauntlet or ⚙ bootstrap"),
             );
         }
 

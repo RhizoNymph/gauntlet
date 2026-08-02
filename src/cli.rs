@@ -51,6 +51,9 @@ pub struct BootstrapArgs {
     /// Apply node tuning (GPU persistence mode, performance governor). Needs sudo on nodes.
     #[arg(long)]
     pub tune: bool,
+    /// Emit the readiness report as JSON on stdout instead of a table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]

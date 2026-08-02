@@ -6,10 +6,12 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, div, px, rgb, rgba,
 };
 
+use super::ChildKind;
 use super::{
     BG, MUTED, PANEL, PANEL_BORDER, RootView, SELECT, TEXT, severity_color, verdict_color,
 };
-use crate::runs::{RunEntry, format_epoch_utc};
+use crate::runs::{RunEntry, format_epoch_utc, is_stalled};
+use std::time::SystemTime;
 
 impl RootView {
     pub(super) fn render_sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -33,7 +35,30 @@ impl RootView {
             .border_r_1()
             .border_color(rgb(PANEL_BORDER))
             .bg(rgb(PANEL))
-            .child(self.run_button(cx));
+            .child(self.run_button(cx))
+            .child(self.bootstrap_button(cx));
+        if self.child_kind().is_some() {
+            rail = rail.child(self.cancel_button(cx));
+        }
+        if self.bootstrap_report.is_some() {
+            rail = rail.child(
+                div()
+                    .id("show-bootstrap")
+                    .px_3()
+                    .pb_1()
+                    .text_size(px(10.0))
+                    .text_color(rgb(SELECT))
+                    .cursor_pointer()
+                    .child("view last bootstrap")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.show_bootstrap();
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
         if let Some((severity, note)) = &self.note {
             rail = rail.child(
                 div()
@@ -56,15 +81,17 @@ impl RootView {
     }
 
     fn run_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
-        let running = self.run_in_flight();
-        let (label, color) = if running {
-            ("running…", MUTED)
+        let busy = self.child_kind().is_some();
+        let label = if self.child_kind() == Some(ChildKind::Run) {
+            "running…"
         } else {
-            ("▶ run gauntlet", SELECT)
+            "▶ run gauntlet"
         };
+        let color = if busy { MUTED } else { SELECT };
         let button = div()
             .id("start-run")
-            .m_2()
+            .mx_2()
+            .mt_2()
             .px_3()
             .py_1()
             .rounded_md()
@@ -74,7 +101,7 @@ impl RootView {
             .flex()
             .justify_center()
             .child(label);
-        if running {
+        if busy {
             button
         } else {
             button.cursor_pointer().on_mouse_down(
@@ -84,6 +111,62 @@ impl RootView {
                 }),
             )
         }
+    }
+
+    fn bootstrap_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let busy = self.child_kind().is_some();
+        let label = if self.child_kind() == Some(ChildKind::Bootstrap) {
+            "bootstrapping…"
+        } else {
+            "⚙ bootstrap"
+        };
+        let color = if busy { MUTED } else { SELECT };
+        let button = div()
+            .id("start-bootstrap")
+            .mx_2()
+            .mt_1()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(color))
+            .text_color(rgb(color))
+            .flex()
+            .justify_center()
+            .child(label);
+        if busy {
+            button
+        } else {
+            button.cursor_pointer().on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.start_bootstrap(cx);
+                }),
+            )
+        }
+    }
+
+    fn cancel_button(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        div()
+            .id("cancel-child")
+            .mx_2()
+            .mt_1()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(super::BAD))
+            .text_color(rgb(super::BAD))
+            .flex()
+            .justify_center()
+            .cursor_pointer()
+            .child("✕ cancel")
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.cancel_child(cx);
+                }),
+            )
     }
 
     fn run_row(&self, ix: usize, entry: &RunEntry, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -139,12 +222,13 @@ impl RootView {
                             .child(format_epoch_utc(entry.started_epoch_secs)),
                     )
                     .when(entry.live, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(rgb(SELECT))
-                                .child("live"),
-                        )
+                        let stalled = is_stalled(entry.live, entry.modified, SystemTime::now());
+                        let (label, color) = if stalled {
+                            ("stalled", super::WARN)
+                        } else {
+                            ("live", SELECT)
+                        };
+                        row.child(div().text_size(px(9.0)).text_color(rgb(color)).child(label))
                     }),
             )
             .child(
