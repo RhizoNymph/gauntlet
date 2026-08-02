@@ -295,7 +295,7 @@ fn edge_entry<'a>(
 
 /// Where a fleet-analysis sample key points: a node's own metric or a
 /// directed pair measurement.
-enum Attribution {
+pub(crate) enum Attribution {
     Node { host: String },
     Pair { host: String, peer: String },
     Unmatched,
@@ -304,7 +304,7 @@ enum Attribution {
 /// Resolve a sample key ("host", "host:<scope>", "host:pair:<peer>")
 /// against the known hosts. Longest host prefix wins, so scope labels that
 /// themselves contain ':' (e.g. "disk:/tmp") never confuse attribution.
-fn attribute(hosts: &[String], key: &str) -> Attribution {
+pub(crate) fn attribute(hosts: &[String], key: &str) -> Attribution {
     let mut best: Option<&String> = None;
     for host in hosts {
         let matches = key == host.as_str()

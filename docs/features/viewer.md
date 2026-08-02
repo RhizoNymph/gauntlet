@@ -5,8 +5,18 @@ connected fleet graph plus a quantitative metric table.
 
 ## Scope
 
-- Load one `RunResults` JSON (a file, or the newest run in a directory —
-  default `runs/`).
+- Browse every run in the runs directory (default `runs/`) in a sidebar:
+  newest first, verdict-colored, with live runs badged. Click to open.
+- Live tailing: a 1s poll loop rescans the directory; a run in flight
+  (`<run_id>.partial.json`, written by `gauntlet run` every ~2s) reloads as
+  it grows and swaps to the final JSON when the run completes.
+- Launch runs from the GUI: the ▶ button spawns the `gauntlet` binary
+  (sibling of the viewer binary, else $PATH) with `run --config <config>`,
+  logs to `runs/gauntlet-run.log`, follows the new live run, and reports
+  the exit verdict.
+- Diff mode: toggle in the header. Colors nodes/edges by regression vs a
+  baseline run (pinned via the sidebar, else the previous finished run);
+  the table's deviation column becomes Δ% vs baseline.
 - Fleet graph: nodes on a ring, one edge per host pair. Node color encodes
   host health (green ok / amber outlier-or-skew / red failed); edge color
   encodes pairwise-path health the same way. Edge midpoints show worst-case
@@ -17,11 +27,12 @@ connected fleet graph plus a quantitative metric table.
   the group median in MADs; outlier-flagged rows amber, threshold-violating
   rows red. Link alpha-beta fits shown in the fleet overview card.
 
-Non-scope: running tests, live/streaming updates (load-at-startup only),
-run-to-run diffing, editing config. No new analysis: the viewer projects the
-findings the report pipeline already computed (it re-derives per-row
-deviations for display, but flags come solely from `fleet.outliers` /
-`fleet.threshold_violations`).
+Non-scope: editing config, cancelling a launched run, run scheduling. No
+new absolute-mode analysis: the viewer projects the findings the report
+pipeline computed (it re-derives per-row deviations for display, but flags
+come solely from `fleet.outliers` / `fleet.threshold_violations`). Diff
+mode's regression math lives in the viewer (`diff.rs`): unit-derived
+direction of goodness, warn at >5% worse, bad at >15% worse.
 
 ## Data / control flow
 
@@ -67,9 +78,23 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/model.rs` — pure `RunResults -> ViewModel` projection.
   Exports `ViewModel`, `NodeView`, `EdgeView` (with per-direction
   `Directional`), `MetricRow`, `LinkRow`, `Severity`, `format_value`.
+- `viewer/src/diff.rs` — pure run-to-run diff: `DiffView::new(current,
+  baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
+  improved flag) plus node/edge regression severities and capped issue
+  lists. `higher_is_better(unit)` is the direction-of-goodness oracle.
+- `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
+  (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals
+  shadow stale partials), `effective_baseline`, `scan` (directory scan
+  with an (mtime, len) parse cache), `format_epoch_utc`.
 - `viewer/src/layout.rs` — ring layout in unit space, letterboxed pixel
   mapping, point-segment distance, node/edge hit-testing. Pure math.
-- `viewer/src/ui/mod.rs` — theme constants, `Selection`, `RootView`, header.
+- `viewer/src/ui/mod.rs` — theme constants, `Selection` (keyed by host /
+  host-pair so it survives live reloads), `RootView` state (current run,
+  baseline cache, diff, child process, scan cache), the 1s poll loop
+  (`cx.spawn` + background timer), run spawning, and the header (verdict,
+  live badge, diff toggle).
+- `viewer/src/ui/sidebar.rs` — run button, status note, run list rows
+  (verdict dot, UTC timestamp, live badge, set/unset baseline).
 - `viewer/src/ui/graph.rs` — graph pane (canvas edges + node chips +
   labels + legend; edge labels suppressed above 24 edges).
 - `viewer/src/ui/table.rs` — detail cards (fleet / node / edge) and the
@@ -77,6 +102,10 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/tests/model_tests.rs` — projection contract, driven through the
   real `report::build` pipeline.
 - `viewer/tests/layout_tests.rs` — geometry and hit-testing.
+- `viewer/tests/diff_tests.rs` — regression directions, thresholds,
+  node/edge attribution, issue capping.
+- `viewer/tests/runs_tests.rs` — classification, ordering, baseline
+  resolution, scanning, timestamp math.
 
 ## Invariants and constraints
 
@@ -92,3 +121,11 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - Edge selection indices refer to `ViewModel::edges` order; the graph pane
   keeps its `edge_indices()` vector aligned with that order (unknown hosts
   map to `usize::MAX`, skipped by hit-testing).
+- `diff` and `runs` stay gpui-free, like `model` and `layout`.
+- Selection is keyed by identity (host, host pair), never by index — live
+  reloads rebuild the ViewModel every ~1s and indices are not stable.
+- The viewer only ever *reads* the runs directory plus writes
+  `gauntlet-run.log`; partial files are produced and cleaned up by
+  `gauntlet run` (see docs/features/reporting.md for the contract).
+- Diff mode never recolors from absolute findings: with a baseline
+  resolved, node/edge colors come exclusively from `DiffView`.

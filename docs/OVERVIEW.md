@@ -108,11 +108,14 @@ Features Index:
   viewer:
     description: >
       `gauntlet-view` (workspace member `viewer/`): native GPUI desktop app
-      rendering a saved run as a fully connected fleet graph — node color =
-      host health, edge color = pairwise-path health — plus per-direction
-      edge details, roofline cards, link fits, and a filterable quantitative
-      metric table. Reads the same runs/<run_id>.json documents the CLI
-      writes; performs no analysis beyond projecting fleet findings.
+      rendering runs as a fully connected fleet graph — node color = host
+      health, edge color = pairwise-path health — plus per-direction edge
+      details, roofline cards, link fits, and a filterable quantitative
+      metric table. Sidebar lists all runs (selectable, baseline-pinnable);
+      a 1s poll loop live-tails `<run_id>.partial.json` snapshots while a
+      run executes; the ▶ button launches `gauntlet run` directly; diff
+      mode recolors the graph by regression vs a baseline run (>5% warn,
+      >15% bad, unit-aware direction of goodness).
     entry_points: [viewer/src/main.rs, viewer/src/model.rs, viewer/src/ui/]
     depends_on: [reporting]
     doc: docs/features/viewer.md

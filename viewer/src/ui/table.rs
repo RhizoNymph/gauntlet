@@ -1,4 +1,6 @@
 //! Side panel: selection detail card plus the quantitative metric table.
+//! In diff mode the deviation column becomes a Δ% column against the
+//! baseline run and cards show regressions instead of absolute findings.
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -6,11 +8,13 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, div, px, rgb,
 };
 
+use gauntlet::proto::Unit;
+
 use super::{
     BAD, MUTED, OK, PANEL, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN, severity_color,
 };
-use crate::model::{EdgeView, MetricRow, NodeView, Severity, format_value};
-use gauntlet::proto::Unit;
+use crate::diff::RowDelta;
+use crate::model::{EdgeView, Issue, MetricRow, NodeView, Severity, format_value};
 
 impl RootView {
     pub(super) fn render_side(&self, cx: &mut Context<Self>) -> Div {
@@ -26,15 +30,27 @@ impl RootView {
     }
 
     fn render_details(&self, cx: &mut Context<Self>) -> Div {
-        let card = match self.selection {
-            Some(Selection::Node(i)) => match self.vm.nodes.get(i) {
-                Some(node) => node_card(node),
-                None => self.fleet_card(),
-            },
-            Some(Selection::Edge(i)) => match self.vm.edges.get(i) {
-                Some(edge) => edge_card(edge),
-                None => self.fleet_card(),
-            },
+        let card = match &self.selection {
+            Some(Selection::Node(host)) => {
+                match self
+                    .current
+                    .as_ref()
+                    .and_then(|run| run.vm.nodes.iter().find(|n| &n.host == host))
+                {
+                    Some(node) => self.node_card(node),
+                    None => self.fleet_card(),
+                }
+            }
+            Some(Selection::Edge(a, b)) => {
+                match self
+                    .current
+                    .as_ref()
+                    .and_then(|run| run.vm.edges.iter().find(|e| &e.a == a && &e.b == b))
+                {
+                    Some(edge) => self.edge_card(edge),
+                    None => self.fleet_card(),
+                }
+            }
             None => self.fleet_card(),
         };
         div()
@@ -63,21 +79,52 @@ impl RootView {
     }
 
     fn fleet_card(&self) -> Div {
-        let vm = &self.vm;
-        let count = |severity: Severity| vm.nodes.iter().filter(|n| n.severity == severity).count();
-        let (healthy, warned, failed) = (
-            count(Severity::Ok),
-            count(Severity::Warn),
-            count(Severity::Bad),
-        );
+        let Some(run) = &self.current else {
+            return div();
+        };
+        let vm = &run.vm;
 
-        let mut card = div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .child(title("fleet overview"))
-            .child(
+        let mut card = div().flex().flex_col().gap_2().p_3();
+        if self.diff_active() {
+            let Some(diff) = &self.diff else {
+                return card;
+            };
+            let count = |severity: Severity| {
+                diff.node_severity
+                    .values()
+                    .filter(|s| **s == severity)
+                    .count()
+            };
+            let (warned, failed) = (count(Severity::Warn), count(Severity::Bad));
+            let regressed_links = diff.edge_severity.len();
+            card = card
+                .child(title(format!("diff vs {}", diff.baseline_run_id)))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .when(warned + failed == 0 && regressed_links == 0, |row| {
+                            row.child(chip(OK, "no regressions".into()))
+                        })
+                        .when(warned > 0, |row| {
+                            row.child(chip(WARN, format!("{warned} nodes >5% worse")))
+                        })
+                        .when(failed > 0, |row| {
+                            row.child(chip(BAD, format!("{failed} nodes >15% worse")))
+                        })
+                        .when(regressed_links > 0, |row| {
+                            row.child(chip(WARN, format!("{regressed_links} links regressed")))
+                        }),
+                );
+        } else {
+            let count =
+                |severity: Severity| vm.nodes.iter().filter(|n| n.severity == severity).count();
+            let (healthy, warned, failed) = (
+                count(Severity::Ok),
+                count(Severity::Warn),
+                count(Severity::Bad),
+            );
+            card = card.child(title("fleet overview")).child(
                 div()
                     .flex()
                     .gap_2()
@@ -89,6 +136,7 @@ impl RootView {
                         row.child(chip(BAD, format!("{failed} failed")))
                     }),
             );
+        }
 
         if !vm.links.is_empty() {
             let mut links = div().flex().flex_col().gap_1().child(
@@ -125,22 +173,140 @@ impl RootView {
         )
     }
 
+    fn node_card(&self, node: &NodeView) -> Div {
+        let severity = self.display_node_severity(node);
+        let diff_issues: Vec<Issue>;
+        let (issues, empty_text): (&[Issue], &str) = if self.diff_active() {
+            diff_issues = self
+                .diff
+                .as_ref()
+                .and_then(|d| d.node_issues.get(&node.host))
+                .cloned()
+                .unwrap_or_default();
+            (&diff_issues, "no regressions vs baseline")
+        } else {
+            (&node.issues, "no findings")
+        };
+
+        let mut card = div().flex().flex_col().gap_2().p_3().child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .h(px(12.0))
+                        .rounded_full()
+                        .bg(rgb(severity_color(severity))),
+                )
+                .child(title(
+                    node.hostname.clone().unwrap_or_else(|| node.host.clone()),
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(MUTED))
+                        .child(node.host.clone()),
+                ),
+        );
+
+        if !node.stats.is_empty() {
+            let mut stats = div().flex().flex_wrap().gap_x_3().gap_y_1();
+            for (label, value) in &node.stats {
+                stats = stats.child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .text_size(px(11.0))
+                        .child(div().text_color(rgb(MUTED)).child(label.clone()))
+                        .child(div().text_color(rgb(TEXT)).child(value.clone())),
+                );
+            }
+            card = card.child(stats);
+        }
+
+        card.child(issues_list(issues, empty_text))
+    }
+
+    fn edge_card(&self, edge: &EdgeView) -> Div {
+        let severity = self.display_edge_severity(edge);
+        let diff_issues: Vec<Issue>;
+        let (issues, empty_text): (&[Issue], &str) = if self.diff_active() {
+            diff_issues = self
+                .diff
+                .as_ref()
+                .and_then(|d| d.edge_issues.get(&(edge.a.clone(), edge.b.clone())))
+                .cloned()
+                .unwrap_or_default();
+            (&diff_issues, "no regressions vs baseline")
+        } else {
+            (&edge.issues, "no findings")
+        };
+
+        let direction_row =
+            |label: String, bandwidth: Option<f64>, p50: Option<f64>, p99: Option<f64>| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .text_size(px(11.0))
+                    .child(cell_grow(label).text_color(rgb(TEXT)))
+                    .child(cell_num(opt(Unit::GibPerSec, bandwidth)))
+                    .child(cell_num(opt(Unit::Micros, p50)))
+                    .child(cell_num(opt(Unit::Micros, p99)))
+            };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .rounded_full()
+                            .bg(rgb(severity_color(severity))),
+                    )
+                    .child(title(format!("{} ⟷ {}", edge.a, edge.b))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED))
+                    .child(cell_grow("direction"))
+                    .child(cell_num("bandwidth"))
+                    .child(cell_num("rtt p50"))
+                    .child(cell_num("rtt p99")),
+            )
+            .child(direction_row(
+                format!("{} → {}", edge.a, edge.b),
+                edge.bandwidth_gib.from_a,
+                edge.rtt_p50_us.from_a,
+                edge.rtt_p99_us.from_a,
+            ))
+            .child(direction_row(
+                format!("{} → {}", edge.b, edge.a),
+                edge.bandwidth_gib.from_b,
+                edge.rtt_p50_us.from_b,
+                edge.rtt_p99_us.from_b,
+            ))
+            .child(issues_list(issues, empty_text))
+    }
+
     fn render_rows(&self) -> Div {
         let rows = self.visible_rows();
-        let filter = match self.selection {
+        let diff_mode = self.diff_active();
+        let filter = match &self.selection {
             None => "all subjects".to_string(),
-            Some(Selection::Node(i)) => self
-                .vm
-                .nodes
-                .get(i)
-                .map(|n| n.host.clone())
-                .unwrap_or_default(),
-            Some(Selection::Edge(i)) => self
-                .vm
-                .edges
-                .get(i)
-                .map(|e| format!("{} ⟷ {}", e.a, e.b))
-                .unwrap_or_default(),
+            Some(Selection::Node(host)) => host.clone(),
+            Some(Selection::Edge(a, b)) => format!("{a} ⟷ {b}"),
         };
 
         let mut list = div()
@@ -151,7 +317,12 @@ impl RootView {
             .flex()
             .flex_col();
         for row in &rows {
-            list = list.child(render_row(row));
+            let delta = self
+                .diff
+                .as_ref()
+                .filter(|_| diff_mode)
+                .and_then(|d| d.rows.get(&(row.group.clone(), row.subject.clone())));
+            list = list.child(render_row(row, delta, diff_mode));
         }
 
         div()
@@ -181,29 +352,30 @@ impl RootView {
                     .child(cell_metric("metric"))
                     .child(cell_subject("subject"))
                     .child(cell_value("value"))
-                    .child(cell_dev("dev (MADs)")),
+                    .child(cell_dev(if diff_mode {
+                        "Δ% vs base"
+                    } else {
+                        "dev (MADs)"
+                    })),
             )
             .child(list)
     }
 
     fn visible_rows(&self) -> Vec<&MetricRow> {
-        let rows = self.vm.rows.iter();
-        match self.selection {
+        let Some(run) = &self.current else {
+            return Vec::new();
+        };
+        let rows = run.vm.rows.iter();
+        match &self.selection {
             None => rows.collect(),
-            Some(Selection::Node(i)) => {
-                let Some(node) = self.vm.nodes.get(i) else {
-                    return self.vm.rows.iter().collect();
-                };
-                let prefix = format!("{}:", node.host);
-                rows.filter(|row| row.subject == node.host || row.subject.starts_with(&prefix))
+            Some(Selection::Node(host)) => {
+                let prefix = format!("{host}:");
+                rows.filter(|row| &row.subject == host || row.subject.starts_with(&prefix))
                     .collect()
             }
-            Some(Selection::Edge(i)) => {
-                let Some(edge) = self.vm.edges.get(i) else {
-                    return self.vm.rows.iter().collect();
-                };
-                let forward = format!("{}:pair:{}", edge.a, edge.b);
-                let backward = format!("{}:pair:{}", edge.b, edge.a);
+            Some(Selection::Edge(a, b)) => {
+                let forward = format!("{a}:pair:{b}");
+                let backward = format!("{b}:pair:{a}");
                 rows.filter(|row| row.subject == forward || row.subject == backward)
                     .collect()
             }
@@ -211,7 +383,7 @@ impl RootView {
     }
 }
 
-fn render_row(row: &MetricRow) -> Div {
+fn render_row(row: &MetricRow, delta: Option<&RowDelta>, diff_mode: bool) -> Div {
     let value_color = if row.violated {
         BAD
     } else if row.flagged {
@@ -219,17 +391,35 @@ fn render_row(row: &MetricRow) -> Div {
     } else {
         TEXT
     };
-    let deviation = row
-        .deviation_mads
-        .map(|d| format!("{d:+.1}"))
-        .unwrap_or_else(|| "—".to_string());
-    let deviation_color = if row.flagged || row.violated {
-        value_color
-    } else if row.deviation_mads.is_some_and(|d| d.abs() > 2.0) {
-        WARN
+
+    let (last_text, last_color) = if diff_mode {
+        match delta.and_then(|d| d.delta_fraction.map(|f| (d, f))) {
+            Some((delta, fraction)) => {
+                let color = match delta.severity {
+                    Severity::Bad => BAD,
+                    Severity::Warn => WARN,
+                    Severity::Ok if delta.improved => OK,
+                    Severity::Ok => MUTED,
+                };
+                (format!("{:+.1}%", fraction * 100.0), color)
+            }
+            None => ("—".to_string(), MUTED),
+        }
     } else {
-        MUTED
+        let text = row
+            .deviation_mads
+            .map(|d| format!("{d:+.1}"))
+            .unwrap_or_else(|| "—".to_string());
+        let color = if row.flagged || row.violated {
+            value_color
+        } else if row.deviation_mads.is_some_and(|d| d.abs() > 2.0) {
+            WARN
+        } else {
+            MUTED
+        };
+        (text, color)
     };
+
     div()
         .flex()
         .items_center()
@@ -240,114 +430,15 @@ fn render_row(row: &MetricRow) -> Div {
         .child(cell_metric(row.group.clone()).text_color(rgb(MUTED)))
         .child(cell_subject(row.subject.clone()))
         .child(cell_value(format_value(row.unit, row.value)).text_color(rgb(value_color)))
-        .child(cell_dev(deviation).text_color(rgb(deviation_color)))
+        .child(cell_dev(last_text).text_color(rgb(last_color)))
 }
 
-fn node_card(node: &NodeView) -> Div {
-    let mut card = div().flex().flex_col().gap_2().p_3().child(
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                div()
-                    .w(px(12.0))
-                    .h(px(12.0))
-                    .rounded_full()
-                    .bg(rgb(severity_color(node.severity))),
-            )
-            .child(title(
-                node.hostname.clone().unwrap_or_else(|| node.host.clone()),
-            ))
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(MUTED))
-                    .child(node.host.clone()),
-            ),
-    );
-
-    if !node.stats.is_empty() {
-        let mut stats = div().flex().flex_wrap().gap_x_3().gap_y_1();
-        for (label, value) in &node.stats {
-            stats = stats.child(
-                div()
-                    .flex()
-                    .gap_1()
-                    .text_size(px(11.0))
-                    .child(div().text_color(rgb(MUTED)).child(label.clone()))
-                    .child(div().text_color(rgb(TEXT)).child(value.clone())),
-            );
-        }
-        card = card.child(stats);
-    }
-
-    card.child(issues_list(&node.issues))
-}
-
-fn edge_card(edge: &EdgeView) -> Div {
-    let direction_row =
-        |label: String, bandwidth: Option<f64>, p50: Option<f64>, p99: Option<f64>| {
-            div()
-                .flex()
-                .gap_2()
-                .text_size(px(11.0))
-                .child(cell_grow(label).text_color(rgb(TEXT)))
-                .child(cell_num(opt(Unit::GibPerSec, bandwidth)))
-                .child(cell_num(opt(Unit::Micros, p50)))
-                .child(cell_num(opt(Unit::Micros, p99)))
-        };
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .p_3()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(12.0))
-                        .h(px(12.0))
-                        .rounded_full()
-                        .bg(rgb(severity_color(edge.severity))),
-                )
-                .child(title(format!("{} ⟷ {}", edge.a, edge.b))),
-        )
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .text_size(px(10.0))
-                .text_color(rgb(MUTED))
-                .child(cell_grow("direction"))
-                .child(cell_num("bandwidth"))
-                .child(cell_num("rtt p50"))
-                .child(cell_num("rtt p99")),
-        )
-        .child(direction_row(
-            format!("{} → {}", edge.a, edge.b),
-            edge.bandwidth_gib.from_a,
-            edge.rtt_p50_us.from_a,
-            edge.rtt_p99_us.from_a,
-        ))
-        .child(direction_row(
-            format!("{} → {}", edge.b, edge.a),
-            edge.bandwidth_gib.from_b,
-            edge.rtt_p50_us.from_b,
-            edge.rtt_p99_us.from_b,
-        ))
-        .child(issues_list(&edge.issues))
-}
-
-fn issues_list(issues: &[(Severity, String)]) -> Div {
+fn issues_list(issues: &[Issue], empty_text: &str) -> Div {
     if issues.is_empty() {
         return div()
             .text_size(px(11.0))
             .text_color(rgb(OK))
-            .child("no findings");
+            .child(empty_text.to_string());
     }
     let mut list = div().flex().flex_col().gap_1();
     for (severity, text) in issues {
