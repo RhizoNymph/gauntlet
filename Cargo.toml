@@ -43,3 +43,9 @@ gpu = ["dep:cudarc", "dep:half", "dep:base64"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+[workspace]
+members = [".", "viewer"]
+# Plain `cargo build` builds only the CLI; the GUI viewer is built with
+# `cargo build -p gauntlet-view` (or --workspace).
+default-members = ["."]

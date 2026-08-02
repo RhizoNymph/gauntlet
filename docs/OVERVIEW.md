@@ -95,6 +95,17 @@ Features Index:
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
     doc: docs/features/reporting.md
+  viewer:
+    description: >
+      `gauntlet-view` (workspace member `viewer/`): native GPUI desktop app
+      rendering a saved run as a fully connected fleet graph — node color =
+      host health, edge color = pairwise-path health — plus per-direction
+      edge details, roofline cards, link fits, and a filterable quantitative
+      metric table. Reads the same runs/<run_id>.json documents the CLI
+      writes; performs no analysis beyond projecting fleet findings.
+    entry_points: [viewer/src/main.rs, viewer/src/model.rs, viewer/src/ui/]
+    depends_on: [reporting]
+    doc: docs/features/viewer.md
 ```
 
 ## Decisions (2026-08-01)
