@@ -142,6 +142,12 @@ impl RootView {
                 .filter(|n| n.perf_severity == Severity::Bad)
                 .count();
             let skewed = vm.nodes.iter().filter(|n| n.skew).count();
+            let flagged_links = vm
+                .edges
+                .iter()
+                .filter(|e| e.severity > Severity::Ok)
+                .count();
+            let any_bad_link = vm.edges.iter().any(|e| e.severity == Severity::Bad);
             card = card.child(title("fleet overview")).child(
                 div()
                     .flex()
@@ -152,6 +158,15 @@ impl RootView {
                     })
                     .when(failed > 0, |row| {
                         row.child(chip(BAD, format!("{failed} failed")))
+                    })
+                    .when(flagged_links > 0, |row| {
+                        row.child(chip(
+                            if any_bad_link { BAD } else { WARN },
+                            format!(
+                                "{flagged_links} link{} flagged",
+                                if flagged_links == 1 { "" } else { "s" }
+                            ),
+                        ))
                     })
                     .when(skewed > 0, |row| {
                         row.child(chip(WARN, format!("{skewed} version skew")))
