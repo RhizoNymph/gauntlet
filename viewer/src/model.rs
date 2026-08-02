@@ -97,6 +97,8 @@ pub struct ViewModel {
     pub run_id: String,
     pub wall_secs: u64,
     pub verdict: Verdict,
+    /// The producing orchestrator/agent was an unoptimized build.
+    pub debug_build: bool,
     /// Sorted by host.
     pub nodes: Vec<NodeView>,
     /// Sorted by (a, b).
@@ -252,6 +254,7 @@ impl ViewModel {
 
         ViewModel {
             run_id: results.run_id.clone(),
+            debug_build: results.debug_build,
             wall_secs: results
                 .finished_epoch_secs
                 .saturating_sub(results.started_epoch_secs),

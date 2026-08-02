@@ -35,6 +35,10 @@ pub struct RunResults {
     pub run_id: String,
     pub started_epoch_secs: u64,
     pub finished_epoch_secs: u64,
+    /// True when the orchestrator (and therefore the deployed agent) was
+    /// built without optimizations; such numbers are not comparable.
+    #[serde(default)]
+    pub debug_build: bool,
     pub hosts: BTreeMap<String, HostObservations>,
     pub fleet: FleetAnalysis,
     pub calibration: Calibration,
@@ -223,6 +227,7 @@ pub fn build(
         run_id,
         started_epoch_secs,
         finished_epoch_secs,
+        debug_build: false,
         hosts: observations,
         fleet,
         calibration,

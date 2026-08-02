@@ -26,6 +26,8 @@ pub struct RunEntry {
     pub verdict: Option<Verdict>,
     pub hosts: usize,
     pub started_epoch_secs: u64,
+    /// File mtime at scan time; drives stalled-run detection.
+    pub modified: Option<SystemTime>,
 }
 
 /// Classify a runs-directory file name. Hidden files (leading '.') and
@@ -136,6 +138,7 @@ pub fn scan(dir: &Path, cache: &mut ScanCache) -> Vec<RunEntry> {
                     verdict: Some(report::verdict(&results)),
                     hosts: results.hosts.len(),
                     started_epoch_secs: results.started_epoch_secs,
+                    modified: Some(fingerprint.0),
                 });
                 cache
                     .files
@@ -149,6 +152,25 @@ pub fn scan(dir: &Path, cache: &mut ScanCache) -> Vec<RunEntry> {
     }
     cache.files.retain(|path, _| seen.contains(path));
     order_and_dedupe(entries)
+}
+
+/// A live run whose partial file has not been rewritten for this long has
+/// almost certainly died (the orchestrator snapshots every ~2s while
+/// anything is happening).
+pub const STALL_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// True when a live run's snapshot file stopped updating.
+pub fn is_stalled(live: bool, modified: Option<SystemTime>, now: SystemTime) -> bool {
+    if !live {
+        return false;
+    }
+    match modified {
+        Some(modified) => now
+            .duration_since(modified)
+            .map(|age| age > STALL_AFTER)
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 /// "YYYY-MM-DD HH:MM:SS" in UTC.

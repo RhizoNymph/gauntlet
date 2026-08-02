@@ -127,6 +127,7 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             run_id: run_id.into(),
             started_epoch_secs: 1,
+            debug_build: false,
             finished_epoch_secs: 2,
             hosts: BTreeMap::new(),
             fleet: FleetAnalysis::default(),

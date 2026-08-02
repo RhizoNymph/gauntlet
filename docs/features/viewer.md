@@ -13,7 +13,18 @@ connected fleet graph plus a quantitative metric table.
 - Launch runs from the GUI: the ▶ button spawns the `gauntlet` binary
   (sibling of the viewer binary, else $PATH) with `run --config <config>`,
   logs to `runs/gauntlet-run.log`, follows the new live run, and reports
-  the exit verdict.
+  the exit verdict. ✕ cancel kills the child; a cancelled run's orphaned
+  partial snapshot is deleted and the view falls back to the newest
+  finished run. Live runs whose partial stops updating for >15s show
+  "stalled" in the sidebar.
+- Bootstrap from the GUI: the ⚙ button spawns `gauntlet bootstrap --json`,
+  captures the readiness report to `runs/.bootstrap.json` (dot-prefixed so
+  the run scanner ignores it), and renders a check × host matrix in the
+  center pane (✓/!/✗ cells, details for anything non-ok). The report is
+  reloaded on startup and reachable via "view last bootstrap".
+- Runs produced by a debug (unoptimized) build carry `debug_build: true`
+  and get a red "debug build" chip in the header — their numbers are not
+  comparable to release-build runs.
 - Diff mode: toggle in the header. Colors nodes/edges by regression vs a
   baseline run (pinned via the sidebar, else the previous finished run);
   the table's deviation column becomes Δ% vs baseline.
@@ -85,7 +96,10 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
   (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals
   shadow stale partials), `effective_baseline`, `scan` (directory scan
-  with an (mtime, len) parse cache), `format_epoch_utc`.
+  with an (mtime, len) parse cache), `is_stalled`, `format_epoch_utc`.
+- `viewer/src/bootstrap.rs` — pure readiness-matrix projection
+  (`check_columns` union, `status_of`, `worst_of`); rendered by
+  `viewer/src/ui/bootstrap.rs`.
 - `viewer/src/layout.rs` — ring layout in unit space, letterboxed pixel
   mapping, point-segment distance, node/edge hit-testing. Pure math.
 - `viewer/src/ui/mod.rs` — theme constants, `Selection` (keyed by host /
@@ -106,6 +120,8 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
   node/edge attribution, issue capping.
 - `viewer/tests/runs_tests.rs` — classification, ordering, baseline
   resolution, scanning, timestamp math.
+- `viewer/tests/bootstrap_tests.rs` — matrix projection and stalled-run
+  detection.
 
 ## Invariants and constraints
 

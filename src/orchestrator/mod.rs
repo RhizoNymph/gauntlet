@@ -147,6 +147,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let config = FleetConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
     let phases = config.resolve_phases(&args.phases)?;
+    bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
     // one identity: a viewer tailing runs/ can follow a run across completion
@@ -238,6 +239,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     );
     // The id the snapshots have been published under wins, so the final
     // document lands where onlookers were already watching.
+    results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
     let path = match &args.out {
         Some(path) => {

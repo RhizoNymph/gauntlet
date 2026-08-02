@@ -72,3 +72,14 @@ writes `performance` into every `cpufreq/scaling_governor` via
   resolves and `mkdir -p`s it at connect time and caches the absolute path.
 - Uploads are staged (`<path>.staging` → `chmod` → `mv -f`) so replacing a
   running agent cannot fail with `ETXTBSY` or leave a truncated binary.
+
+## Machine interface (`--json`)
+
+`gauntlet bootstrap --json` prints a `BootstrapReport` document to stdout
+instead of the table: `{ schema_version, finished_epoch_secs, hosts:
+[HostReadiness] }`, where each `HostReadiness` carries the ordered
+`ReadinessCheck` list (`name`, `status`: ok|warn|fail, one-line `detail`)
+plus the probed `InventorySnapshot` when available. The exit code contract
+is unchanged (non-zero when any host's worst status is fail). The GUI
+viewer runs bootstrap through this interface and renders the same matrix;
+`BOOTSTRAP_SCHEMA_VERSION` bumps on field renames.

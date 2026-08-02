@@ -55,7 +55,8 @@ Features Index:
       `gauntlet bootstrap`: connectivity check, arch check, agent deploy,
       capability probe (agent probe -> InventorySnapshot), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
-      readiness matrix; idempotent.
+      readiness matrix; idempotent. `--json` emits the same report as a
+      schema-versioned document (the GUI viewer's interface).
     entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
     depends_on: []
     doc: docs/features/bootstrap.md
@@ -115,7 +116,9 @@ Features Index:
       a 1s poll loop live-tails `<run_id>.partial.json` snapshots while a
       run executes; the ▶ button launches `gauntlet run` directly; diff
       mode recolors the graph by regression vs a baseline run (>5% warn,
-      >15% bad, unit-aware direction of goodness).
+      >15% bad, unit-aware direction of goodness). ⚙ runs bootstrap --json
+      and renders the readiness matrix; ✕ cancels a launched child (and
+      cleans up its orphaned partial); debug-build runs are chip-flagged.
     entry_points: [viewer/src/main.rs, viewer/src/model.rs, viewer/src/ui/]
     depends_on: [reporting]
     doc: docs/features/viewer.md

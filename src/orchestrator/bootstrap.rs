@@ -31,6 +31,17 @@ use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
 use crate::proto::InventorySnapshot;
 
+/// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
+/// viewer renders the same matrix from this document.
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BootstrapReport {
+    pub schema_version: u32,
+    pub finished_epoch_secs: u64,
+    pub hosts: Vec<HostReadiness>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
@@ -77,6 +88,17 @@ impl ReadinessCheck {
     }
 }
 
+/// The deployed agent is a copy of this binary, so an unoptimized build
+/// understates CPU/GPU numbers by an order of magnitude or more.
+pub fn warn_if_debug_build() {
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            "this is a debug build; benchmark numbers will be badly understated — \
+             rebuild with `cargo build --release`"
+        );
+    }
+}
+
 /// Clock offsets beyond this are a warning: cross-host timestamps drift.
 const CLOCK_WARN_MS: f64 = 100.0;
 /// Beyond this the fleet's timestamps cannot be correlated at all.
@@ -94,6 +116,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
         tune = args.tune,
         "bootstrapping fleet"
     );
+    warn_if_debug_build();
 
     let mut tasks = JoinSet::new();
     for (index, host) in hosts.iter().cloned().enumerate() {
@@ -131,7 +154,20 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
         .collect();
 
     let mut stdout = std::io::stdout();
-    render_matrix(&rows, &mut stdout)?;
+    if args.json {
+        let report = BootstrapReport {
+            schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            finished_epoch_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default(),
+            hosts: rows.clone(),
+        };
+        serde_json::to_writer_pretty(&mut stdout, &report).context("writing readiness JSON")?;
+        writeln!(stdout)?;
+    } else {
+        render_matrix(&rows, &mut stdout)?;
+    }
     stdout.flush().context("flushing stdout")?;
 
     let failed: Vec<&str> = rows
@@ -929,5 +965,26 @@ mod tests {
             !script.contains("{lib_dir}"),
             "all placeholders substituted"
         );
+    }
+
+    #[test]
+    fn readiness_report_round_trips_through_json() {
+        let report = BootstrapReport {
+            schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            finished_epoch_secs: 1_700_000_000,
+            hosts: vec![HostReadiness {
+                host: "10.0.0.1".into(),
+                checks: vec![
+                    ReadinessCheck::ok("connectivity", "~/.gauntlet"),
+                    ReadinessCheck::warn("governor", "powersave"),
+                    ReadinessCheck::fail("gpu_driver", "nvidia-smi missing"),
+                ],
+                inventory: None,
+            }],
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains("\"status\": \"warn\"") || json.contains("\"status\":\"warn\""));
+        let back: BootstrapReport = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, report);
     }
 }

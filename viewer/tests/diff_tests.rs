@@ -33,6 +33,7 @@ fn vm(run_id: &str, hosts: &[&str], rows: Vec<MetricRow>) -> ViewModel {
         run_id: run_id.into(),
         wall_secs: 60,
         verdict: Verdict::Clean,
+        debug_build: false,
         nodes: hosts.iter().map(|h| node(h)).collect(),
         edges: Vec::new(),
         rows,
