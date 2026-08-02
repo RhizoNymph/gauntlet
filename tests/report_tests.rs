@@ -253,3 +253,158 @@ fn missing_history_dir_lists_empty() {
     let listed = gauntlet::report::history::list(&dir).expect("empty ok");
     assert!(listed.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Stable run ids and partial (in-flight) snapshots
+// ---------------------------------------------------------------------------
+
+fn hosts(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| (*name).to_string()).collect()
+}
+
+/// A results document with an arbitrary run id, for filesystem tests.
+fn results_with_id(run_id: &str) -> gauntlet::report::RunResults {
+    let (config, observations) = fleet();
+    let mut results = report::build(&config, observations, 1_700_000_000, 1_700_000_600);
+    results.run_id = run_id.to_string();
+    results
+}
+
+#[test]
+fn make_run_id_is_deterministic_and_well_formed() {
+    let hosts = hosts(&["n1", "n2", "n3"]);
+    let id = report::make_run_id(1_700_000_000, &hosts);
+    assert_eq!(id, report::make_run_id(1_700_000_000, &hosts));
+
+    let (stamp, suffix) = id.split_once('-').expect("<epoch>-<suffix>");
+    assert_eq!(stamp, "1700000000");
+    assert_eq!(suffix.len(), 6);
+    assert!(
+        suffix
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "{suffix}"
+    );
+}
+
+#[test]
+fn make_run_id_varies_with_start_time_and_host_set() {
+    let base = hosts(&["n1", "n2"]);
+    let id = report::make_run_id(1_700_000_000, &base);
+
+    // A different start second changes both halves.
+    assert_ne!(id, report::make_run_id(1_700_000_001, &base));
+    // A different host set changes the suffix at the same start second.
+    assert_ne!(
+        id,
+        report::make_run_id(1_700_000_000, &hosts(&["n1", "n3"]))
+    );
+    assert_ne!(
+        id,
+        report::make_run_id(1_700_000_000, &hosts(&["n1", "n2", "n3"]))
+    );
+    // The id is independent of the run's finish time, unlike `build`'s.
+    assert_eq!(id, report::make_run_id(1_700_000_000, &base));
+}
+
+#[test]
+fn save_partial_writes_the_partial_name_and_leaves_no_temporary() {
+    let dir = common::scratch_dir("partial-save");
+    let results = results_with_id("1700000000-abcdef");
+
+    let path = gauntlet::report::history::save_partial(&results, &dir).expect("save partial");
+    assert_eq!(path, dir.join("1700000000-abcdef.partial.json"));
+    assert_eq!(
+        gauntlet::report::history::load(&path).expect("load partial"),
+        results
+    );
+
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .expect("read dir")
+        .map(|entry| entry.expect("entry").file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temporary left behind: {leftovers:?}");
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn save_partial_overwrites_the_previous_snapshot() {
+    let dir = common::scratch_dir("partial-overwrite");
+    let mut results = results_with_id("1700000000-abcdef");
+
+    let first = gauntlet::report::history::save_partial(&results, &dir).expect("first snapshot");
+    results.finished_epoch_secs = 1_700_000_900;
+    let second = gauntlet::report::history::save_partial(&results, &dir).expect("second snapshot");
+
+    assert_eq!(first, second);
+    let loaded = gauntlet::report::history::load(&second).expect("load");
+    assert_eq!(loaded.finished_epoch_secs, 1_700_000_900);
+    assert_eq!(
+        std::fs::read_dir(&dir).expect("read dir").count(),
+        1,
+        "one snapshot file, replaced in place"
+    );
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn list_ignores_partials_and_hidden_files() {
+    let dir = common::scratch_dir("partial-list");
+    let finished =
+        gauntlet::report::history::save(&results_with_id("1700000000-aaaaaa"), &dir).expect("save");
+    gauntlet::report::history::save_partial(&results_with_id("1700000900-bbbbbb"), &dir)
+        .expect("save partial");
+    std::fs::write(dir.join(".1700000900-bbbbbb.partial.json.tmp"), "{}").expect("write tmp");
+    std::fs::write(dir.join(".hidden.json"), "{}").expect("write hidden");
+
+    assert_eq!(
+        gauntlet::report::history::list(&dir).expect("list"),
+        vec![finished]
+    );
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn list_live_returns_only_partials_in_order() {
+    let dir = common::scratch_dir("partial-list-live");
+    gauntlet::report::history::save(&results_with_id("1700000000-aaaaaa"), &dir).expect("save");
+    let second =
+        gauntlet::report::history::save_partial(&results_with_id("1700000900-bbbbbb"), &dir)
+            .expect("save partial");
+    let first =
+        gauntlet::report::history::save_partial(&results_with_id("1700000000-cccccc"), &dir)
+            .expect("save partial");
+
+    assert_eq!(
+        gauntlet::report::history::list_live(&dir).expect("list live"),
+        vec![first, second]
+    );
+
+    let missing = dir.join("does-not-exist");
+    assert!(
+        gauntlet::report::history::list_live(&missing)
+            .expect("empty ok")
+            .is_empty()
+    );
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn remove_partial_deletes_the_snapshot_and_tolerates_absence() {
+    let dir = common::scratch_dir("partial-remove");
+    let path = gauntlet::report::history::save_partial(&results_with_id("1700000000-abcdef"), &dir)
+        .expect("save partial");
+
+    gauntlet::report::history::remove_partial("1700000000-abcdef", &dir).expect("remove");
+    assert!(!path.exists());
+    // Removing again (and removing one that never existed) is not an error.
+    gauntlet::report::history::remove_partial("1700000000-abcdef", &dir).expect("idempotent");
+    gauntlet::report::history::remove_partial("1700000000-nothere", &dir).expect("absent is ok");
+
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+}

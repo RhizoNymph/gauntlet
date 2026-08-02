@@ -31,7 +31,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use self::collect::Collector;
+use self::collect::{Collector, HostObservations};
 use self::session::{HostSession, single_quote};
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
@@ -49,6 +49,8 @@ const PEER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIR_TIMEOUT_SLACK: Duration = Duration::from_secs(60);
 /// Time given to a freshly spawned `agent peer serve` to bind its port.
 const PEER_BIND_DELAY: Duration = Duration::from_millis(500);
+/// How often the collector publishes a partial snapshot of a run in flight.
+const PARTIAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Observation plumbing
@@ -106,6 +108,37 @@ impl ObservationSink {
     }
 }
 
+/// Everything the collector task needs to publish an in-flight snapshot of
+/// the run to `runs/<run_id>.partial.json`. Present only when the run writes
+/// to the default history directory.
+struct PartialWriter {
+    run_id: String,
+    config: FleetConfig,
+    started_epoch_secs: u64,
+}
+
+impl PartialWriter {
+    /// Analyse and publish `observations` as they stand. Snapshots are a
+    /// convenience for onlookers: a failure here is logged and forgotten,
+    /// never propagated into the run.
+    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+        let mut results = report::build(
+            &self.config,
+            observations,
+            self.started_epoch_secs,
+            epoch_secs(),
+        );
+        results.run_id = self.run_id.clone();
+        let dir = Path::new(report::history::DEFAULT_DIR);
+        match report::history::save_partial(&results, dir) {
+            Ok(path) => {
+                debug!(path = %path.display(), run_id = %self.run_id, "partial snapshot written")
+            }
+            Err(error) => warn!(%error, run_id = %self.run_id, "cannot write partial snapshot"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -115,15 +148,46 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .with_context(|| format!("loading {}", args.config.display()))?;
     let phases = config.resolve_phases(&args.phases)?;
     let started_epoch_secs = epoch_secs();
+    // Fixed up front so the in-flight snapshots and the final document share
+    // one identity: a viewer tailing runs/ can follow a run across completion
+    // without re-keying it.
+    let host_addrs: Vec<String> = config.hosts().map(|host| host.addr).collect();
+    let run_id = report::make_run_id(started_epoch_secs, &host_addrs);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let sink = ObservationSink(tx);
+    // Snapshots only make sense for the default history directory; an
+    // explicit --out is a one-shot destination, not a directory a viewer
+    // tails.
+    let partials = args.out.is_none().then(|| PartialWriter {
+        run_id: run_id.clone(),
+        config: config.clone(),
+        started_epoch_secs,
+    });
     let collector = tokio::spawn(async move {
         let mut collector = Collector::new();
-        while let Some(observation) = rx.recv().await {
-            match observation {
-                Observation::Event { host, event } => collector.ingest(&host, *event),
-                Observation::Error { host, error } => collector.host_error(&host, error),
+        let mut dirty = false;
+        let mut ticker = tokio::time::interval(PARTIAL_SNAPSHOT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                observation = rx.recv() => match observation {
+                    Some(Observation::Event { host, event }) => {
+                        collector.ingest(&host, *event);
+                        dirty = true;
+                    }
+                    Some(Observation::Error { host, error }) => {
+                        collector.host_error(&host, error);
+                        dirty = true;
+                    }
+                    None => break,
+                },
+                _ = ticker.tick() => {
+                    if dirty && let Some(partials) = &partials {
+                        partials.write(collector.snapshot());
+                        dirty = false;
+                    }
+                }
             }
         }
         collector.into_observations()
@@ -166,12 +230,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let observations = collector.await.context("collector task")?;
     let finished_epoch_secs = epoch_secs();
 
-    let results = report::build(
+    let mut results = report::build(
         &config,
         observations,
         started_epoch_secs,
         finished_epoch_secs,
     );
+    // The id the snapshots have been published under wins, so the final
+    // document lands where onlookers were already watching.
+    results.run_id = run_id.clone();
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -184,8 +251,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
             std::fs::write(path, json).with_context(|| format!("writing {}", path.display()))?;
             path.clone()
         }
-        None => report::history::save(&results, Path::new(report::history::DEFAULT_DIR))
-            .context("saving run history")?,
+        None => {
+            let dir = Path::new(report::history::DEFAULT_DIR);
+            let path = report::history::save(&results, dir).context("saving run history")?;
+            // The finished document supersedes the snapshots; a stale partial
+            // left behind would show a viewer a run that never ends.
+            if let Err(error) = report::history::remove_partial(&run_id, dir) {
+                debug!(%error, run_id = %run_id, "leftover partial snapshot not removed");
+            }
+            path
+        }
     };
     info!(path = %path.display(), run_id = %results.run_id, "results written");
 

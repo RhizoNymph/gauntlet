@@ -35,13 +35,19 @@ Overview:
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
       MADs, applies optional absolute thresholds, renders table + JSON, sets
-      exit code. Runs persisted for diffing against last known-good.
+      exit code. Runs persisted for diffing against last known-good. A run in
+      flight also republishes itself every 2s as runs/<run_id>.partial.json so
+      viewers can tail progress.
   data_flow: >
     config.toml -> orchestrator -> (scp agent, spawn `gauntlet agent` per
     host/pair) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
     mpsc -> collector -> outlier analysis -> report.json + terminal table.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
+    The collector task also ticks on a 2s interval, rebuilding the results
+    document from a snapshot of its state and writing it atomically to
+    runs/<run_id>.partial.json; that file is removed when the final
+    runs/<run_id>.json lands.
 
 Features Index:
   bootstrap:
@@ -91,7 +97,11 @@ Features Index:
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
-      overlay, run history, terminal table, exit codes.
+      overlay, run history, terminal table, exit codes. Live runs publish
+      periodic partial snapshots (runs/<run_id>.partial.json, written via
+      temp+rename, removed on completion) under a run id fixed at startup;
+      history::list excludes them, history::list_live enumerates them.
+      Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
     doc: docs/features/reporting.md

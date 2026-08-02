@@ -93,6 +93,13 @@ impl Collector {
             .push(error);
     }
 
+    /// A detached copy of everything seen so far, for the periodic partial
+    /// snapshots written while a run is still in flight. The collector keeps
+    /// ownership of its state and carries on.
+    pub fn snapshot(&self) -> BTreeMap<String, HostObservations> {
+        self.hosts.clone()
+    }
+
     pub fn into_observations(self) -> BTreeMap<String, HostObservations> {
         self.hosts
     }
@@ -207,6 +214,26 @@ mod tests {
         let observations = collector.into_observations();
         let host = observations.get("a").expect("host recorded even so");
         assert_eq!(host, &HostObservations::default());
+    }
+
+    #[test]
+    fn snapshots_copy_state_without_consuming_the_collector() {
+        let mut collector = Collector::new();
+        collector.ingest(
+            "a",
+            AgentEvent::Metric {
+                record: metric("gflops"),
+            },
+        );
+
+        let early = collector.snapshot();
+        assert_eq!(early["a"].metrics.len(), 1);
+
+        collector.host_error("b", "connect refused".into());
+        let later = collector.snapshot();
+        assert_eq!(early.len(), 1, "an earlier snapshot is a detached copy");
+        assert_eq!(later.len(), 2);
+        assert_eq!(later, collector.into_observations());
     }
 
     #[test]
