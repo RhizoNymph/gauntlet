@@ -496,6 +496,23 @@ fn run_suffix(
     finished_epoch_secs: u64,
     observations: &BTreeMap<String, HostObservations>,
 ) -> String {
+    id_suffix(finished_epoch_secs, observations.keys().map(String::as_str))
+}
+
+/// The run id a run will carry, known before any observation arrives: same
+/// shape as `build`'s, seeded from the *start* time and the configured host
+/// list rather than the finish time and the hosts heard from. In-flight
+/// partial snapshots and the final document therefore share one id.
+pub fn make_run_id(started_epoch_secs: u64, hosts: &[String]) -> String {
+    format!(
+        "{started_epoch_secs}-{}",
+        id_suffix(started_epoch_secs, hosts.iter().map(String::as_str))
+    )
+}
+
+/// FNV-1a over a timestamp then the host set (count first, so two host lists
+/// cannot alias by concatenation), folded to six hex characters.
+fn id_suffix<'a>(seed_epoch_secs: u64, hosts: impl ExactSizeIterator<Item = &'a str>) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -505,9 +522,9 @@ fn run_suffix(
         })
     }
 
-    let mut hash = mix(OFFSET, &finished_epoch_secs.to_le_bytes());
-    hash = mix(hash, &(observations.len() as u64).to_le_bytes());
-    for host in observations.keys() {
+    let mut hash = mix(OFFSET, &seed_epoch_secs.to_le_bytes());
+    hash = mix(hash, &(hosts.len() as u64).to_le_bytes());
+    for host in hosts {
         hash = mix(hash, host.as_bytes());
     }
     format!("{:06x}", hash & 0xff_ffff)

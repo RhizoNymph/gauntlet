@@ -29,7 +29,15 @@ started, finished)`:
    Exit codes 2/1/0.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
-over the finish timestamp and the host set (deterministic, no rand dep).
+over a timestamp and the host set (deterministic, no rand dep). Two seeds
+produce the same shape:
+- `build` seeds from the *finish* timestamp and the hosts actually heard
+  from (`observations.keys()`, sorted) — the id of a document built in
+  isolation, e.g. by tests or an offline re-analysis.
+- `make_run_id(started_epoch_secs, hosts)` seeds from the *start* timestamp
+  and the configured host addresses in config order. `gauntlet run` computes
+  this once at startup and stamps it over `build`'s id, so a run has one
+  identity from its first partial snapshot through its final document.
 
 ## Key formats (contract with the orchestrator)
 - `metric_key(test, name)` = "<test_display_name>.<name>", e.g.
@@ -97,15 +105,54 @@ loads via `history::load` and prints the table, or pretty JSON with
 `--json`.
 
 ## Persistence (history.rs)
-`runs/<run_id>.json`, pretty-printed. `list` returns `*.json` paths sorted
-by file name (chronological, since run_id leads with the epoch) and treats
-a missing directory as an empty list.
+`runs/<run_id>.json`, pretty-printed. `list` returns completed `*.json`
+paths sorted by file name (chronological, since run_id leads with the
+epoch) and treats a missing directory as an empty list. It skips in-flight
+snapshots (`*.partial.json`) and anything whose file name starts with `.`
+(hidden files and the snapshot staging file).
+
+### Partial snapshots (contract with the viewer)
+While a run is in flight the collector republishes the whole results
+document every `PARTIAL_SNAPSHOT_INTERVAL` (2s) so a separate process can
+tail progress:
+- **Filename**: `runs/<run_id>.partial.json` (`history::PARTIAL_SUFFIX` =
+  `".partial.json"`). Same `RunResults` schema as a finished run — a
+  snapshot is just an early build over the observations so far, with
+  `finished_epoch_secs` set to the snapshot time.
+- **Atomicity**: `save_partial` writes `runs/.<run_id>.partial.json.tmp`
+  then renames it over the destination. A reader therefore sees either the
+  previous snapshot or the new one, never a torn document. The staging name
+  is hidden and `.tmp`-suffixed, so neither `list` nor `list_live` shows it.
+- **Stable id**: the snapshots and the final document share the `run_id`
+  from `make_run_id(started, configured hosts)`, computed before the first
+  event arrives. A viewer keys on it and follows a run across completion.
+- **Cadence**: tick-driven (`tokio::time::interval`,
+  `MissedTickBehavior::Delay`) and gated on a dirty flag, so an idle run
+  rewrites nothing. A snapshot failure is logged (warn) and dropped; it can
+  never abort a run.
+- **Cleanup**: after the final `runs/<run_id>.json` is saved,
+  `remove_partial(run_id, dir)` deletes the snapshot (absent is Ok), so a
+  live listing only ever contains runs that are genuinely in flight. A
+  crashed run leaves its last snapshot behind by design.
+- **Only the default directory**: `--out <path>` is a one-shot destination,
+  not a directory anyone tails, so it disables snapshots entirely.
+- `list_live(dir)` returns the `*.partial.json` paths, sorted, with a
+  missing directory yielding an empty list — the viewer's discovery call.
 
 ## Files
-`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history}.rs`.
+`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history}.rs`,
+`src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
+`src/orchestrator/collect.rs` (`Collector::snapshot`).
 
 ## Invariants
 - SCHEMA_VERSION bumps on any field rename/removal in `RunResults`.
+- A run's `run_id` never changes once the run has started: the partial
+  snapshots and the final document are the same file stem.
+- `list` and `list_live` partition the visible documents in a run
+  directory; a `<run_id>` appearing in both is a transient overlap only if
+  cleanup failed.
+- Partial snapshots are advisory. Nothing in the run path reads them, and
+  no snapshot error is ever fatal.
 - The table is a projection of the JSON; no analysis happens at render
   time.
 - Outlier grouping never compares across different units, and never
