@@ -1,11 +1,12 @@
 # Example fleet config for `gauntlet run -c gauntlet.toml`.
 
 # Hosts: bare strings or tables with labels. Must appear before any [table]
-# header (top-level TOML key).
+# header (top-level TOML key). `data_addr` points pairwise network tests at
+# a data-plane NIC when ssh rides a management network.
 hosts = [
     "10.0.0.1",
     "10.0.0.2",
-    { addr = "10.0.0.3", labels = { rack = "r2", role = "trainer" } },
+    { addr = "10.0.0.3", data_addr = "10.1.1.3", labels = { rack = "r2", role = "trainer" } },
 ]
 
 [ssh]

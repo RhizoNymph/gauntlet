@@ -58,6 +58,11 @@ pub enum HostEntry {
 #[serde(deny_unknown_fields)]
 pub struct HostConfig {
     pub addr: String,
+    /// Address on the data-plane network, for clusters where ssh rides a
+    /// management NIC but training traffic rides a faster fabric. Pairwise
+    /// network tests target this when set; ssh always uses `addr`.
+    #[serde(default)]
+    pub data_addr: Option<String>,
     /// Free-form labels (rack, role, ...) surfaced in reports.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
@@ -211,6 +216,7 @@ impl FleetConfig {
         self.hosts.iter().map(|entry| match entry {
             HostEntry::Addr(addr) => HostConfig {
                 addr: addr.clone(),
+                data_addr: None,
                 labels: BTreeMap::new(),
             },
             HostEntry::Full(full) => full.clone(),

@@ -101,6 +101,22 @@ fn resolve_phases_defaults_and_aliases() {
 }
 
 #[test]
+fn data_addr_parses_and_defaults_off() {
+    let config = parse(
+        r#"
+        hosts = [
+            "10.0.0.1",
+            { addr = "10.0.0.2", data_addr = "10.1.1.2" },
+        ]
+        "#,
+    )
+    .expect("data_addr host form");
+    let hosts: Vec<_> = config.hosts().collect();
+    assert_eq!(hosts[0].data_addr, None);
+    assert_eq!(hosts[1].data_addr.as_deref(), Some("10.1.1.2"));
+}
+
+#[test]
 fn task_spec_converts_units() {
     let config = parse(
         r#"

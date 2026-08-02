@@ -464,7 +464,14 @@ async fn run_pair(
     };
     tokio::time::sleep(PEER_BIND_DELAY).await;
 
-    let target = format!("{}:{port}", peer_endpoint(&server_addr));
+    // Benchmark traffic goes over the data plane when one is configured;
+    // ssh (and therefore `server_addr`) may ride a management NIC.
+    let endpoint = server
+        .host
+        .data_addr
+        .clone()
+        .unwrap_or_else(|| peer_endpoint(&server_addr).to_string());
+    let target = format!("{endpoint}:{port}");
     let outcome = tokio::time::timeout(params.timeout, probe_pair(&client, &target, params)).await;
 
     stop_peer(&server, &target, port, child).await;

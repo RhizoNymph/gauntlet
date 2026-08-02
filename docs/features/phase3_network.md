@@ -23,6 +23,12 @@ Orchestrator phase-3 driver:
    `links` entries ("tcp_pairwise" from latency+bandwidth points per pair
    class, "nccl_allreduce_fleet" from the sweep).
 
+## Management vs data plane
+`HostConfig.data_addr`, when set, is the target for peer latency/bandwidth
+probes; ssh control traffic stays on `addr`. Without it, the target is
+`addr` stripped of user/port. NCCL interface selection is orthogonal:
+`[nccl] socket_ifname` pins NCCL_SOCKET_IFNAME (e.g. "bond0").
+
 ## Peer wire format (net.rs)
 First byte from client selects mode: 0x01 latency, 0x02 bandwidth, 0xFF
 shutdown. Latency: 8-byte payload echoed, TCP_NODELAY, client times each
