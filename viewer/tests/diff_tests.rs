@@ -23,6 +23,8 @@ fn node(host: &str) -> NodeView {
         host: host.into(),
         hostname: None,
         severity: Severity::Ok,
+        perf_severity: Severity::Ok,
+        skew: false,
         issues: Vec::new(),
         stats: Vec::new(),
     }

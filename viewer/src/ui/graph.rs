@@ -10,7 +10,8 @@ use gpui::{
 };
 
 use super::{
-    BAD, EDGE_OK, MUTED, OK, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN, severity_color,
+    BAD, BG, EDGE_OK, MUTED, OK, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN,
+    severity_color,
 };
 use crate::layout;
 use crate::model::{Severity, ViewModel};
@@ -203,6 +204,10 @@ impl RootView {
                 };
                 let selected = self.node_selected(&node.host);
                 let color = severity_color(self.display_node_severity(node));
+                // Skew-only nodes render as a hollow ring: present, flagged,
+                // but not a performance problem. Diff mode has its own
+                // semantics and keeps solid fills.
+                let skew_only = !self.diff_active() && node.skew_only();
                 let host = node.host.clone();
                 pane = pane
                     .child(
@@ -214,10 +219,12 @@ impl RootView {
                             .w(px(NODE_RADIUS * 2.0))
                             .h(px(NODE_RADIUS * 2.0))
                             .rounded_full()
-                            .bg(rgb(color))
+                            .bg(if skew_only { rgb(BG) } else { rgb(color) })
                             .border_2()
                             .border_color(if selected {
                                 rgb(SELECT)
+                            } else if skew_only {
+                                rgb(WARN)
                             } else {
                                 rgb(PANEL_BORDER)
                             })
