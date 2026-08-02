@@ -45,13 +45,8 @@ fn execute(directive: &NcclDirective) -> Result<()> {
     // fails this directive instead of aborting the process.
     use crate::agent::gpu::guard;
     match directive {
-        NcclDirective::GenerateId => {
-            let id = guard("nccl generate id", imp::generate_id)
-                .map_err(|reason| anyhow::anyhow!("{reason}"))?;
-            // The one and only stdout line this mode produces.
-            println!("{}", serde_json::to_string(&id)?);
-            Ok(())
-        }
+        NcclDirective::Lead { .. } => guard("nccl lead", || imp::lead(directive))
+            .map_err(|reason| anyhow::anyhow!("{reason}")),
         NcclDirective::Participate { .. } => {
             guard("nccl participate", || imp::participate(directive))
                 .map_err(|reason| anyhow::anyhow!("{reason}"))
@@ -131,7 +126,7 @@ pub mod imp {
 
     use crate::agent::EventSink;
     use crate::proto::{
-        AgentEvent, MetricRecord, NcclDirective, NcclUniqueId, PROTO_VERSION, Scope, TestId, Unit,
+        AgentEvent, MetricRecord, NcclDirective, PROTO_VERSION, Scope, TestId, Unit,
     };
 
     /// NCCL's opaque rendezvous token is exactly 128 bytes.
@@ -145,13 +140,6 @@ pub mod imp {
     /// cannot ride `?` into anyhow; the raw `ncclResult_t` is the useful part.
     fn nccl_error(what: &str, error: NcclError) -> anyhow::Error {
         anyhow!("{what}: {:?}", error.0)
-    }
-
-    pub fn generate_id() -> Result<NcclUniqueId> {
-        let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
-        Ok(NcclUniqueId {
-            unique_id_b64: encode_id(&id),
-        })
     }
 
     /// The raw 128 bytes of an `ncclUniqueId`, base64'd so it survives a JSON
@@ -178,6 +166,34 @@ pub mod imp {
         Ok(Id::uninit(internal))
     }
 
+    /// Rank 0: mint the id in *this* process (ncclGetUniqueId opens the
+    /// bootstrap listen socket here, so the process must stay alive through
+    /// communicator init), announce it, then join the sweep.
+    pub fn lead(directive: &NcclDirective) -> Result<()> {
+        let NcclDirective::Lead {
+            world_size,
+            sizes,
+            iters_per_size,
+            socket_ifname,
+        } = directive
+        else {
+            bail!("lead requires a Lead directive");
+        };
+        set_socket_ifname(socket_ifname);
+
+        let sink = EventSink::stdout();
+        sink.emit(&AgentEvent::Hello {
+            proto_version: PROTO_VERSION,
+            hostname: crate::agent::hostname()?,
+        });
+        let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
+        sink.emit(&AgentEvent::NcclId {
+            unique_id_b64: encode_id(&id),
+        });
+        run_rank(Some(&sink), id, 0, *world_size, sizes, *iters_per_size)
+    }
+
+    /// Ranks 1..n: silent participants; failures ride the exit status.
     pub fn participate(directive: &NcclDirective) -> Result<()> {
         let NcclDirective::Participate {
             unique_id_b64,
@@ -190,13 +206,15 @@ pub mod imp {
         else {
             bail!("participate requires a Participate directive");
         };
-        if *world_size == 0 {
-            bail!("world_size must be at least 1");
+        if *rank == 0 {
+            bail!("rank 0 must run the Lead directive");
         }
-        if rank >= world_size {
-            bail!("rank {rank} is outside a world of {world_size}");
-        }
+        set_socket_ifname(socket_ifname);
+        let id = decode_id(unique_id_b64)?;
+        run_rank(None, id, *rank, *world_size, sizes, *iters_per_size)
+    }
 
+    fn set_socket_ifname(socket_ifname: &Option<String>) {
         if let Some(ifname) = socket_ifname {
             // NCCL reads this once, at communicator init.
             //
@@ -205,20 +223,30 @@ pub mod imp {
             // be reading the environment concurrently with this write.
             unsafe { std::env::set_var("NCCL_SOCKET_IFNAME", ifname) };
         }
+    }
+
+    fn run_rank(
+        sink: Option<&EventSink>,
+        id: Id,
+        rank: u32,
+        world_size: u32,
+        sizes: &[u64],
+        iters_per_size: u32,
+    ) -> Result<()> {
+        if world_size == 0 {
+            bail!("world_size must be at least 1");
+        }
+        if rank >= world_size {
+            bail!("rank {rank} is outside a world of {world_size}");
+        }
 
         // v1: one process per node, one rank, driving device 0. Intra-node
         // GPU<->GPU is covered by the p2p test, so nothing is lost by not
         // fanning out across the local GPUs here.
         let ctx = CudaContext::new(0).context("creating cuda context for nccl rank")?;
         let stream = ctx.default_stream();
-        let id = decode_id(unique_id_b64)?;
-        let comm = Comm::from_rank(
-            Arc::clone(&stream),
-            *rank as usize,
-            *world_size as usize,
-            id,
-        )
-        .map_err(|error| nccl_error("ncclCommInitRank", error))?;
+        let comm = Comm::from_rank(Arc::clone(&stream), rank as usize, world_size as usize, id)
+            .map_err(|error| nccl_error("ncclCommInitRank", error))?;
 
         let max_elements = sizes
             .iter()
@@ -229,24 +257,14 @@ pub mod imp {
         let send = stream.alloc_zeros::<f32>(max_elements)?;
         let mut recv = stream.alloc_zeros::<f32>(max_elements)?;
 
-        // Only rank 0 speaks the event protocol; every other rank stays silent
-        // and reports failures through its exit status.
-        let sink = (*rank == 0).then(EventSink::stdout);
-        if let Some(sink) = &sink {
-            sink.emit(&AgentEvent::Hello {
-                proto_version: PROTO_VERSION,
-                hostname: crate::agent::hostname()?,
-            });
-        }
-
         for _ in 0..WARMUP_ITERS {
             comm.all_reduce(&send, &mut recv, &ReduceOp::Sum)
                 .map_err(|error| nccl_error("warmup all_reduce", error))?;
         }
         stream.synchronize()?;
 
-        let iters = (*iters_per_size).max(1);
-        let world = *world_size as usize;
+        let iters = iters_per_size.max(1);
+        let world = world_size as usize;
 
         for &size in sizes {
             let elements = (size as usize / F32_BYTES).clamp(1, max_elements);
@@ -260,13 +278,13 @@ pub mod imp {
                 .map_err(|error| nccl_error("all_reduce", error))?;
                 Ok(())
             })?;
-            if let Some(sink) = &sink {
+            if let Some(sink) = sink {
                 emit_collective(
                     sink,
                     TestId::NcclAllReduce,
                     (elements * F32_BYTES) as f64,
                     elapsed / f64::from(iters),
-                    *world_size,
+                    world_size,
                 );
             }
 
@@ -284,13 +302,13 @@ pub mod imp {
                     .map_err(|error| nccl_error("all_gather", error))?;
                 Ok(())
             })?;
-            if let Some(sink) = &sink {
+            if let Some(sink) = sink {
                 emit_collective(
                     sink,
                     TestId::NcclAllGather,
                     (gathered * F32_BYTES) as f64,
                     elapsed / f64::from(iters),
-                    *world_size,
+                    world_size,
                 );
             }
         }

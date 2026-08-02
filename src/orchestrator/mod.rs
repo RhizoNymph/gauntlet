@@ -38,8 +38,7 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::proto::{
-    AgentEvent, InventorySnapshot, MetricRecord, NcclDirective, NcclUniqueId, Phase, Scope, TestId,
-    Unit,
+    AgentEvent, InventorySnapshot, MetricRecord, NcclDirective, Phase, Scope, TestId, Unit,
 };
 use crate::report;
 
@@ -670,33 +669,73 @@ async fn nccl_sweep(
     let rank0 = &gpu_hosts[0];
     let world_size = gpu_hosts.len() as u32;
 
-    let generate = match serde_json::to_string(&NcclDirective::GenerateId) {
-        Ok(document) => document,
-        Err(error) => {
-            warn!(%error, "cannot serialize the NCCL id directive");
-            return;
-        }
-    };
-    let unique_id: NcclUniqueId = match rank0.run_agent_capture(&["nccl"], Some(generate)).await {
-        Ok(output) => match agent_json(output, "nccl generate-id") {
-            Ok(id) => id,
-            Err(error) => {
-                sink.error(rank0.addr(), format!("NCCL rendezvous failed: {error:#}"));
-                return;
-            }
-        },
-        Err(error) => {
-            sink.error(rank0.addr(), format!("NCCL rendezvous failed: {error:#}"));
-            return;
-        }
-    };
     info!(world_size, rank0 = %rank0.addr(), "NCCL sweep");
 
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let mut tasks = JoinSet::new();
-    for (rank, session) in gpu_hosts.iter().enumerate() {
+
+    // Rank 0 leads: it mints the rendezvous id in-process (the id's bootstrap
+    // listen socket must live in the process that serves as rank 0) and
+    // announces it as an NcclId event, which is intercepted here and relayed
+    // to the other ranks.
+    let lead = NcclDirective::Lead {
+        world_size,
+        sizes: config.tests.nccl_sizes.clone(),
+        iters_per_size: config.tests.nccl_iters_per_size,
+        socket_ifname: config.nccl.socket_ifname.clone(),
+    };
+    let document = match serde_json::to_string(&lead) {
+        Ok(document) => document,
+        Err(error) => {
+            warn!(%error, "cannot serialize the NCCL lead directive");
+            return;
+        }
+    };
+    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
+    let id_slot = Arc::new(std::sync::Mutex::new(Some(id_tx)));
+    {
+        let session = Arc::clone(rank0);
+        let sink = sink.clone();
+        let id_slot = Arc::clone(&id_slot);
+        tasks.spawn(async move {
+            let addr = session.addr().to_string();
+            let outcome = tokio::time::timeout(
+                timeout,
+                session.run_agent(&["nccl"], Some(document), |event| {
+                    if let AgentEvent::NcclId { unique_id_b64 } = &event {
+                        if let Some(tx) = id_slot.lock().expect("id slot poisoned").take() {
+                            let _ = tx.send(unique_id_b64.clone());
+                        }
+                    } else {
+                        sink.event(&addr, event);
+                    }
+                }),
+            )
+            .await;
+            report_rank_outcome(&sink, &addr, 0, timeout, outcome);
+        });
+    }
+
+    let unique_id_b64 = match tokio::time::timeout(NCCL_ID_WAIT, id_rx).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(_)) | Err(_) => {
+            // The lead task reports its own failure; just stop recruiting.
+            warn!(
+                rank0 = %rank0.addr(),
+                "NCCL lead produced no rendezvous id; aborting the sweep"
+            );
+            while let Some(joined) = tasks.join_next().await {
+                if let Err(error) = joined {
+                    warn!(%error, "nccl task did not complete");
+                }
+            }
+            return;
+        }
+    };
+
+    for (rank, session) in gpu_hosts.iter().enumerate().skip(1) {
         let directive = NcclDirective::Participate {
-            unique_id_b64: unique_id.unique_id_b64.clone(),
+            unique_id_b64: unique_id_b64.clone(),
             rank: rank as u32,
             world_size,
             sizes: config.tests.nccl_sizes.clone(),
@@ -719,17 +758,7 @@ async fn nccl_sweep(
                 session.run_agent(&["nccl"], Some(document), |event| sink.event(&addr, event)),
             )
             .await;
-            match outcome {
-                Ok(Ok(status)) if status.success() => {}
-                Ok(Ok(status)) => {
-                    sink.error(&addr, format!("nccl rank {rank} exited with {status}"))
-                }
-                Ok(Err(error)) => sink.error(&addr, format!("nccl rank {rank} failed: {error:#}")),
-                Err(_) => sink.error(
-                    &addr,
-                    format!("nccl rank {rank} timed out after {}s", timeout.as_secs()),
-                ),
-            }
+            report_rank_outcome(&sink, &addr, rank, timeout, outcome);
         });
     }
     while let Some(joined) = tasks.join_next().await {
@@ -741,6 +770,27 @@ async fn nccl_sweep(
 
 /// Hosts with at least one GPU, in fleet order. Inventories collected during
 /// phase 0 are reused; hosts without one (e.g. `--phases network`) are probed.
+/// How long the orchestrator waits for the lead rank's NcclId event.
+const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
+
+fn report_rank_outcome(
+    sink: &ObservationSink,
+    addr: &str,
+    rank: usize,
+    timeout: Duration,
+    outcome: Result<anyhow::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
+) {
+    match outcome {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => sink.error(addr, format!("nccl rank {rank} exited with {status}")),
+        Ok(Err(error)) => sink.error(addr, format!("nccl rank {rank} failed: {error:#}")),
+        Err(_) => sink.error(
+            addr,
+            format!("nccl rank {rank} timed out after {}s", timeout.as_secs()),
+        ),
+    }
+}
+
 async fn gpu_bearing_hosts(
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
@@ -870,14 +920,18 @@ mod tests {
 
     #[test]
     fn json_documents_survive_pretty_printing_and_leading_noise() {
+        #[derive(serde::Deserialize)]
+        struct Doc {
+            unique_id_b64: String,
+        }
         let pretty = "{\n  \"unique_id_b64\": \"abc\"\n}\n";
-        let parsed: NcclUniqueId = parse_json_document(pretty).expect("pretty json");
+        let parsed: Doc = parse_json_document(pretty).expect("pretty json");
         assert_eq!(parsed.unique_id_b64, "abc");
 
         let noisy = "warming up\n{\"unique_id_b64\":\"xyz\"}\n";
-        let parsed: NcclUniqueId = parse_json_document(noisy).expect("last line json");
+        let parsed: Doc = parse_json_document(noisy).expect("last line json");
         assert_eq!(parsed.unique_id_b64, "xyz");
 
-        assert!(parse_json_document::<NcclUniqueId>("nothing here").is_err());
+        assert!(parse_json_document::<Doc>("nothing here").is_err());
     }
 }

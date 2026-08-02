@@ -226,6 +226,14 @@ async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostRead
         }
     };
 
+    let inventory = match maybe_build_nccl_shim(&session, inventory).await {
+        (inventory, Some(shim_check)) => {
+            checks.push(shim_check);
+            inventory
+        }
+        (inventory, None) => inventory,
+    };
+
     checks.extend(readiness_checks(&inventory));
     if tune {
         checks.extend(apply_tuning(&session, &inventory).await);
@@ -235,6 +243,70 @@ async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostRead
         host: addr,
         checks,
         inventory: Some(inventory),
+    }
+}
+
+/// Remote script that symlinks the NCCL runtime soname under a name cudarc
+/// searches, inside the agent's own directory (no sudo, no system change).
+/// `{lib_dir}` is substituted with `<remote_dir>/lib`.
+const NCCL_SHIM_SCRIPT: &str = r#"mkdir -p {lib_dir} && target=""; for p in $(ldconfig -p 2>/dev/null | awk '/libnccl\.so\.2 /{print $NF}') /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib64/libnccl.so.2 /usr/lib/libnccl.so.2; do if [ -e "$p" ]; then target="$p"; break; fi; done; if [ -n "$target" ]; then ln -sf "$target" {lib_dir}/libnccl.so && echo "$target"; else exit 3; fi"#;
+
+/// Does this inventory describe the runtime-only NCCL install (libnccl.so.2
+/// present, but no name cudarc's loader searches)?
+fn nccl_shim_needed(inventory: &InventorySnapshot) -> bool {
+    !inventory.gpus.is_empty()
+        && inventory.gpu_libs.get("nccl") == Some(&false)
+        && inventory.gpu_libs.get("nccl_runtime") == Some(&true)
+}
+
+/// cudarc's loader does not search libnccl.so.2 (NCCL's actual runtime
+/// soname), so a node with only the runtime package installed cannot run the
+/// NCCL sweep. Build `<remote_dir>/lib/libnccl.so -> libnccl.so.2`; every
+/// agent invocation already carries LD_LIBRARY_PATH=<remote_dir>/lib, so
+/// dlopen("libnccl.so") then resolves. Re-probes afterwards so the returned
+/// inventory reflects reality.
+async fn maybe_build_nccl_shim(
+    session: &HostSession,
+    inventory: InventorySnapshot,
+) -> (InventorySnapshot, Option<ReadinessCheck>) {
+    if !nccl_shim_needed(&inventory) {
+        return (inventory, None);
+    }
+    let script = NCCL_SHIM_SCRIPT.replace("{lib_dir}", &format!("{}/lib", session.remote_dir()));
+    let target = match session.exec(&script).await {
+        Ok(stdout) => stdout.trim().to_string(),
+        Err(error) => {
+            return (
+                inventory,
+                Some(ReadinessCheck::warn(
+                    "nccl_shim",
+                    format!("libnccl.so.2 present but shim creation failed: {error:#}"),
+                )),
+            );
+        }
+    };
+    match probe(session).await {
+        Ok(reprobed) if reprobed.gpu_libs.get("nccl") == Some(&true) => (
+            reprobed,
+            Some(ReadinessCheck::ok(
+                "nccl_shim",
+                format!("libnccl.so -> {target}"),
+            )),
+        ),
+        Ok(reprobed) => (
+            reprobed,
+            Some(ReadinessCheck::warn(
+                "nccl_shim",
+                format!("shim created ({target}) but libnccl still not loadable"),
+            )),
+        ),
+        Err(error) => (
+            inventory,
+            Some(ReadinessCheck::warn(
+                "nccl_shim",
+                format!("re-probe after shim failed: {error:#}"),
+            )),
+        ),
     }
 }
 
@@ -301,7 +373,9 @@ fn gpu_libs_check(inventory: &InventorySnapshot) -> ReadinessCheck {
     let missing: Vec<&str> = inventory
         .gpu_libs
         .iter()
-        .filter(|(_, available)| !**available)
+        // "nccl_runtime" is a diagnostic companion signal for the shim
+        // logic, not a requirement in its own right.
+        .filter(|(name, available)| name.as_str() != "nccl_runtime" && !**available)
         .map(|(name, _)| name.as_str())
         .collect();
     if inventory.gpu_libs.is_empty() {
@@ -309,15 +383,20 @@ fn gpu_libs_check(inventory: &InventorySnapshot) -> ReadinessCheck {
     } else if missing.is_empty() {
         ReadinessCheck::ok("gpu_libs", "cuda, cublas, nccl loadable")
     } else {
-        let phases: &str = if missing == ["nccl"] {
-            "NCCL sweep unavailable"
+        if missing == ["nccl"] && inventory.gpu_libs.get("nccl_runtime") == Some(&true) {
+            ReadinessCheck::warn(
+                "gpu_libs",
+                "libnccl.so.2 present but not under a name cudarc searches; \
+                 re-run bootstrap to build the shim, or install libnccl-dev",
+            )
+        } else if missing == ["nccl"] {
+            ReadinessCheck::warn("gpu_libs", "not loadable: nccl; NCCL sweep unavailable")
         } else {
-            "GPU phases will fail"
-        };
-        ReadinessCheck::warn(
-            "gpu_libs",
-            format!("not loadable: {}; {phases}", missing.join(", ")),
-        )
+            ReadinessCheck::warn(
+                "gpu_libs",
+                format!("not loadable: {}; GPU phases will fail", missing.join(", ")),
+            )
+        }
     }
 }
 
@@ -787,5 +866,68 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(gpu_libs_check(&inv).status, CheckStatus::Ok);
+    }
+
+    fn libs(entries: &[(&str, bool)]) -> std::collections::BTreeMap<String, bool> {
+        entries
+            .iter()
+            .map(|(name, ok)| (name.to_string(), *ok))
+            .collect()
+    }
+
+    #[test]
+    fn shim_needed_only_for_runtime_only_nccl_on_gpu_hosts() {
+        let mut inv = inventory();
+        inv.gpu_libs = libs(&[("nccl", false), ("nccl_runtime", true)]);
+        assert!(nccl_shim_needed(&inv));
+
+        inv.gpu_libs = libs(&[("nccl", true), ("nccl_runtime", true)]);
+        assert!(!nccl_shim_needed(&inv), "already loadable");
+
+        inv.gpu_libs = libs(&[("nccl", false), ("nccl_runtime", false)]);
+        assert!(!nccl_shim_needed(&inv), "nothing to shim to");
+
+        inv.gpu_libs = libs(&[("nccl", false), ("nccl_runtime", true)]);
+        inv.gpus.clear();
+        assert!(!nccl_shim_needed(&inv), "no GPUs, no sweep");
+    }
+
+    #[test]
+    fn gpu_libs_runtime_only_gets_the_actionable_message() {
+        let mut inv = inventory();
+        inv.gpu_libs = libs(&[
+            ("cuda", true),
+            ("cublas", true),
+            ("nccl", false),
+            ("nccl_runtime", true),
+        ]);
+        let check = gpu_libs_check(&inv);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("libnccl.so.2"), "{}", check.detail);
+        assert!(check.detail.contains("shim"), "{}", check.detail);
+    }
+
+    #[test]
+    fn gpu_libs_nccl_runtime_alone_is_not_a_missing_lib() {
+        let mut inv = inventory();
+        // Dev symlink present, .so.2 name not probed successfully: fine.
+        inv.gpu_libs = libs(&[
+            ("cuda", true),
+            ("cublas", true),
+            ("nccl", true),
+            ("nccl_runtime", false),
+        ]);
+        assert_eq!(gpu_libs_check(&inv).status, CheckStatus::Ok);
+    }
+
+    #[test]
+    fn shim_script_targets_the_lib_dir() {
+        let script = NCCL_SHIM_SCRIPT.replace("{lib_dir}", "/home/u/.gauntlet/lib");
+        assert!(script.contains("ln -sf"));
+        assert!(script.contains("/home/u/.gauntlet/lib/libnccl.so"));
+        assert!(
+            !script.contains("{lib_dir}"),
+            "all placeholders substituted"
+        );
     }
 }

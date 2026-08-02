@@ -30,7 +30,7 @@ fn inventory_reflects_this_machine() {
     }
     // The dlopen probe must always report all three libraries, whatever
     // their availability on this machine.
-    for lib in ["cuda", "cublas", "nccl"] {
+    for lib in ["cuda", "cublas", "nccl", "nccl_runtime"] {
         assert!(
             snapshot.gpu_libs.contains_key(lib),
             "gpu_libs missing {lib}: {:?}",

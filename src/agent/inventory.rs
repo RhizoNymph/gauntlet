@@ -400,7 +400,11 @@ fn parse_duration_ms(raw: &str) -> Option<f64> {
 /// under the same process environment they will run in. Soname fallbacks
 /// cover the CUDA major versions in the field.
 fn probe_gpu_libs() -> std::collections::BTreeMap<String, bool> {
-    const CANDIDATES: [(&str, &[&str]); 3] = [
+    // The "nccl" entry mirrors cudarc's search list, which notably does NOT
+    // include libnccl.so.2 — NCCL's actual runtime soname. "nccl_runtime"
+    // detects that runtime-only situation (libnccl2 installed without the
+    // -dev symlink) so bootstrap can build a shim symlink for it.
+    const CANDIDATES: [(&str, &[&str]); 4] = [
         ("cuda", &["libcuda.so.1", "libcuda.so"]),
         (
             "cublas",
@@ -411,7 +415,18 @@ fn probe_gpu_libs() -> std::collections::BTreeMap<String, bool> {
                 "libcublas.so",
             ],
         ),
-        ("nccl", &["libnccl.so.2", "libnccl.so"]),
+        (
+            "nccl",
+            &[
+                "libnccl.so",
+                "libnccl.so.12",
+                "libnccl.so.11",
+                "libnccl.so.10",
+                "libnccl.so.9",
+                "libnccl.so.1",
+            ],
+        ),
+        ("nccl_runtime", &["libnccl.so.2"]),
     ];
     CANDIDATES
         .into_iter()

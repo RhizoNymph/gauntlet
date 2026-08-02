@@ -61,6 +61,9 @@ fn events_round_trip() {
         AgentEvent::PhaseEnd {
             phase: Phase::CpuMem,
         },
+        AgentEvent::NcclId {
+            unique_id_b64: "S1QrZi9HZldHV1VDQUs3ckNnRUE=".into(),
+        },
         AgentEvent::Fatal {
             message: "boom".into(),
         },

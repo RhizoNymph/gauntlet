@@ -32,8 +32,11 @@ never an error; only unreadable /proc fails)
 - Xid errors: `journalctl -k --no-pager -o cat` grep for "NVRM: Xid"
   (fallback /var/log/kern.log), codes deduplicated and sorted ascending.
 - GPU library stack: dlopen probe (libloading) for libcuda / libcublas /
-  libnccl with soname fallbacks per CUDA major -> `gpu_libs` map
-  ("cuda"/"cublas"/"nccl" -> bool). This measures what the GPU/NCCL phases
+  libnccl -> `gpu_libs` map. The "nccl" entry deliberately mirrors cudarc's
+  search list, which does NOT include libnccl.so.2 (NCCL's actual runtime
+  soname); a companion "nccl_runtime" entry probes libnccl.so.2 itself so
+  bootstrap can tell "not installed" apart from "runtime-only install" and
+  build a shim for the latter. This measures what the GPU/NCCL phases
   will actually experience; handles are leaked deliberately (some driver
   stacks misbehave under dlclose; the agent is short-lived). Feeds the
   bootstrap `gpu_libs` readiness check, the orchestrator's NCCL-sweep

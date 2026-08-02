@@ -62,6 +62,15 @@ pub enum AgentEvent {
     PhaseEnd {
         phase: Phase,
     },
+    /// NCCL lead rank only: the freshly minted rendezvous id, emitted before
+    /// communicator init. The orchestrator relays it to the other ranks. It
+    /// must come from the process that stays alive as rank 0:
+    /// ncclGetUniqueId opens the bootstrap listen socket in the calling
+    /// process, so a mint-and-exit helper leaves every rank connecting to a
+    /// dead port.
+    NcclId {
+        unique_id_b64: String,
+    },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
         message: String,
@@ -304,12 +313,10 @@ pub enum GemmDtype {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "directive", rename_all = "snake_case")]
 pub enum NcclDirective {
-    /// Rank 0 only: print an `NcclUniqueId` JSON on stdout and exit.
-    GenerateId,
-    /// All ranks: join the communicator and run the collective sweep.
-    Participate {
-        unique_id_b64: String,
-        rank: u32,
+    /// Rank 0: mint the rendezvous id, announce it as an `NcclId` event, and
+    /// stay alive through the whole sweep (the id's bootstrap listen socket
+    /// lives in this process).
+    Lead {
         world_size: u32,
         /// Message sizes in bytes for the sweep.
         sizes: Vec<u64>,
@@ -317,11 +324,15 @@ pub enum NcclDirective {
         /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
         socket_ifname: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NcclUniqueId {
-    pub unique_id_b64: String,
+    /// Ranks 1..n: join the lead's communicator and run the sweep silently.
+    Participate {
+        unique_id_b64: String,
+        rank: u32,
+        world_size: u32,
+        sizes: Vec<u64>,
+        iters_per_size: u32,
+        socket_ifname: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------

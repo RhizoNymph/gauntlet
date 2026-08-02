@@ -18,6 +18,12 @@ ssh key distribution (the operator must already be able to ssh in).
    The first four steps are also matrix columns (`connectivity`, `arch`,
    `deploy`, `probe`); a Fail in any of them short-circuits the rest of that
    host's sequence, so its later columns render as `-`.
+   Between probe and the derived checks, a runtime-only NCCL install
+   (libnccl.so.2 present, no name cudarc searches — `nccl_shim_needed`)
+   triggers the shim step: `<remote_dir>/lib/libnccl.so -> libnccl.so.2`
+   (`ln -sf`, no sudo), then a re-probe. Every agent invocation runs under
+   `env LD_LIBRARY_PATH=<remote_dir>/lib`, so cudarc's dlopen("libnccl.so")
+   resolves through the shim. Matrix column `nccl_shim` reports it.
 3. Render a host × check readiness matrix (comfy-table); exit non-zero iff
    any host has a Fail. Columns appear in execution order; cells are `ok`,
    or `warn:`/`fail:` plus a one-line detail.

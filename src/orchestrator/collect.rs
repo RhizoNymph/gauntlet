@@ -70,6 +70,11 @@ impl Collector {
                 LogLevel::Info => info!(host = host_addr, message, "agent"),
                 LogLevel::Debug => debug!(host = host_addr, message, "agent"),
             },
+            // The phase-3 driver intercepts and relays this before events
+            // reach the collector; one arriving here is a stray duplicate.
+            AgentEvent::NcclId { .. } => {
+                tracing::debug!(host = host_addr, "ignoring stray nccl id event");
+            }
             AgentEvent::Fatal { message } => {
                 error!(host = host_addr, message, "agent fatal");
                 host.errors.push(message);

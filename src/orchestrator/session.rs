@@ -137,6 +137,14 @@ impl HostSession {
         &self.agent_path
     }
 
+    /// Environment for every agent invocation. `<remote_dir>/lib` holds
+    /// shim symlinks bootstrap may have created for runtime-only libraries
+    /// (e.g. libnccl.so -> libnccl.so.2); dlopen consults LD_LIBRARY_PATH
+    /// as captured at process start, so it must be set at spawn time.
+    fn agent_env(&self) -> String {
+        format!("LD_LIBRARY_PATH={}/lib", self.remote_dir)
+    }
+
     /// Run a short remote command, capturing stdout (used by deploy for
     /// hash checks and by bootstrap tuning). Non-zero exit is an error.
     pub async fn exec(&self, command: &str) -> Result<String> {
@@ -242,8 +250,10 @@ impl HostSession {
         stdin_doc: Option<String>,
         mut on_event: impl FnMut(AgentEvent) + Send,
     ) -> Result<ExitStatus> {
-        let mut command = self.session.command(self.agent_path.clone());
+        let mut command = self.session.command("env");
         command
+            .arg(self.agent_env())
+            .arg(self.agent_path.clone())
             // The deployed binary is the full multi-command CLI; node-side
             // modes all live under its `agent` subcommand.
             .arg("agent")
@@ -329,8 +339,10 @@ impl HostSession {
         args: &[&str],
         stdin_doc: Option<String>,
     ) -> Result<RemoteOutput> {
-        let mut command = self.session.command(self.agent_path.clone());
+        let mut command = self.session.command("env");
         command
+            .arg(self.agent_env())
+            .arg(self.agent_path.clone())
             // The deployed binary is the full multi-command CLI; node-side
             // modes all live under its `agent` subcommand.
             .arg("agent")
@@ -376,8 +388,10 @@ impl HostSession {
     /// owns a clone of the session, so it outlives this borrow (phase 3 keeps
     /// a `peer serve` running while it drives the other end of the pair).
     pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
-        let mut command = Arc::clone(&self.session).arc_command(self.agent_path.clone());
+        let mut command = Arc::clone(&self.session).arc_command("env");
         command
+            .arg(self.agent_env())
+            .arg(self.agent_path.clone())
             .arg("agent")
             .args(args.iter().copied())
             .stdin(Stdio::null())
