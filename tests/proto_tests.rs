@@ -45,6 +45,7 @@ fn events_round_trip() {
                 name: "triad".into(),
                 value: 210.5,
                 unit: Unit::GibPerSec,
+                repeat: 0,
             },
         },
         AgentEvent::Outcome {
@@ -155,6 +156,7 @@ fn event_sink_is_thread_safe_and_line_delimited() {
                         name: "gflops".into(),
                         value: 42.0,
                         unit: Unit::Gflops,
+                        repeat: 0,
                     });
                 }
             });

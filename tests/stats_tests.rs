@@ -113,3 +113,44 @@ fn k_controls_sensitivity() {
     assert!(strict.iter().any(|o| o.key == "meh"));
     assert!(lax.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Moments (per-subject distribution summaries for --repeat runs)
+// ---------------------------------------------------------------------------
+
+use gauntlet::analysis::stats::moments;
+
+#[test]
+fn moments_summarize_a_small_sample() {
+    let m = moments(&[10.0, 12.0, 11.0, 13.0, 9.0]).expect("moments");
+    assert_eq!(m.n, 5);
+    assert_eq!(m.median, 11.0);
+    assert_eq!(m.min, 9.0);
+    assert_eq!(m.max, 13.0);
+    assert!((m.mean - 11.0).abs() < 1e-9);
+    // MAD: deviations from 11 are [1,1,0,2,2] -> median 1 -> * 1.4826.
+    assert!((m.mad - 1.4826).abs() < 1e-9);
+    // Sample stddev of [9..13] around 11: sqrt(10/4).
+    assert!((m.stddev - (10.0f64 / 4.0).sqrt()).abs() < 1e-9);
+}
+
+#[test]
+fn single_sample_moments_have_zero_spread() {
+    let m = moments(&[42.0]).expect("moments");
+    assert_eq!(m.n, 1);
+    assert_eq!(m.median, 42.0);
+    assert_eq!(m.mean, 42.0);
+    assert_eq!(m.min, 42.0);
+    assert_eq!(m.max, 42.0);
+    assert_eq!(m.mad, 0.0);
+    assert_eq!(m.stddev, 0.0);
+}
+
+#[test]
+fn moments_ignore_non_finite_values_and_need_at_least_one() {
+    let m = moments(&[f64::NAN, 5.0, f64::INFINITY, 7.0]).expect("moments");
+    assert_eq!(m.n, 2);
+    assert_eq!(m.median, 6.0);
+    assert!(moments(&[]).is_none());
+    assert!(moments(&[f64::NAN]).is_none());
+}

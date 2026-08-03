@@ -30,6 +30,54 @@ pub struct Outlier {
     pub deviation_mads: f64,
 }
 
+/// Distribution summary of one subject's repeated measurements. Median and
+/// MAD are the robust headline; mean and (sample) stddev are kept for
+/// simulator consumers that want Gaussian inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Moments {
+    pub n: usize,
+    pub median: f64,
+    /// Scaled median absolute deviation; 0.0 when n == 1.
+    pub mad: f64,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    /// Sample standard deviation (n - 1); 0.0 when n == 1.
+    pub stddev: f64,
+}
+
+/// Summarize `values` into `Moments`, ignoring non-finite entries.
+/// Returns `None` when nothing finite remains.
+pub fn moments(values: &[f64]) -> Option<Moments> {
+    let sorted = finite_sorted(values);
+    if sorted.is_empty() {
+        return None;
+    }
+    let n = sorted.len();
+    let median = median_of_sorted(&sorted)?;
+    let mad = if n >= 2 { mad(&sorted)? } else { 0.0 };
+    let mean = sorted.iter().sum::<f64>() / n as f64;
+    let stddev = if n >= 2 {
+        let variance = sorted
+            .iter()
+            .map(|value| (value - mean).powi(2))
+            .sum::<f64>()
+            / (n - 1) as f64;
+        variance.sqrt()
+    } else {
+        0.0
+    };
+    Some(Moments {
+        n,
+        median,
+        mad,
+        min: sorted[0],
+        max: sorted[n - 1],
+        mean,
+        stddev,
+    })
+}
+
 /// Median of `values`. Returns `None` for an empty slice. Non-finite inputs
 /// are ignored.
 pub fn median(values: &[f64]) -> Option<f64> {

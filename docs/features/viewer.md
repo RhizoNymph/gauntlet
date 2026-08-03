@@ -38,9 +38,15 @@ connected fleet graph plus a quantitative metric table.
   bandwidth.
 - Click a node or edge to see its findings (issues, roofline digest,
   per-direction bandwidth/RTT) and filter the metric table to that subject.
-- Metric table: every fleet-comparable metric with per-sample deviation from
-  the group median in MADs; outlier-flagged rows amber, threshold-violating
-  rows red. Link alpha-beta fits shown in the fleet overview card.
+- Metric table: one row per (group, subject) from the run's aggregates —
+  value is the median across `--repeat` samples, with a muted ±MAD tail
+  when n >= 2 — and deviation from the group median in MADs;
+  outlier-flagged rows amber, threshold-violating rows red. Jitter
+  outliers (high run-to-run spread) surface as node findings. Link
+  alpha-beta fits shown in the fleet overview card. Schema-v1 runs without
+  aggregates are re-derived on load.
+- Diff mode is noise-aware: when both runs carry spreads (n >= 2), a delta
+  must clear ~2x the pooled spread in addition to the 5%/15% floors.
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report

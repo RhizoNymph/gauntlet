@@ -35,7 +35,10 @@ Overview:
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
       MADs, applies optional absolute thresholds, renders table + JSON, sets
-      exit code. Runs persisted for diffing against last known-good. A run in
+      exit code. Runs persisted for diffing against last known-good. With
+      --repeat N, metrics aggregate into per-subject distribution moments
+      (median/MAD/min/max/mean/stddev); outliers flag on medians and
+      high run-to-run spread flags as jitter. A run in
       flight also republishes itself every 2s as runs/<run_id>.partial.json so
       viewers can tail progress.
   data_flow: >

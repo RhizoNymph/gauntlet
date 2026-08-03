@@ -157,3 +157,22 @@ tail progress:
   time.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
+
+## Repeats and distribution moments (schema v2)
+
+`gauntlet run --repeat N` executes the measurement phases N times over the
+held sessions (inventory once); the orchestrator stamps each metric record
+with its repeat index (`MetricRecord.repeat`, serde-defaulted so old wire
+output still decodes). `report::build` reduces raw records into
+`RunResults.aggregates`: group -> subject -> `{unit, moments}` with
+`Moments {n, median, mad, min, max, mean, stddev}` (robust median/MAD as
+the headline; mean/stddev for Gaussian consumers). A group where any
+(subject, repeat) pair occurs twice is a per-host sweep series and is
+excluded — series feed `calibration.links` exactly as before.
+
+Downstream effects: fleet outliers are flagged on per-subject *medians*
+(centered run-to-run noise can no longer masquerade as slowness);
+`fleet.jitter_outliers` flags subjects whose spread is a high-side fleet
+outlier (informational, not part of the verdict); absolute thresholds
+check the median (sweep series keep per-value semantics); rooflines reduce
+over per-subject medians. Everything degrades gracefully at n = 1.

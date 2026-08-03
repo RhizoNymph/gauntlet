@@ -47,6 +47,7 @@ fn node_metric(test: TestId, name: &str, value: f64, unit: Unit) -> MetricRecord
         name: name.into(),
         value,
         unit,
+        repeat: 0,
     }
 }
 
@@ -207,6 +208,7 @@ fn rooflines_take_the_worst_gpu() {
                 name: "gflops_bf16".into(),
                 value: gflops,
                 unit: Unit::Gflops,
+                repeat: 0,
             });
         }
         observations.insert(name.to_string(), obs);
@@ -407,4 +409,191 @@ fn remove_partial_deletes_the_snapshot_and_tolerates_absence() {
     gauntlet::report::history::remove_partial("1700000000-nothere", &dir).expect("absent is ok");
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// --repeat: per-subject aggregates, median-based analysis, jitter
+// ---------------------------------------------------------------------------
+
+fn metric_repeat(test: TestId, scope: Scope, name: &str, value: f64, repeat: u32) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope,
+        name: name.into(),
+        value,
+        unit: Unit::GibPerSec,
+        repeat,
+    }
+}
+
+fn host_with_series(name_values: &[(&str, &[f64])]) -> HostObservations {
+    let mut obs = HostObservations::default();
+    for (name, values) in name_values {
+        for (repeat, value) in values.iter().enumerate() {
+            obs.metrics.push(metric_repeat(
+                TestId::MemBandwidth,
+                Scope::Node,
+                name,
+                *value,
+                repeat as u32,
+            ));
+        }
+    }
+    obs
+}
+
+#[test]
+fn aggregates_summarize_repeats_per_subject() {
+    let config = config_for(&["a", "b"]);
+    let hosts = BTreeMap::from([
+        (
+            "a".to_string(),
+            host_with_series(&[("triad", &[40.0, 42.0, 41.0])]),
+        ),
+        (
+            "b".to_string(),
+            host_with_series(&[("triad", &[38.0, 39.0, 40.0])]),
+        ),
+    ]);
+    let results = report::build(&config, hosts, 1, 2);
+
+    let group = &results.aggregates["mem_bandwidth.triad"];
+    let a = &group["a"];
+    assert_eq!(a.moments.n, 3);
+    assert_eq!(a.moments.median, 41.0);
+    assert!(a.moments.mad > 0.0);
+    assert_eq!(a.unit, Unit::GibPerSec);
+    assert_eq!(group["b"].moments.median, 39.0);
+}
+
+#[test]
+fn outliers_use_medians_so_centered_noise_is_not_flagged() {
+    let config: FleetConfig =
+        toml::from_str("hosts = [\"a\", \"b\", \"c\", \"d\", \"e\"]\n[thresholds]\nmad_k = 4.0\n")
+            .expect("config");
+    let mut hosts = BTreeMap::new();
+    for (host, values) in [
+        ("a", [100.0, 100.5, 99.5]),
+        ("b", [100.2, 99.8, 100.2]),
+        // Noisy but centered on the fleet median: not a straggler.
+        ("c", [80.0, 100.1, 120.0]),
+        ("d", [99.9, 100.1, 99.9]),
+        // Genuinely slow across every repeat.
+        ("e", [60.0, 61.0, 59.0]),
+    ] {
+        hosts.insert(host.to_string(), host_with_series(&[("triad", &values)]));
+    }
+    let results = report::build(&config, hosts, 1, 2);
+
+    let flagged = &results.fleet.outliers["mem_bandwidth.triad"];
+    assert_eq!(flagged.len(), 1, "{flagged:?}");
+    assert_eq!(flagged[0].key, "e");
+    // The centered-noise host shows up as a jitter outlier instead.
+    let jitter = &results.fleet.jitter_outliers["mem_bandwidth.triad"];
+    assert_eq!(jitter.len(), 1, "{jitter:?}");
+    assert_eq!(jitter[0].key, "c");
+    assert!(jitter[0].deviation_mads > 0.0);
+}
+
+#[test]
+fn sweep_series_stay_out_of_aggregates() {
+    // Two records with the same (subject, repeat) pair: a per-size series,
+    // not repeated single measurements.
+    let mut obs = HostObservations::default();
+    obs.metrics.push(metric_repeat(
+        TestId::NcclAllReduce,
+        Scope::Node,
+        "msg_bytes",
+        1024.0,
+        0,
+    ));
+    obs.metrics.push(metric_repeat(
+        TestId::NcclAllReduce,
+        Scope::Node,
+        "msg_bytes",
+        4096.0,
+        0,
+    ));
+    obs.metrics.push(metric_repeat(
+        TestId::MemBandwidth,
+        Scope::Node,
+        "triad",
+        40.0,
+        0,
+    ));
+    let config = config_for(&["a"]);
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+
+    assert!(!results.aggregates.contains_key("nccl_all_reduce.msg_bytes"));
+    assert!(results.aggregates.contains_key("mem_bandwidth.triad"));
+}
+
+#[test]
+fn low_jitter_is_never_flagged() {
+    let config: FleetConfig =
+        toml::from_str("hosts = [\"a\", \"b\", \"c\", \"d\", \"e\"]\n[thresholds]\nmad_k = 4.0\n")
+            .expect("config");
+    let mut hosts = BTreeMap::new();
+    // One host with *unusually low* spread must not be flagged; jitter is a
+    // one-sided signal.
+    for (host, values) in [
+        ("a", [100.0, 103.0, 97.0]),
+        ("b", [100.0, 104.0, 96.0]),
+        ("c", [100.0, 103.5, 96.5]),
+        ("d", [100.0, 102.9, 97.1]),
+        ("e", [100.0, 100.0, 100.0]),
+    ] {
+        hosts.insert(host.to_string(), host_with_series(&[("triad", &values)]));
+    }
+    let results = report::build(&config, hosts, 1, 2);
+    let jitter = results.fleet.jitter_outliers.get("mem_bandwidth.triad");
+    assert!(
+        jitter.is_none_or(|flagged| flagged.iter().all(|o| o.key != "e")),
+        "{jitter:?}"
+    );
+}
+
+#[test]
+fn absolute_thresholds_apply_to_the_median_of_repeats() {
+    let mut config = config_for(&["a"]);
+    config.thresholds.absolute.insert(
+        "mem_bandwidth.triad".to_string(),
+        Bound {
+            min: Some(10.0),
+            max: None,
+        },
+    );
+    // One glitchy low sample, but the median clears the bound.
+    let hosts = BTreeMap::from([(
+        "a".to_string(),
+        host_with_series(&[("triad", &[5.0, 50.0, 51.0])]),
+    )]);
+    let results = report::build(&config, hosts, 1, 2);
+    assert!(
+        results.fleet.threshold_violations.is_empty(),
+        "{:?}",
+        results.fleet
+    );
+}
+
+#[test]
+fn rooflines_reduce_over_per_subject_medians() {
+    let mut obs = HostObservations::default();
+    // GPU 0 d2d has one glitched repeat; the median absorbs it.
+    for (repeat, value) in [(0u32, 3000.0), (1, 100.0), (2, 3010.0)] {
+        obs.metrics.push(MetricRecord {
+            test: TestId::GpuMemBandwidth,
+            scope: Scope::Gpu { index: 0 },
+            name: "d2d".into(),
+            value,
+            unit: Unit::GibPerSec,
+            repeat,
+        });
+    }
+    let config = config_for(&["a"]);
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    assert_eq!(
+        results.calibration.rooflines["a"].gpu_hbm_gib_per_sec,
+        Some(3000.0)
+    );
 }

@@ -211,6 +211,7 @@ fn run_throughput(sink: &EventSink, spec: &CpuTaskSpec, cores: usize, core_ids: 
                 name: "gflops".to_string(),
                 value: gflops,
                 unit: Unit::Gflops,
+                repeat: 0,
             });
         } else {
             sink.outcome(
@@ -249,6 +250,7 @@ fn run_throughput(sink: &EventSink, spec: &CpuTaskSpec, cores: usize, core_ids: 
             name: "gflops_allcore".to_string(),
             value: allcore,
             unit: Unit::Gflops,
+            repeat: 0,
         });
     } else {
         sink.outcome(
