@@ -15,7 +15,7 @@ use super::{
     severity_color,
 };
 use crate::diff::RowDelta;
-use crate::model::{EdgeView, Issue, MetricRow, NodeView, Severity, format_value};
+use crate::model::{EdgeView, Issue, MetricRow, NodeView, Severity, format_number, format_value};
 
 impl RootView {
     pub(super) fn render_side(&self, cx: &mut Context<Self>) -> Div {
@@ -466,6 +466,25 @@ fn render_row(row: &MetricRow, delta: Option<&RowDelta>, diff_mode: bool) -> Div
         (text, color)
     };
 
+    let mut value_cell = div()
+        .w(px(150.0))
+        .flex()
+        .justify_end()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .text_color(rgb(value_color))
+                .child(format_value(row.unit, row.value)),
+        );
+    if let Some(spread) = row.spread_mad {
+        value_cell = value_cell.child(
+            div()
+                .text_size(px(10.0))
+                .text_color(rgb(MUTED))
+                .child(format!("±{}", format_number(row.unit, spread))),
+        );
+    }
     div()
         .flex()
         .items_center()
@@ -475,7 +494,7 @@ fn render_row(row: &MetricRow, delta: Option<&RowDelta>, diff_mode: bool) -> Div
         .text_size(px(12.0))
         .child(cell_metric(row.group.clone()).text_color(rgb(MUTED)))
         .child(cell_subject(row.subject.clone()))
-        .child(cell_value(format_value(row.unit, row.value)).text_color(rgb(value_color)))
+        .child(value_cell)
         .child(cell_dev(last_text).text_color(rgb(last_color)))
 }
 
@@ -544,7 +563,7 @@ fn cell_subject(text: impl Into<String>) -> Div {
 }
 
 fn cell_value(text: impl Into<String>) -> Div {
-    div().w(px(105.0)).flex().justify_end().child(text.into())
+    div().w(px(150.0)).flex().justify_end().child(text.into())
 }
 
 fn cell_dev(text: impl Into<String>) -> Div {

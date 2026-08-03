@@ -358,6 +358,7 @@ pub mod imp {
                 name: name.to_string(),
                 value,
                 unit,
+                repeat: 0,
             });
         }
     }

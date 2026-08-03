@@ -128,6 +128,7 @@ mod tests {
             run_id: run_id.into(),
             started_epoch_secs: 1,
             debug_build: false,
+            aggregates: Default::default(),
             finished_epoch_secs: 2,
             hosts: BTreeMap::new(),
             fleet: FleetAnalysis::default(),

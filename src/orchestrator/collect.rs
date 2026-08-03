@@ -117,6 +117,7 @@ mod tests {
             name: name.to_string(),
             value: 1.0,
             unit: Unit::Gflops,
+            repeat: 0,
         }
     }
 

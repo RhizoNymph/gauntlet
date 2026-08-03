@@ -13,6 +13,8 @@ fn row(group: &str, subject: &str, value: f64, unit: Unit) -> MetricRow {
         value,
         unit,
         deviation_mads: None,
+        spread_mad: None,
+        n: 1,
         flagged: false,
         violated: false,
     }
@@ -275,4 +277,78 @@ fn worst_regressions_lead_the_issue_list() {
     let issues = &diff.node_issues["a"];
     assert!(issues[0].1.contains("g.severe"));
     assert_eq!(issues[0].0, Severity::Bad);
+}
+
+// ---------------------------------------------------------------------------
+// Noise gate: regressions must clear the pooled run-to-run spread
+// ---------------------------------------------------------------------------
+
+fn row_spread(group: &str, subject: &str, value: f64, unit: Unit, mad: f64, n: usize) -> MetricRow {
+    MetricRow {
+        group: group.into(),
+        subject: subject.into(),
+        value,
+        unit,
+        deviation_mads: None,
+        spread_mad: Some(mad),
+        n,
+        flagged: false,
+        violated: false,
+    }
+}
+
+#[test]
+fn deltas_within_pooled_spread_are_not_regressions() {
+    let baseline = vm(
+        "base",
+        &["a"],
+        vec![row_spread("g.m", "a", 100.0, Unit::Gflops, 8.0, 3)],
+    );
+    let current = vm(
+        "cur",
+        &["a"],
+        vec![row_spread("g.m", "a", 90.0, Unit::Gflops, 8.0, 3)],
+    );
+    let diff = DiffView::new(&current, &baseline);
+    let delta = &diff.rows[&("g.m".to_string(), "a".to_string())];
+    // -10% clears the floor but not 2x the pooled spread (~11.3).
+    assert_eq!(delta.severity, Severity::Ok);
+    assert!(!delta.improved);
+    assert!(delta.delta_fraction.is_some());
+    assert!(!diff.node_severity.contains_key("a"));
+}
+
+#[test]
+fn tight_spread_regressions_still_flag() {
+    let baseline = vm(
+        "base",
+        &["a"],
+        vec![row_spread("g.m", "a", 100.0, Unit::Gflops, 0.5, 3)],
+    );
+    let current = vm(
+        "cur",
+        &["a"],
+        vec![row_spread("g.m", "a", 90.0, Unit::Gflops, 0.5, 3)],
+    );
+    let diff = DiffView::new(&current, &baseline);
+    assert_eq!(
+        diff.rows[&("g.m".to_string(), "a".to_string())].severity,
+        Severity::Warn
+    );
+}
+
+#[test]
+fn single_sample_sides_skip_the_noise_gate() {
+    // Baseline has no spread info (n = 1): the % floors alone decide.
+    let baseline = vm("base", &["a"], vec![row("g.m", "a", 100.0, Unit::Gflops)]);
+    let current = vm(
+        "cur",
+        &["a"],
+        vec![row_spread("g.m", "a", 90.0, Unit::Gflops, 8.0, 3)],
+    );
+    let diff = DiffView::new(&current, &baseline);
+    assert_eq!(
+        diff.rows[&("g.m".to_string(), "a".to_string())].severity,
+        Severity::Warn
+    );
 }

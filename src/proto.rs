@@ -164,6 +164,11 @@ pub struct MetricRecord {
     pub name: String,
     pub value: f64,
     pub unit: Unit,
+    /// Which `--repeat` iteration produced this sample. Agents always emit
+    /// 0; the orchestrator stamps the real index on ingestion, so old wire
+    /// output (field absent) still decodes.
+    #[serde(default)]
+    pub repeat: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -25,6 +25,7 @@ fn metric(test: TestId, scope: Scope, name: &str, value: f64, unit: Unit) -> Met
         name: name.into(),
         value,
         unit,
+        repeat: 0,
     }
 }
 
@@ -453,4 +454,91 @@ fn outlier_plus_skew_is_not_skew_only() {
     let a = node(&vm, "a");
     assert_eq!(a.perf_severity, Severity::Ok);
     assert!(!a.skew && a.severity == Severity::Ok);
+}
+
+// ---------------------------------------------------------------------------
+// --repeat: medians, spread, jitter
+// ---------------------------------------------------------------------------
+
+fn metric_rep(name: &str, value: f64, repeat: u32) -> MetricRecord {
+    MetricRecord {
+        test: TestId::MemBandwidth,
+        scope: Scope::Node,
+        name: name.into(),
+        value,
+        unit: Unit::GibPerSec,
+        repeat,
+    }
+}
+
+#[test]
+fn repeated_measurements_become_median_and_spread() {
+    let config = config(r#"hosts = ["a", "b"]"#);
+    let mut a = HostObservations::default();
+    for (repeat, value) in [(0u32, 40.0), (1, 42.0), (2, 41.0)] {
+        a.metrics.push(metric_rep("triad", value, repeat));
+    }
+    let mut b = HostObservations::default();
+    for (repeat, value) in [(0u32, 39.0), (1, 39.5), (2, 38.5)] {
+        b.metrics.push(metric_rep("triad", value, repeat));
+    }
+    let hosts = BTreeMap::from([("a".to_string(), a), ("b".to_string(), b)]);
+    let vm = ViewModel::new(&results(&config, hosts));
+
+    let row = vm
+        .rows
+        .iter()
+        .find(|r| r.group == "mem_bandwidth.triad" && r.subject == "a")
+        .expect("row present");
+    assert_eq!(row.value, 41.0);
+    assert_eq!(row.n, 3);
+    assert!(row.spread_mad.expect("spread") > 0.0);
+}
+
+#[test]
+fn jitter_outliers_mark_nodes_warn() {
+    let config = config("hosts = [\"a\", \"b\", \"c\", \"d\", \"e\"]\n[thresholds]\nmad_k = 4.0\n");
+    let mut hosts = BTreeMap::new();
+    for (host, values) in [
+        ("a", [100.0, 100.5, 99.5]),
+        ("b", [100.2, 99.8, 100.2]),
+        ("c", [80.0, 100.1, 120.0]),
+        ("d", [99.9, 100.1, 99.9]),
+        ("e", [100.0, 100.4, 99.6]),
+    ] {
+        let mut obs = HostObservations::default();
+        for (repeat, value) in values.iter().enumerate() {
+            obs.metrics.push(metric_rep("triad", *value, repeat as u32));
+        }
+        hosts.insert(host.to_string(), obs);
+    }
+    let vm = ViewModel::new(&results(&config, hosts));
+
+    let c = node(&vm, "c");
+    assert_eq!(c.severity, Severity::Warn);
+    assert!(
+        c.issues
+            .iter()
+            .any(|(_, text)| text.contains("run-to-run spread"))
+    );
+    assert_eq!(node(&vm, "a").severity, Severity::Ok);
+}
+
+#[test]
+fn schema_v1_runs_without_aggregates_still_render_rows() {
+    let config = config(r#"hosts = ["a"]"#);
+    let mut obs = HostObservations::default();
+    obs.metrics.push(metric_rep("triad", 40.0, 0));
+    let hosts = BTreeMap::from([("a".to_string(), obs)]);
+    let mut saved = results(&config, hosts);
+    saved.aggregates.clear();
+    let vm = ViewModel::new(&saved);
+    let row = vm
+        .rows
+        .iter()
+        .find(|r| r.group == "mem_bandwidth.triad" && r.subject == "a")
+        .expect("row derived from raw metrics");
+    assert_eq!(row.value, 40.0);
+    assert_eq!(row.n, 1);
+    assert!(row.spread_mad.is_none());
 }

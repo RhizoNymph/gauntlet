@@ -41,6 +41,11 @@ pub struct RunArgs {
     /// Sampled network mode: test only this many pairs per host instead of full mesh.
     #[arg(long)]
     pub sample_pairs: Option<usize>,
+    /// Run the measurement phases this many times and report per-metric
+    /// distributions (median, MAD, ...) instead of single samples.
+    /// Inventory runs once.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
+    pub repeat: u32,
 }
 
 #[derive(Debug, Args)]

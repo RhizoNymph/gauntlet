@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gauntlet::analysis::stats;
-use gauntlet::proto::{Scope, TestId, TestOutcome, Unit};
+use gauntlet::proto::{Scope, TestOutcome, Unit};
 use gauntlet::report::{
-    NodeRoofline, RunResults, Verdict, metric_key, sample_key, scope_label, test_display_name,
-    verdict,
+    Aggregates, NodeRoofline, RunResults, Verdict, aggregate_metrics, scope_label,
+    test_display_name, verdict,
 };
 
 /// Health of a subject, ordered so `Ord::max` picks the worse of two.
@@ -92,6 +92,10 @@ pub struct MetricRow {
     /// Signed distance from the group median in MADs; `None` when the
     /// group's spread is degenerate or the value is not finite.
     pub deviation_mads: Option<f64>,
+    /// Run-to-run spread (scaled MAD across repeats); `None` when n == 1.
+    pub spread_mad: Option<f64>,
+    /// Number of repeat samples behind `value` (the median).
+    pub n: usize,
     /// Flagged by fleet-relative outlier detection.
     pub flagged: bool,
     /// Violates an absolute threshold from the run's config.
@@ -126,6 +130,14 @@ pub struct ViewModel {
 impl ViewModel {
     pub fn new(results: &RunResults) -> Self {
         let host_keys: Vec<String> = results.hosts.keys().cloned().collect();
+        // Runs saved before schema v2 carry no aggregates; derive them.
+        let derived;
+        let aggregates: &Aggregates = if results.aggregates.is_empty() {
+            derived = aggregate_metrics(&results.hosts);
+            &derived
+        } else {
+            &results.aggregates
+        };
 
         let mut nodes: BTreeMap<String, NodeView> = results
             .hosts
@@ -153,26 +165,30 @@ impl ViewModel {
 
         let mut edges: BTreeMap<(String, String), EdgeView> = BTreeMap::new();
 
-        // Pairwise measurements define the graph's edges.
-        for (host, obs) in &results.hosts {
-            for record in &obs.metrics {
-                let Scope::HostPair { peer } = &record.scope else {
+        // Pairwise medians define the graph's edges.
+        for (group, pick) in [
+            ("net_bandwidth.gib_per_sec", EdgeSlot::Bandwidth),
+            ("net_latency.rtt_p50", EdgeSlot::RttP50),
+            ("net_latency.rtt_p99", EdgeSlot::RttP99),
+        ] {
+            let Some(subjects) = aggregates.get(group) else {
+                continue;
+            };
+            for (subject, aggregate) in subjects {
+                let Attribution::Pair { host, peer } = attribute(&host_keys, subject) else {
                     continue;
                 };
-                let edge = edge_entry(&mut edges, host, peer);
-                let measured_by_a = *host == edge.a;
-                let slot = match (record.test, record.name.as_str()) {
-                    (TestId::NetBandwidth, "gib_per_sec") => Some(&mut edge.bandwidth_gib),
-                    (TestId::NetLatency, "rtt_p50") => Some(&mut edge.rtt_p50_us),
-                    (TestId::NetLatency, "rtt_p99") => Some(&mut edge.rtt_p99_us),
-                    _ => None,
+                let edge = edge_entry(&mut edges, &host, &peer);
+                let measured_by_a = host == edge.a;
+                let direction = match pick {
+                    EdgeSlot::Bandwidth => &mut edge.bandwidth_gib,
+                    EdgeSlot::RttP50 => &mut edge.rtt_p50_us,
+                    EdgeSlot::RttP99 => &mut edge.rtt_p99_us,
                 };
-                if let Some(direction) = slot {
-                    if measured_by_a {
-                        direction.from_a = Some(record.value);
-                    } else {
-                        direction.from_b = Some(record.value);
-                    }
+                if measured_by_a {
+                    direction.from_a = Some(aggregate.moments.median);
+                } else {
+                    direction.from_b = Some(aggregate.moments.median);
                 }
             }
         }
@@ -242,6 +258,23 @@ impl ViewModel {
             }
         }
 
+        for (group, outliers) in &results.fleet.jitter_outliers {
+            for outlier in outliers {
+                let issue = format!(
+                    "{group}: run-to-run spread {:.3} vs fleet {:.3} ({:+.1} MADs)",
+                    outlier.value, outlier.fleet_median, outlier.deviation_mads
+                );
+                apply_finding(
+                    &mut nodes,
+                    &mut edges,
+                    &host_keys,
+                    &outlier.key,
+                    Severity::Warn,
+                    issue,
+                );
+            }
+        }
+
         for (field, finding) in &results.fleet.consistency {
             for (host, value) in &finding.dissenters {
                 if let Some(node) = nodes.get_mut(host) {
@@ -277,13 +310,21 @@ impl ViewModel {
             verdict: verdict(results),
             nodes: nodes.into_values().collect(),
             edges: edges.into_values().collect(),
-            rows: metric_rows(results),
+            rows: metric_rows(results, aggregates),
             links,
         }
     }
 }
 
 /// Record a performance finding (error, failed test, outlier, violation).
+/// Which per-direction slot a pairwise metric group feeds.
+#[derive(Clone, Copy)]
+enum EdgeSlot {
+    Bandwidth,
+    RttP50,
+    RttP99,
+}
+
 fn note(node: &mut NodeView, severity: Severity, text: String) {
     node.severity = node.severity.max(severity);
     node.perf_severity = node.perf_severity.max(severity);
@@ -380,59 +421,50 @@ fn apply_finding(
     }
 }
 
-/// Flatten every fleet-comparable metric group into table rows with
-/// per-sample deviations. Groups with repeated sample keys are per-host
-/// series (the NCCL sweeps), which render as link fits instead.
-fn metric_rows(results: &RunResults) -> Vec<MetricRow> {
-    let mut groups: BTreeMap<String, Vec<(String, f64, Unit)>> = BTreeMap::new();
-    for (host, obs) in &results.hosts {
-        for record in &obs.metrics {
-            groups
-                .entry(metric_key(record.test, &record.name))
-                .or_default()
-                .push((sample_key(host, &record.scope), record.value, record.unit));
-        }
-    }
-
+/// Table rows straight from the report's aggregates: one row per
+/// (group, subject), value = median across repeats, deviation computed
+/// over the group's medians. Sweep series never reach the aggregates.
+fn metric_rows(results: &RunResults, aggregates: &Aggregates) -> Vec<MetricRow> {
     let mut rows = Vec::new();
-    for (group, samples) in groups {
-        let mut seen = BTreeSet::new();
-        if !samples.iter().all(|(key, _, _)| seen.insert(key.clone())) {
-            continue;
-        }
-        let values: Vec<f64> = samples.iter().map(|(_, value, _)| *value).collect();
-        let median = stats::median(&values);
-        let mad = stats::mad(&values).filter(|mad| *mad > f64::EPSILON);
+    for (group, subjects) in aggregates {
+        let medians: Vec<f64> = subjects
+            .values()
+            .map(|aggregate| aggregate.moments.median)
+            .collect();
+        let center = stats::median(&medians);
+        let spread = stats::mad(&medians).filter(|mad| *mad > f64::EPSILON);
         let flagged: BTreeSet<&str> = results
             .fleet
             .outliers
-            .get(&group)
+            .get(group)
             .map(|outliers| outliers.iter().map(|o| o.key.as_str()).collect())
             .unwrap_or_default();
         let violated: BTreeSet<&str> = results
             .fleet
             .threshold_violations
-            .get(&group)
+            .get(group)
             .map(|keys| keys.iter().map(String::as_str).collect())
             .unwrap_or_default();
 
-        let mut group_rows: Vec<MetricRow> = samples
-            .iter()
-            .map(|(subject, value, unit)| MetricRow {
+        for (subject, aggregate) in subjects {
+            let median = aggregate.moments.median;
+            rows.push(MetricRow {
                 group: group.clone(),
                 subject: subject.clone(),
-                value: *value,
-                unit: *unit,
-                deviation_mads: match (median, mad) {
-                    (Some(median), Some(mad)) if value.is_finite() => Some((value - median) / mad),
+                value: median,
+                unit: aggregate.unit,
+                deviation_mads: match (center, spread) {
+                    (Some(center), Some(spread)) if median.is_finite() => {
+                        Some((median - center) / spread)
+                    }
                     _ => None,
                 },
+                spread_mad: (aggregate.moments.n >= 2).then_some(aggregate.moments.mad),
+                n: aggregate.moments.n,
                 flagged: flagged.contains(subject.as_str()),
                 violated: violated.contains(subject.as_str()),
-            })
-            .collect();
-        group_rows.sort_by(|left, right| left.subject.cmp(&right.subject));
-        rows.extend(group_rows);
+            });
+        }
     }
     rows
 }
@@ -481,6 +513,26 @@ pub fn format_value(unit: Unit, value: f64) -> String {
         Unit::Bytes => format_bytes(value),
         Unit::Count => format!("{value:.0}"),
         Unit::Residual => format!("{value:.2e}"),
+        Unit::Ratio => format!("{value:.3}"),
+    }
+}
+
+/// `format_value` without the unit suffix, for compact "±spread" tails.
+pub fn format_number(unit: Unit, value: f64) -> String {
+    match unit {
+        Unit::Gflops => {
+            if value.abs() >= 10.0 {
+                format!("{value:.0}")
+            } else {
+                format!("{value:.2}")
+            }
+        }
+        Unit::GibPerSec => format!("{value:.2}"),
+        Unit::Micros => format!("{value:.1}"),
+        Unit::Millis => format!("{value:.2}"),
+        Unit::Celsius | Unit::Mhz | Unit::Count => format!("{value:.0}"),
+        Unit::Bytes => format!("{value:.0}"),
+        Unit::Residual => format!("{value:.1e}"),
         Unit::Ratio => format!("{value:.3}"),
     }
 }

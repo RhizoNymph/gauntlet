@@ -72,6 +72,7 @@ pub fn run_all_pairs(sink: &EventSink, transfer_bytes: u64) -> Result<()> {
                         name: "bandwidth".to_string(),
                         value: measurement.bandwidth_gib_per_sec,
                         unit: Unit::GibPerSec,
+                        repeat: 0,
                     });
                     sink.metric(MetricRecord {
                         test: TestId::GpuP2p,
@@ -79,6 +80,7 @@ pub fn run_all_pairs(sink: &EventSink, transfer_bytes: u64) -> Result<()> {
                         name: "latency".to_string(),
                         value: measurement.latency_micros,
                         unit: Unit::Micros,
+                        repeat: 0,
                     });
                     sink.outcome(TestId::GpuP2p, scope, TestOutcome::Passed);
                 }

@@ -15,18 +15,32 @@ use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::fit::{AlphaBetaFit, fit_alpha_beta};
-use crate::analysis::stats::{self, Outlier, Sample};
+use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig};
 use crate::orchestrator::collect::HostObservations;
-use crate::proto::{Scope, TestId, TestOutcome, consistency_fields};
+use crate::proto::{Scope, TestId, TestOutcome, Unit, consistency_fields};
 
-pub const SCHEMA_VERSION: u32 = 1;
+// v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
+// and `repeat` on raw metric records.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Bytes per GiB, for turning a GiB/s reading into microseconds per byte.
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
 /// Microseconds per second.
 const MICROS_PER_SEC: f64 = 1_000_000.0;
+
+/// Per-subject distribution summary of one metric group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetricAggregate {
+    pub unit: Unit,
+    pub moments: Moments,
+}
+
+/// "<test>.<metric>" group -> sample key -> aggregate. Sweep series (a
+/// subject emitting several values within one repeat, e.g. the NCCL
+/// message-size sweeps) are excluded; they feed `calibration.links`.
+pub type Aggregates = BTreeMap<String, BTreeMap<String, MetricAggregate>>;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunResults {
@@ -41,6 +55,10 @@ pub struct RunResults {
     pub debug_build: bool,
     pub hosts: BTreeMap<String, HostObservations>,
     pub fleet: FleetAnalysis,
+    /// Per-subject distributions; n == 1 everywhere unless the run used
+    /// `--repeat`.
+    #[serde(default)]
+    pub aggregates: Aggregates,
     pub calibration: Calibration,
 }
 
@@ -55,6 +73,11 @@ pub struct FleetAnalysis {
     pub consistency: BTreeMap<String, ConsistencyFinding>,
     /// Hosts that produced errors (Fatal, transport, timeout).
     pub failed_hosts: BTreeMap<String, Vec<String>>,
+    /// Subjects whose run-to-run spread (MAD across repeats) is a fleet
+    /// outlier on the high side: jitter, not slowness. Informational —
+    /// does not affect the verdict. Empty unless the run used `--repeat`.
+    #[serde(default)]
+    pub jitter_outliers: BTreeMap<String, Vec<Outlier>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -173,29 +196,66 @@ pub fn build(
     started_epoch_secs: u64,
     finished_epoch_secs: u64,
 ) -> RunResults {
-    let groups = group_samples(&observations);
+    let aggregates = aggregate_metrics(&observations);
+    let raw_groups = group_samples(&observations);
 
+    // Fleet-relative straggler detection over per-subject medians, so
+    // run-to-run noise inside one subject cannot masquerade as slowness.
     let mut outliers = BTreeMap::new();
-    for (group, samples) in &groups {
-        if !is_fleet_comparable(samples) {
-            continue;
-        }
-        let flagged = stats::flag_outliers(samples, config.thresholds.mad_k);
+    for (group, subjects) in &aggregates {
+        let samples: Vec<Sample> = subjects
+            .iter()
+            .map(|(key, aggregate)| Sample {
+                key: key.clone(),
+                value: aggregate.moments.median,
+            })
+            .collect();
+        let flagged = stats::flag_outliers(&samples, config.thresholds.mad_k);
         if !flagged.is_empty() {
             outliers.insert(group.clone(), flagged);
         }
     }
 
+    // Jitter: a subject whose spread is a high-side fleet outlier. Only
+    // meaningful with repeats (n >= 2).
+    let mut jitter_outliers = BTreeMap::new();
+    for (group, subjects) in &aggregates {
+        let spreads: Vec<Sample> = subjects
+            .iter()
+            .filter(|(_, aggregate)| aggregate.moments.n >= 2)
+            .map(|(key, aggregate)| Sample {
+                key: key.clone(),
+                value: aggregate.moments.mad,
+            })
+            .collect();
+        let flagged: Vec<Outlier> = stats::flag_outliers(&spreads, config.thresholds.mad_k)
+            .into_iter()
+            .filter(|outlier| outlier.deviation_mads > 0.0)
+            .collect();
+        if !flagged.is_empty() {
+            jitter_outliers.insert(group.clone(), flagged);
+        }
+    }
+
+    // Absolute bounds check the per-subject median; sweep series (absent
+    // from aggregates) stay a per-value opt-in as before.
     let mut threshold_violations = BTreeMap::new();
     for (group, bound) in &config.thresholds.absolute {
-        let Some(samples) = groups.get(group) else {
+        let violators: Vec<String> = if let Some(subjects) = aggregates.get(group) {
+            subjects
+                .iter()
+                .filter(|(_, aggregate)| violates(bound, aggregate.moments.median))
+                .map(|(key, _)| key.clone())
+                .collect()
+        } else if let Some(samples) = raw_groups.get(group) {
+            samples
+                .iter()
+                .filter(|sample| violates(bound, sample.value))
+                .map(|sample| sample.key.clone())
+                .collect()
+        } else {
             continue;
         };
-        let violators: Vec<String> = samples
-            .iter()
-            .filter(|sample| violates(bound, sample.value))
-            .map(|sample| sample.key.clone())
-            .collect();
         if !violators.is_empty() {
             threshold_violations.insert(group.clone(), violators);
         }
@@ -212,6 +272,7 @@ pub fn build(
         threshold_violations,
         consistency: consistency_findings(&observations),
         failed_hosts,
+        jitter_outliers,
     };
     let calibration = Calibration {
         rooflines: rooflines(&observations),
@@ -230,8 +291,57 @@ pub fn build(
         debug_build: false,
         hosts: observations,
         fleet,
+        aggregates,
         calibration,
     }
+}
+
+/// Reduce raw (possibly repeated) metric records into per-subject
+/// `Moments`. A group where any (subject, repeat) pair occurs twice is a
+/// per-host series (the sweeps) and is skipped wholesale.
+pub fn aggregate_metrics(observations: &BTreeMap<String, HostObservations>) -> Aggregates {
+    let mut raw: BTreeMap<String, Vec<(String, u32, f64, Unit)>> = BTreeMap::new();
+    for (host, obs) in observations {
+        for record in &obs.metrics {
+            raw.entry(metric_key(record.test, &record.name))
+                .or_default()
+                .push((
+                    sample_key(host, &record.scope),
+                    record.repeat,
+                    record.value,
+                    record.unit,
+                ));
+        }
+    }
+
+    let mut aggregates = Aggregates::new();
+    for (group, entries) in raw {
+        let mut seen = BTreeSet::new();
+        if !entries
+            .iter()
+            .all(|(subject, repeat, _, _)| seen.insert((subject.clone(), *repeat)))
+        {
+            continue;
+        }
+        let mut per_subject: BTreeMap<String, (Unit, Vec<f64>)> = BTreeMap::new();
+        for (subject, _, value, unit) in entries {
+            per_subject
+                .entry(subject)
+                .or_insert_with(|| (unit, Vec::new()))
+                .1
+                .push(value);
+        }
+        let subjects: BTreeMap<String, MetricAggregate> = per_subject
+            .into_iter()
+            .filter_map(|(subject, (unit, values))| {
+                stats::moments(&values).map(|moments| (subject, MetricAggregate { unit, moments }))
+            })
+            .collect();
+        if !subjects.is_empty() {
+            aggregates.insert(group, subjects);
+        }
+    }
+    aggregates
 }
 
 pub fn verdict(results: &RunResults) -> Verdict {
@@ -277,19 +387,6 @@ fn group_samples(
         }
     }
     groups
-}
-
-/// A group is a fleet comparison only when every sample key is distinct.
-/// A repeated key means the metric is a per-host series rather than one
-/// reading per subject — the NCCL sweeps emit `msg_bytes`/`elapsed_us` once
-/// per message size, where spread across the series is the design, not a
-/// straggler signal. Those feed `calibration.links` instead. Absolute
-/// thresholds still apply to them: a bound is an explicit per-value opt-in.
-fn is_fleet_comparable(samples: &[Sample]) -> bool {
-    let mut seen = BTreeSet::new();
-    samples
-        .iter()
-        .all(|sample| seen.insert(sample.key.as_str()))
 }
 
 fn violates(bound: &Bound, value: f64) -> bool {
@@ -366,17 +463,28 @@ fn rooflines(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<Stri
 }
 
 fn roofline_for(obs: &HostObservations) -> NodeRoofline {
-    let mut gpu_gflops: BTreeMap<String, f64> = BTreeMap::new();
+    // Median per (metric, GPU) across repeats, then the slowest GPU
+    // defines what the node can sustain.
+    let mut per_gpu: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
     for record in &obs.metrics {
         if record.test == TestId::GpuGemmPerf
             && record.name.starts_with("gflops_")
             && record.value.is_finite()
         {
-            // The slowest GPU defines what the node can sustain.
-            let slot = gpu_gflops
-                .entry(record.name.clone())
-                .or_insert(record.value);
-            *slot = slot.min(record.value);
+            per_gpu
+                .entry((
+                    record.name.clone(),
+                    scope_label(&record.scope).unwrap_or_default(),
+                ))
+                .or_default()
+                .push(record.value);
+        }
+    }
+    let mut gpu_gflops: BTreeMap<String, f64> = BTreeMap::new();
+    for ((name, _scope), values) in per_gpu {
+        if let Some(median) = stats::median(&values) {
+            let slot = gpu_gflops.entry(name).or_insert(median);
+            *slot = slot.min(median);
         }
     }
 
@@ -403,11 +511,21 @@ enum Reduce {
     Max,
 }
 
+/// Reduce across subjects (cores, GPUs, disks, NUMA nodes) after taking
+/// each subject's median across repeats.
 fn reduce(obs: &HostObservations, test: TestId, name: &str, how: Reduce) -> Option<f64> {
-    obs.metrics
-        .iter()
-        .filter(|record| record.test == test && record.name == name && record.value.is_finite())
-        .map(|record| record.value)
+    let mut per_subject: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for record in &obs.metrics {
+        if record.test == test && record.name == name && record.value.is_finite() {
+            per_subject
+                .entry(scope_label(&record.scope).unwrap_or_default())
+                .or_default()
+                .push(record.value);
+        }
+    }
+    per_subject
+        .into_values()
+        .filter_map(|values| stats::median(&values))
         .reduce(|a, b| match how {
             Reduce::Min => a.min(b),
             Reduce::Max => a.max(b),
@@ -555,6 +673,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
 
     render_hosts(results, out)?;
     render_outliers(results, out)?;
+    render_jitter(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
     render_failures(results, out)?;
@@ -646,6 +765,29 @@ fn render_outliers(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     section(out, "outliers (fleet-relative)", &table)
 }
 
+fn render_jitter(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.jitter_outliers.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&["subject", "metric", "spread (MAD)", "fleet spread", "mads"]);
+    for (group, flagged) in &results.fleet.jitter_outliers {
+        for outlier in flagged {
+            table.add_row(vec![
+                outlier.key.clone(),
+                group.clone(),
+                format!("{:.3}", outlier.value),
+                format!("{:.3}", outlier.fleet_median),
+                format!("{:+.1}", outlier.deviation_mads),
+            ]);
+        }
+    }
+    section(
+        out,
+        "jitter outliers (fleet-relative run-to-run spread)",
+        &table,
+    )
+}
+
 fn render_violations(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     if results.fleet.threshold_violations.is_empty() {
         return Ok(());
@@ -734,6 +876,7 @@ mod tests {
             name: name.into(),
             value,
             unit: Unit::GibPerSec,
+            repeat: 0,
         }
     }
 
@@ -933,32 +1076,6 @@ mod tests {
         let links = link_fits(&observations);
         assert!(links.contains_key("nccl_allreduce_fleet"));
         assert!(!links.contains_key("tcp_pairwise"));
-    }
-
-    #[test]
-    fn sweep_series_are_not_treated_as_a_fleet_comparison() {
-        let unique = vec![
-            Sample {
-                key: "n1".into(),
-                value: 1.0,
-            },
-            Sample {
-                key: "n2".into(),
-                value: 2.0,
-            },
-        ];
-        assert!(is_fleet_comparable(&unique));
-        let series = vec![
-            Sample {
-                key: "n1".into(),
-                value: 1.0,
-            },
-            Sample {
-                key: "n1".into(),
-                value: 2.0,
-            },
-        ];
-        assert!(!is_fleet_comparable(&series));
     }
 
     #[test]

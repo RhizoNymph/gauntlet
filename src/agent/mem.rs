@@ -54,6 +54,7 @@ pub fn run(sink: &EventSink, spec: &MemTaskSpec) -> Result<()> {
                 name: "triad".to_string(),
                 value: gib_per_sec,
                 unit: Unit::GibPerSec,
+                repeat: 0,
             });
         } else {
             sink.outcome(
@@ -81,6 +82,7 @@ pub fn run(sink: &EventSink, spec: &MemTaskSpec) -> Result<()> {
             name: "triad_allnode".to_string(),
             value: allnode,
             unit: Unit::GibPerSec,
+            repeat: 0,
         });
     } else {
         sink.outcome(

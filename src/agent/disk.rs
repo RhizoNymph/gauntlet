@@ -117,6 +117,7 @@ pub fn run(sink: &EventSink, spec: &DiskTaskSpec) -> Result<()> {
                     name: "seq_write".to_string(),
                     value: throughput.write_gib_per_sec,
                     unit: Unit::GibPerSec,
+                    repeat: 0,
                 });
                 sink.metric(MetricRecord {
                     test: TestId::DiskIo,
@@ -124,6 +125,7 @@ pub fn run(sink: &EventSink, spec: &DiskTaskSpec) -> Result<()> {
                     name: "seq_read".to_string(),
                     value: throughput.read_gib_per_sec,
                     unit: Unit::GibPerSec,
+                    repeat: 0,
                 });
                 sink.outcome(TestId::DiskIo, scope, TestOutcome::Passed);
             }

@@ -15,6 +15,10 @@ use crate::model::{Attribution, Issue, MetricRow, Severity, ViewModel, attribute
 pub const REGRESS_WARN: f64 = 0.05;
 /// Regression fraction that colors a subject red.
 pub const REGRESS_BAD: f64 = 0.15;
+/// When both runs carry repeat spreads, a delta must also exceed this many
+/// units of pooled spread before it is judged — the % floors alone cannot
+/// tell regression from run-to-run noise.
+pub const NOISE_GATE_MADS: f64 = 2.0;
 /// Issue-list cap per subject; the rest collapse into a summary line.
 const MAX_ISSUES: usize = 6;
 
@@ -87,14 +91,26 @@ impl DiffView {
                 Some(false) => delta,
                 None => 0.0,
             };
-            let severity = if direction.is_some() && regression >= REGRESS_BAD {
+            // Noise gate: with spreads on both sides, the shift must clear
+            // ~2x the pooled run-to-run spread to be judged at all.
+            let clears_noise = match (row.spread_mad, base.spread_mad) {
+                (Some(current_spread), Some(baseline_spread)) if row.n >= 2 && base.n >= 2 => {
+                    let pooled = (current_spread.powi(2) + baseline_spread.powi(2)).sqrt();
+                    pooled <= f64::EPSILON
+                        || (row.value - base.value).abs() > NOISE_GATE_MADS * pooled
+                }
+                _ => true,
+            };
+            let severity = if !clears_noise {
+                Severity::Ok
+            } else if direction.is_some() && regression >= REGRESS_BAD {
                 Severity::Bad
             } else if direction.is_some() && regression >= REGRESS_WARN {
                 Severity::Warn
             } else {
                 Severity::Ok
             };
-            let improved = direction.is_some() && regression <= -REGRESS_WARN;
+            let improved = clears_noise && direction.is_some() && regression <= -REGRESS_WARN;
 
             rows.insert(
                 (row.group.clone(), row.subject.clone()),

@@ -527,6 +527,7 @@ pub fn run_on_gpu(sink: &EventSink, gpu_index: u32, spec: &GpuTaskSpec) -> Resul
             name: format!("residual_{tag}"),
             value: reported,
             unit: Unit::Residual,
+            repeat: 0,
         });
         sink.outcome(TestId::GpuGemmCorrectness, scope.clone(), outcome);
     }
@@ -566,6 +567,7 @@ pub fn run_on_gpu(sink: &EventSink, gpu_index: u32, spec: &GpuTaskSpec) -> Resul
                 name: name.to_string(),
                 value,
                 unit,
+                repeat: 0,
             });
         }
     }
@@ -606,6 +608,7 @@ fn sustained_pass(
             name: format!("gflops_{tag}"),
             value: gflops,
             unit: Unit::Gflops,
+            repeat: 0,
         });
     }
     Ok(())

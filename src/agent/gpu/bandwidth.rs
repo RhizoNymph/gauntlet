@@ -80,6 +80,7 @@ pub fn run_on_gpu(sink: &EventSink, gpu_index: u32, bandwidth_bytes: u64) -> Res
             name: name.to_string(),
             value,
             unit: Unit::GibPerSec,
+            repeat: 0,
         });
     }
     sink.outcome(TestId::GpuMemBandwidth, scope, TestOutcome::Passed);

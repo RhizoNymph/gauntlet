@@ -73,12 +73,26 @@ enum Observation {
 /// Cheap, cloneable handle onto the collector channel. Sends never block and
 /// never fail the caller: if the collector is gone the run is already over.
 #[derive(Clone)]
-struct ObservationSink(mpsc::UnboundedSender<Observation>);
+struct ObservationSink {
+    tx: mpsc::UnboundedSender<Observation>,
+    /// `--repeat` iteration stamped onto every metric that flows through.
+    repeat: u32,
+}
 
 impl ObservationSink {
-    fn event(&self, host: &str, event: AgentEvent) {
+    fn with_repeat(&self, repeat: u32) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            repeat,
+        }
+    }
+
+    fn event(&self, host: &str, mut event: AgentEvent) {
+        if let AgentEvent::Metric { record } = &mut event {
+            record.repeat = self.repeat;
+        }
         if self
-            .0
+            .tx
             .send(Observation::Event {
                 host: host.to_string(),
                 event: Box::new(event),
@@ -96,7 +110,7 @@ impl ObservationSink {
     fn error(&self, host: &str, error: impl Into<String>) {
         let error = error.into();
         if self
-            .0
+            .tx
             .send(Observation::Error {
                 host: host.to_string(),
                 error,
@@ -156,7 +170,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let run_id = report::make_run_id(started_epoch_secs, &host_addrs);
 
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let sink = ObservationSink(tx);
+    let sink = ObservationSink { tx, repeat: 0 };
     // Snapshots only make sense for the default history directory; an
     // explicit --out is a one-shot destination, not a directory a viewer
     // tails.
@@ -206,25 +220,35 @@ pub async fn run(args: RunArgs) -> Result<()> {
     );
 
     let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
-    for phase in &phases {
-        info!(?phase, "phase start");
-        match phase {
-            Phase::Inventory | Phase::CpuMem | Phase::Gpu => {
-                let seen = node_phase(&config, &sessions, *phase, &sink).await;
-                inventories.extend(seen);
-            }
-            Phase::Network => {
-                network_phase(
-                    &config,
-                    &sessions,
-                    &mut inventories,
-                    args.sample_pairs,
-                    &sink,
-                )
-                .await;
-            }
+    for repeat in 0..args.repeat {
+        let sink = sink.with_repeat(repeat);
+        if args.repeat > 1 {
+            info!(repeat, of = args.repeat, "repeat start");
         }
-        info!(?phase, "phase end");
+        for phase in &phases {
+            // The inventory is a census, not a measurement.
+            if *phase == Phase::Inventory && repeat > 0 {
+                continue;
+            }
+            info!(?phase, "phase start");
+            match phase {
+                Phase::Inventory | Phase::CpuMem | Phase::Gpu => {
+                    let seen = node_phase(&config, &sessions, *phase, &sink).await;
+                    inventories.extend(seen);
+                }
+                Phase::Network => {
+                    network_phase(
+                        &config,
+                        &sessions,
+                        &mut inventories,
+                        args.sample_pairs,
+                        &sink,
+                    )
+                    .await;
+                }
+            }
+            info!(?phase, "phase end");
+        }
     }
 
     drop(sink);
@@ -666,6 +690,7 @@ fn pair_metrics(
             name: "rtt_p50".into(),
             value: latency.rtt_p50_us,
             unit: Unit::Micros,
+            repeat: 0,
         },
         MetricRecord {
             test: TestId::NetLatency,
@@ -673,6 +698,7 @@ fn pair_metrics(
             name: "rtt_p99".into(),
             value: latency.rtt_p99_us,
             unit: Unit::Micros,
+            repeat: 0,
         },
         MetricRecord {
             test: TestId::NetLatency,
@@ -680,6 +706,7 @@ fn pair_metrics(
             name: "rtt_max".into(),
             value: latency.rtt_max_us,
             unit: Unit::Micros,
+            repeat: 0,
         },
         MetricRecord {
             test: TestId::NetBandwidth,
@@ -687,6 +714,7 @@ fn pair_metrics(
             name: "gib_per_sec".into(),
             value: bandwidth.gib_per_sec,
             unit: Unit::GibPerSec,
+            repeat: 0,
         },
     ]
 }
