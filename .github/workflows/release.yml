@@ -1,0 +1,230 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# The APT repository is a single git branch in another repo; two releases
+# rewriting its reprepro database at once would corrupt it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # gpui links libxkbcommon and libxkbcommon-x11 at build time. Wayland,
+  # Vulkan and fontconfig are dlopened at runtime and need no -dev packages
+  # here. cudarc likewise dlopens the CUDA stack, so no CUDA toolchain is
+  # required to build the GPU feature.
+  BUILD_DEPS: libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+
+jobs:
+  verify:
+    name: Verify version and test
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      # A tag whose version disagrees with the manifests would publish a crate
+      # that can never be matched to its release, so fail before anything is
+      # pushed anywhere.
+      - name: Check manifest versions match the tag
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          fail=0
+          for pkg in gauntlet-bench gauntlet-view; do
+            got=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg p "$pkg" '.packages[] | select(.name==$p) | .version')
+            if [ "$got" != "$VERSION" ]; then
+              echo "::error::$pkg is version $got but the tag says $VERSION"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build packages
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version =3.7.0 --locked
+
+      # Built separately so a node installing the CLI never pulls the GUI's
+      # Vulkan/Wayland runtime dependencies.
+      - name: Build .deb packages
+        run: |
+          cargo deb -p gauntlet-bench
+          cargo deb -p gauntlet-view
+
+      - name: Build release tarballs
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          mkdir -p dist
+          for bin in gauntlet gauntlet-view; do
+            tar -czf "dist/${bin}-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+              -C target/release "$bin"
+          done
+          cp target/debian/*.deb dist/
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+
+  publish-apt:
+    name: Publish to APT repository
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - name: Check out the APT repository branch
+        uses: actions/checkout@v4
+        with:
+          repository: RhizoNymph/sysdui
+          ref: apt-repo
+          token: ${{ secrets.APT_REPO_TOKEN }}
+          path: apt-repo
+
+      - name: Install reprepro
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Import GPG signing key
+        run: echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
+
+      # `reprepro includedeb` refuses a version it already has, so drop any
+      # existing copy first; this makes re-running a release idempotent.
+      - name: Add packages to the repository
+        run: |
+          cd apt-repo
+          reprepro --export=never remove stable gauntlet gauntlet-view || true
+          for deb in ../dist/*.deb; do
+            reprepro includedeb stable "$deb"
+          done
+
+      - name: Push updated repository
+        run: |
+          cd apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repository already up to date."
+          else
+            git commit -m "Add gauntlet ${{ needs.verify.outputs.tag }}"
+            git push
+          fi
+
+  github-release:
+    name: Create GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      # gauntlet-view depends on gauntlet-bench, so the order is fixed and the
+      # second publish has to wait for the first to reach the index.
+      - name: Publish
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          UA="gauntlet-release-ci (https://github.com/RhizoNymph/gauntlet)"
+
+          published() {
+            curl -sS -H "User-Agent: $UA" \
+              "https://crates.io/api/v1/crates/$1/$2" \
+              | grep -q '"num":'
+          }
+
+          for pkg in gauntlet-bench gauntlet-view; do
+            if published "$pkg" "$VERSION"; then
+              echo "$pkg $VERSION is already on crates.io, skipping."
+              continue
+            fi
+
+            # Deliberately not --locked: publishing gauntlet-view resolves
+            # gauntlet-bench from the registry rather than the workspace path,
+            # which the committed lock file does not describe.
+            cargo publish -p "$pkg"
+
+            echo "Waiting for $pkg $VERSION to appear in the index..."
+            for _ in $(seq 1 30); do
+              if published "$pkg" "$VERSION"; then
+                echo "$pkg $VERSION is available."
+                break
+              fi
+              sleep 10
+            done
+          done

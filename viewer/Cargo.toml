@@ -2,14 +2,49 @@
 name = "gauntlet-view"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Native GUI viewer for gauntlet cluster benchmark runs: browse runs, tail live runs, and diff against a baseline."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RhizoNymph/gauntlet"
+homepage = "https://github.com/RhizoNymph/gauntlet"
+readme = "README.md"
+keywords = ["benchmark", "cluster", "gui", "viewer", "gpui"]
+categories = ["command-line-utilities", "visualization"]
+
+[[bin]]
+name = "gauntlet-view"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "=1.0.104"
 clap = { version = "=4.6.5", features = ["derive"] }
-# Results parsing and analysis primitives only; no cudarc/GPU stack.
-gauntlet = { path = "..", default-features = false }
+# Results parsing and analysis primitives only; no cudarc/GPU stack. The
+# package is `gauntlet-bench` on crates.io but its lib target is named
+# `gauntlet`, which is what this crate's source refers to.
+gauntlet = { package = "gauntlet-bench", path = "..", version = "0.1.0", default-features = false }
 gpui = "=0.2.2"
 serde_json = "=1.0.151"
 
 [dev-dependencies]
 toml = "=1.1.4"
+
+# The viewer links libxkbcommon/libxkbcommon-x11 at build time; Wayland,
+# Vulkan and fontconfig are dlopened by gpui at runtime and so are named
+# explicitly here (dpkg-shlibdeps cannot see dlopen'd libraries).
+[package.metadata.deb]
+name = "gauntlet-view"
+maintainer = "RhizoNymph <quantnymph@gmail.com>"
+copyright = "2026 RhizoNymph"
+license-file = "LICENSE-MIT"
+section = "utils"
+priority = "optional"
+extended-description = """\
+GPU-accelerated desktop viewer for gauntlet run results. Browses the runs \
+directory, tails in-flight runs as they publish partial snapshots, and diffs \
+any run against a baseline."""
+depends = "$auto, libvulkan1, libfontconfig1, libwayland-client0"
+recommends = "gauntlet"
+assets = [
+    ["target/release/gauntlet-view", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/gauntlet-view/README.md", "644"],
+]
