@@ -36,6 +36,7 @@ impl RootView {
             .border_color(rgb(PANEL_BORDER))
             .bg(rgb(PANEL))
             .child(self.run_button(cx))
+            .child(self.repeat_chip(cx))
             .child(self.bootstrap_button(cx));
         if self.child_kind().is_some() {
             rail = rail.child(self.cancel_button(cx));
@@ -110,6 +111,45 @@ impl RootView {
                     this.start_run(cx);
                 }),
             )
+        }
+    }
+
+    /// Click to cycle 1 -> 3 -> 5 -> 10 repeats for the next launched run.
+    fn repeat_chip(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let busy = self.child_kind().is_some();
+        let label = if self.repeat == 1 {
+            "repeat: off".to_string()
+        } else {
+            format!("repeat: ×{} (moments)", self.repeat)
+        };
+        let color = if busy {
+            MUTED
+        } else if self.repeat > 1 {
+            SELECT
+        } else {
+            MUTED
+        };
+        let chip = div()
+            .id("repeat-cycle")
+            .mx_2()
+            .mt_1()
+            .px_3()
+            .text_size(px(10.0))
+            .text_color(rgb(color))
+            .flex()
+            .justify_center()
+            .child(label);
+        if busy {
+            chip
+        } else {
+            chip.cursor_pointer()
+                .hover(|style| style.text_color(rgb(SELECT)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.cycle_repeat(cx);
+                    }),
+                )
         }
     }
 

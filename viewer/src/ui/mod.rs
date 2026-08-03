@@ -110,6 +110,8 @@ pub struct RootView {
     launched_run_id: Option<String>,
     /// Status line under the run button (spawn results, load errors).
     pub note: Option<(Severity, String)>,
+    /// `--repeat` passed to GUI-launched runs (1 = single shot).
+    pub repeat: u32,
     /// Jump to the next live run that appears (set when a run is launched).
     auto_follow: bool,
     /// Last bootstrap readiness report, shown in the center pane.
@@ -149,6 +151,7 @@ impl RootView {
             graph_bounds: None,
             child: None,
             launched_run_id: None,
+            repeat: 1,
             note: None,
             auto_follow: false,
             bootstrap_report: None,
@@ -346,6 +349,11 @@ impl RootView {
         self.child.as_ref().map(|(kind, _)| *kind)
     }
 
+    pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
+        self.repeat = crate::runs::cycle_repeat(self.repeat);
+        cx.notify();
+    }
+
     pub fn start_run(&mut self, cx: &mut Context<Self>) {
         if self.child.is_some() {
             return;
@@ -441,10 +449,12 @@ impl RootView {
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
         let log_err = log.try_clone().context("cloning log handle")?;
-        Command::new(&program)
-            .arg("run")
-            .arg("--config")
-            .arg(&self.config_path)
+        let mut command = Command::new(&program);
+        command.arg("run").arg("--config").arg(&self.config_path);
+        if self.repeat > 1 {
+            command.arg("--repeat").arg(self.repeat.to_string());
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))

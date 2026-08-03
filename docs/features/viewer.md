@@ -11,7 +11,9 @@ connected fleet graph plus a quantitative metric table.
   (`<run_id>.partial.json`, written by `gauntlet run` every ~2s) reloads as
   it grows and swaps to the final JSON when the run completes.
 - Launch runs from the GUI: the ▶ button spawns the `gauntlet` binary
-  (sibling of the viewer binary, else $PATH) with `run --config <config>`,
+  (sibling of the viewer binary, else $PATH) with `run --config <config>`
+  (plus `--repeat N` when the repeat chip under the button is cycled past
+  "off": ×3/×5/×10),
   logs to `runs/gauntlet-run.log`, follows the new live run, and reports
   the exit verdict. ✕ cancel kills the child; a cancelled run's orphaned
   partial snapshot is deleted and the view falls back to the newest

@@ -173,3 +173,14 @@ fn scan_reads_finals_and_partials_and_skips_junk() {
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
 }
+
+#[test]
+fn repeat_cycle_walks_the_presets_and_wraps() {
+    use gauntlet_view::runs::cycle_repeat;
+    assert_eq!(cycle_repeat(1), 3);
+    assert_eq!(cycle_repeat(3), 5);
+    assert_eq!(cycle_repeat(5), 10);
+    assert_eq!(cycle_repeat(10), 1);
+    // Anything unexpected resets to a single shot.
+    assert_eq!(cycle_repeat(7), 1);
+}
