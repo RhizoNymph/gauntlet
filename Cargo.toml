@@ -1,7 +1,29 @@
 [package]
-name = "gauntlet"
+# `gauntlet` is taken on crates.io by an unrelated crate; the published name
+# carries the `-bench` suffix. The lib and bin targets below keep the plain
+# `gauntlet` name, so `use gauntlet::...` and the installed binary are
+# unaffected.
+name = "gauntlet-bench"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Cluster pre-flight benchmark and health check: deploys itself over ssh and runs a phased CPU, DRAM, disk, GPU, network and NCCL suite with fleet-relative outlier detection."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/RhizoNymph/gauntlet"
+homepage = "https://github.com/RhizoNymph/gauntlet"
+readme = "README.md"
+keywords = ["benchmark", "cluster", "gpu", "nccl", "hpc"]
+categories = ["command-line-utilities", "science"]
+# Run outputs and local operator config are not part of the published crate.
+exclude = ["/runs", "/.claude", "/target", "gauntlet.toml"]
+
+[lib]
+name = "gauntlet"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gauntlet"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "=1.0.104"
@@ -39,6 +61,30 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 [features]
 default = ["gpu"]
 gpu = ["dep:cudarc", "dep:half", "dep:base64"]
+
+# Debian packaging. The package keeps the short name `gauntlet` regardless of
+# the crates.io name. CUDA/NCCL libraries are dlopened at runtime, so they are
+# deliberately absent from `depends`: the CLI is useful on GPU-less nodes and
+# the driver stack is never installed from this repo.
+[package.metadata.deb]
+name = "gauntlet"
+maintainer = "RhizoNymph <quantnymph@gmail.com>"
+copyright = "2026 RhizoNymph"
+license-file = "LICENSE-MIT"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Gauntlet deploys itself to each host in a TOML-described fleet over ssh and \
+runs a phased suite of correctness and performance tests covering CPU, DRAM, \
+disk, GPU, intra/inter-node network and NCCL collectives. It reports a \
+schema-versioned JSON document plus a human-readable table, flagging \
+stragglers by fleet-relative outlier detection (median + MAD)."""
+depends = "$auto, openssh-client"
+assets = [
+    ["target/release/gauntlet", "usr/bin/", "755"],
+    ["gauntlet.example.toml", "usr/share/doc/gauntlet/", "644"],
+    ["README.md", "usr/share/doc/gauntlet/README.md", "644"],
+]
 
 [profile.release]
 lto = true

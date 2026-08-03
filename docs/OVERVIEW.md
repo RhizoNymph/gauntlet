@@ -125,6 +125,21 @@ Features Index:
     entry_points: [viewer/src/main.rs, viewer/src/model.rs, viewer/src/ui/]
     depends_on: [reporting]
     doc: docs/features/viewer.md
+  release_ci:
+    description: >
+      A `vX.Y.Z` tag gates on version agreement + `cargo test --workspace`,
+      then builds two .deb packages (`gauntlet` CLI, `gauntlet-view` GUI, kept
+      separate so fleet nodes never pull Vulkan/Wayland runtime deps), and
+      fans out to three destinations: reprepro into the APT repo on the
+      `apt-repo` branch of RhizoNymph/sysdui (served at
+      rhizonymph.github.io/sysdui), a GitHub release with .debs + tarballs,
+      and crates.io. The CLI publishes as `gauntlet-bench` because `gauntlet`
+      is taken; `[lib]`/`[[bin]]`/deb names stay `gauntlet`, so no source or
+      deployment path changes. Every publishing step is idempotent, so a
+      partially failed release can be resumed via workflow_dispatch.
+    entry_points: [.github/workflows/release.yml, Cargo.toml, viewer/Cargo.toml]
+    depends_on: [viewer, reporting]
+    doc: docs/features/release_ci.md
 ```
 
 ## Decisions (2026-08-01)
@@ -133,4 +148,13 @@ Features Index:
 - Target scale 32–256 nodes; full-mesh pairwise viable via tournament rounds.
 - v1 scope: phases 0–3. Soak mode (sustained mixed load watching clock decay,
   new ECC/Xid errors, link flaps) and richer run-history diffing deferred.
+
+## Decisions (2026-08-02)
+
+- Released from tags only; the tag is the single source of version truth and
+  both crates are versioned in lockstep.
+- Packages ship into the pre-existing `sysdui` APT repo rather than a new
+  per-project repo, so one keyring and one sources.list entry cover all tools.
+- amd64 only: the APT repo declares `Architectures: amd64` and the fleet is
+  x86_64.
 ```
