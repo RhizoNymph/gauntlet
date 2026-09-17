@@ -89,6 +89,18 @@ Features Index:
     entry_points: [agent/gpu/]
     depends_on: [phase0_inventory]
     doc: docs/features/phase2_gpu.md
+  hot_sdc:
+    description: >
+      Silent-data-corruption screens under thermal load (SDC is
+      temperature/voltage dependent): periodic bitwise verification of the
+      sustained GEMM output during the loaded window (busy-time scheduled,
+      throughput-neutral), and an all-core CPU screen interleaving checksum
+      rounds with the power-heavy FMA workload. Mismatches are hard
+      per-scope failures with clock/temp context; fleet.sdc_failures +
+      dedicated table section.
+    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs]
+    depends_on: [phase1_cpu_mem_disk, phase2_gpu]
+    doc: docs/features/hot_sdc.md
   phase3_network:
     description: >
       Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
