@@ -87,6 +87,8 @@ pub enum AgentCommand {
     Peer(PeerArgs),
     /// NCCL participant; reads an NcclDirective JSON from stdin.
     Nccl,
+    /// TCP star-barrier participant (barrier-skew microbenchmark).
+    Barrier(BarrierArgs),
 }
 
 #[derive(Debug, Args)]
@@ -120,5 +122,35 @@ pub enum PeerCommand {
         target: String,
         #[arg(long, default_value_t = 5)]
         duration_secs: u64,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct BarrierArgs {
+    #[command(subcommand)]
+    pub command: BarrierCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BarrierCommand {
+    /// Coordinate the barrier: release every rank each iteration, time the
+    /// responses, print a TcpBarrierReport JSON line.
+    Serve {
+        #[arg(long)]
+        port: u16,
+        /// Number of ranks that must join before iterations start.
+        #[arg(long)]
+        world: u32,
+        #[arg(long)]
+        iters: u32,
+    },
+    /// Join a coordinator and answer its releases.
+    Join {
+        target: String,
+        /// Rank id assigned by the orchestrator (stable host index).
+        #[arg(long)]
+        rank: u32,
+        #[arg(long)]
+        iters: u32,
     },
 }

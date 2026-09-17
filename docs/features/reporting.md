@@ -176,3 +176,16 @@ Downstream effects: fleet outliers are flagged on per-subject *medians*
 outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
+
+## Barrier stragglers (schema v3)
+
+The barrier-skew microbenchmark (docs/features/barrier_skew.md) emits
+per-host `nccl_barrier.*` / `tcp_barrier.*` metrics that flow through the
+ordinary MAD machinery, plus a dedicated rule:
+`report::barrier_straggler_flags` populates `fleet.barrier_stragglers`
+(group -> flagged hosts) when a host's median `slowest_frac` exceeds
+`thresholds.barrier_slowest_frac` and its median `slowest_considered` is
+at least `analysis::skew::MIN_TALLY_ITERS`. Barrier straggler flags count
+toward the `Stragglers` verdict and render as the "barrier stragglers"
+table section. The field is serde-defaulted, so pre-v3 documents load
+with it empty.

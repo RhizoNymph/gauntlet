@@ -24,9 +24,16 @@ gemm_dim = 8192
 gemm_dtypes = ["f32", "bf16", "f16"]
 disk_paths = ["/tmp"]
 net_port_base = 29500
+# Barrier-skew microbenchmark: iterations of a tiny collective, timed
+# per rank to find hosts that consistently arrive late. 0 disables.
+barrier_iters = 2000
+barrier_bytes = 8
 
 [thresholds]
 mad_k = 4.0
+# Flag a host as a barrier straggler when it was the late arriver in more
+# than this fraction of the margin-passing iterations.
+barrier_slowest_frac = 0.5
 # Optional absolute floors/ceilings, keyed "<test>.<metric>":
 # [thresholds.absolute."gpu_gemm_perf.gflops_bf16"]
 # min = 500000.0

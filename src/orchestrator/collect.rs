@@ -75,6 +75,11 @@ impl Collector {
             AgentEvent::NcclId { .. } => {
                 tracing::debug!(host = host_addr, "ignoring stray nccl id event");
             }
+            // Same: the phase-3 driver merges these across ranks and emits
+            // derived metrics; the raw vectors never land in the report.
+            AgentEvent::NcclBarrierTimings { .. } => {
+                tracing::debug!(host = host_addr, "ignoring stray barrier timings event");
+            }
             AgentEvent::Fatal { message } => {
                 error!(host = host_addr, message, "agent fatal");
                 host.errors.push(message);

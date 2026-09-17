@@ -22,6 +22,9 @@ Orchestrator phase-3 driver:
 4. `analysis::fit::fit_alpha_beta` over (size, elapsed_us) → calibration
    `links` entries ("tcp_pairwise" from latency+bandwidth points per pair
    class, "nccl_allreduce_fleet" from the sweep).
+5. Barrier-skew microbenchmark: a tiny-collective straggler probe riding
+   the same NCCL communicator, plus a TCP star-barrier fallback after it.
+   See docs/features/barrier_skew.md.
 
 ## Management vs data plane
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth
