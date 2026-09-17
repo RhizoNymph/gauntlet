@@ -232,7 +232,11 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
             info!(?phase, "phase start");
             match phase {
-                Phase::Inventory | Phase::CpuMem | Phase::Gpu => {
+                // Overlap is node-local like phases 0-2 (single process,
+                // intra-node NCCL world); it is scheduled after gpu/network
+                // so its retention ratios divide isolated baselines from the
+                // same run.
+                Phase::Inventory | Phase::CpuMem | Phase::Gpu | Phase::Overlap => {
                     let seen = node_phase(&config, &sessions, *phase, &sink).await;
                     inventories.extend(seen);
                 }

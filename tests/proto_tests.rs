@@ -121,6 +121,80 @@ fn hello_validation() {
 }
 
 #[test]
+fn overlap_phase_exists_and_runs_last() {
+    assert_eq!(Phase::parse("overlap"), Some(Phase::Overlap));
+    assert_eq!(Phase::ALL.len(), 5);
+    // The overlap phase needs the isolated phase-2/3 baselines from the same
+    // run, so it must be scheduled after them.
+    assert_eq!(Phase::ALL.last(), Some(&Phase::Overlap));
+}
+
+#[test]
+fn overlap_task_spec_round_trips() {
+    use gauntlet::proto::{
+        AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec,
+        OverlapTaskSpec,
+    };
+    let spec = AgentTaskSpec {
+        phases: vec![Phase::Gpu, Phase::Overlap],
+        cpu: CpuTaskSpec {
+            correctness_secs_per_core: 1,
+            gflops_secs: 1,
+        },
+        mem: MemTaskSpec {
+            buffer_bytes_per_numa: 1 << 20,
+            iters: 2,
+        },
+        disk: DiskTaskSpec {
+            paths: vec!["/tmp".into()],
+            file_bytes: 1 << 20,
+        },
+        gpu: GpuTaskSpec {
+            gemm_secs: 3,
+            gemm_dtypes: vec![GemmDtype::Bf16],
+            gemm_dim: 2048,
+            bandwidth_bytes: 1 << 20,
+        },
+        overlap: OverlapTaskSpec {
+            duration_secs: 30,
+            baseline_secs: 5,
+            gemm_dim: 2048,
+            gemm_dtype: GemmDtype::Bf16,
+            msg_bytes: 64 << 20,
+        },
+    };
+    let json = serde_json::to_string(&spec).expect("serialize");
+    let back: AgentTaskSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, spec);
+}
+
+#[test]
+fn overlap_metric_events_round_trip() {
+    for (test, name, scope) in [
+        (TestId::OverlapGemm, "gflops_bf16", Scope::Gpu { index: 1 }),
+        (
+            TestId::OverlapAllReduce,
+            "overlap_bus_gib_per_sec",
+            Scope::Node,
+        ),
+        (TestId::OverlapRetention, "all_reduce", Scope::Node),
+    ] {
+        let event = AgentEvent::Metric {
+            record: MetricRecord {
+                test,
+                scope,
+                name: name.into(),
+                value: 0.87,
+                unit: Unit::Ratio,
+                repeat: 0,
+            },
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
+}
+
+#[test]
 fn malformed_lines_error() {
     assert!(decode_event("not json").is_err());
     assert!(decode_event(r#"{"event":"warp"}"#).is_err());

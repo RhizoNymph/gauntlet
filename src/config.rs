@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, Phase,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapTaskSpec,
+    Phase,
 };
 
 #[derive(Debug, Error)]
@@ -118,6 +119,12 @@ pub struct TestConfig {
     /// NCCL sweep message sizes in bytes.
     pub nccl_sizes: Vec<u64>,
     pub nccl_iters_per_size: u32,
+    /// Overlap phase: wall seconds of GEMM + all-reduce combined load.
+    pub overlap_secs: u64,
+    /// Overlap phase: isolated intra-node all-reduce baseline window.
+    pub overlap_baseline_secs: u64,
+    /// Overlap phase: all-reduce message size in MiB.
+    pub overlap_msg_mib: u64,
 }
 
 impl Default for TestConfig {
@@ -141,6 +148,9 @@ impl Default for TestConfig {
             // 1 KiB .. 1 GiB, powers of 4.
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
+            overlap_secs: 30,
+            overlap_baseline_secs: 5,
+            overlap_msg_mib: 64,
         }
     }
 }
@@ -245,6 +255,16 @@ impl FleetConfig {
                 gemm_dtypes: tests.gemm_dtypes.clone(),
                 gemm_dim: tests.gemm_dim,
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
+            },
+            overlap: OverlapTaskSpec {
+                duration_secs: tests.overlap_secs,
+                baseline_secs: tests.overlap_baseline_secs,
+                // Same dimension as phase 2 so the retention ratio divides
+                // comparable numbers; the compute leg runs the first
+                // configured dtype only.
+                gemm_dim: tests.gemm_dim,
+                gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
+                msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
             },
         }
     }
