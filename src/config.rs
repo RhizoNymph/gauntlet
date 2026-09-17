@@ -246,6 +246,9 @@ impl FleetConfig {
                 gemm_dim: tests.gemm_dim,
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
             },
+            // Counter passes are scheduled by the orchestrator as dedicated
+            // invocations; a plain phase spec never carries one.
+            counters: None,
         }
     }
 

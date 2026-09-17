@@ -98,6 +98,19 @@ Features Index:
     entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
+  counter_deltas:
+    description: >
+      Error-counter delta detection across the load phases: the agent
+      snapshots PCIe AER, GPU ECC/row-remap, dmesg Xid, NVLink, EDAC, IB
+      port and NVMe error counters before the first load phase (baseline
+      held by the orchestrator) and again after the last repeat, diffs on
+      the agent, and emits per-node CounterDeltas. Any positive increment
+      is a per-host finding (verdict Stragglers) rendered in its own table
+      section; full deltas (zeros included) land in the JSON. Collection
+      is best effort — nodes without a subsystem contribute nothing.
+    entry_points: [agent/counters.rs, orchestrator/mod.rs]
+    depends_on: [phase0_inventory]
+    doc: docs/features/counter_deltas.md
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
@@ -107,7 +120,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, counter_deltas]
     doc: docs/features/reporting.md
   viewer:
     description: >

@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use tracing::{debug, error, info, warn};
 
 use crate::proto::{
-    AgentEvent, InventorySnapshot, LogLevel, MetricRecord, Scope, TestId, TestOutcome,
+    AgentEvent, CounterDeltas, InventorySnapshot, LogLevel, MetricRecord, Scope, TestId,
+    TestOutcome,
 };
 
 /// Everything observed about one host during a run.
@@ -22,6 +23,10 @@ pub struct HostObservations {
     pub outcomes: Vec<(TestId, Scope, TestOutcome)>,
     /// Fatal events, transport failures, phase timeouts.
     pub errors: Vec<String>,
+    /// Error-counter deltas across the load phases, zero deltas included.
+    /// Absent when the run had no load phases or the delta pass failed.
+    #[serde(default)]
+    pub counter_deltas: Option<CounterDeltas>,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +79,14 @@ impl Collector {
             // reach the collector; one arriving here is a stray duplicate.
             AgentEvent::NcclId { .. } => {
                 tracing::debug!(host = host_addr, "ignoring stray nccl id event");
+            }
+            // The counter driver intercepts and holds baselines; one
+            // arriving here is a stray duplicate.
+            AgentEvent::CounterBaseline { .. } => {
+                debug!(host = host_addr, "ignoring stray counter baseline event");
+            }
+            AgentEvent::CounterDeltas { deltas } => {
+                host.counter_deltas = Some(*deltas);
             }
             AgentEvent::Fatal { message } => {
                 error!(host = host_addr, message, "agent fatal");

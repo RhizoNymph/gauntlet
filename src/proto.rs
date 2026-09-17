@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const PROTO_VERSION: u32 = 1;
+// v2: error-counter snapshot/delta events (`counter_baseline`,
+// `counter_deltas`) and the `counters` request on `AgentTaskSpec`.
+pub const PROTO_VERSION: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -70,6 +72,17 @@ pub enum AgentEvent {
     /// dead port.
     NcclId {
         unique_id_b64: String,
+    },
+    /// Error-counter snapshot taken before the load phases. Boxed for the
+    /// same reason as `Inventory`. The orchestrator intercepts and holds it;
+    /// it never reaches the collector on the happy path.
+    CounterBaseline {
+        snapshot: Box<CounterSnapshot>,
+    },
+    /// Per-node counter deltas across the load phases, computed on the agent
+    /// from the baseline the orchestrator handed back in the task spec.
+    CounterDeltas {
+        deltas: Box<CounterDeltas>,
     },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
@@ -262,6 +275,98 @@ pub struct IbPortInventory {
 }
 
 // ---------------------------------------------------------------------------
+// Error counters
+// ---------------------------------------------------------------------------
+
+/// Which hardware subsystem an error counter belongs to. Order matters only
+/// for deterministic rendering (deltas sort by (domain, device, counter)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterDomain {
+    PcieAer,
+    GpuEcc,
+    GpuXid,
+    Nvlink,
+    Edac,
+    IbPort,
+    Nvme,
+}
+
+impl CounterDomain {
+    pub fn label(self) -> &'static str {
+        match self {
+            CounterDomain::PcieAer => "pcie_aer",
+            CounterDomain::GpuEcc => "gpu_ecc",
+            CounterDomain::GpuXid => "gpu_xid",
+            CounterDomain::Nvlink => "nvlink",
+            CounterDomain::Edac => "edac",
+            CounterDomain::IbPort => "ib_port",
+            CounterDomain::Nvme => "nvme",
+        }
+    }
+}
+
+/// One monotonic error counter at one instant. Identity is
+/// (domain, device, counter); a snapshot never carries the same identity
+/// twice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterReading {
+    pub domain: CounterDomain,
+    /// The hardware unit the counter belongs to: a PCI address
+    /// ("0000:65:00.0"), "gpu0", "mc0/dimm1", "mlx5_0/1" (device/port),
+    /// "gpu0/link1", "nvme0", or "dmesg" for the kernel-log Xid tally.
+    pub device: String,
+    pub counter: String,
+    pub value: u64,
+}
+
+/// Everything counted on a node at one instant. Absence of a subsystem
+/// (no IB, no NVMe, ...) is simply absence of its readings, never an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterSnapshot {
+    pub readings: Vec<CounterReading>,
+}
+
+/// Before/after values of one counter across the load phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterDelta {
+    pub domain: CounterDomain,
+    pub device: String,
+    pub counter: String,
+    pub before: u64,
+    pub after: u64,
+}
+
+impl CounterDelta {
+    /// Signed change. Negative means the counter reset between snapshots
+    /// (driver reload, log rotation) — recorded, but not an error finding.
+    pub fn increment(&self) -> i128 {
+        i128::from(self.after) - i128::from(self.before)
+    }
+}
+
+/// Full delta list for a node, zero deltas included: the JSON document keeps
+/// everything; only nonzero increments become report findings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterDeltas {
+    pub deltas: Vec<CounterDelta>,
+}
+
+/// What the orchestrator wants from a counter pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CounterRequest {
+    /// Snapshot now and emit `CounterBaseline`.
+    Baseline,
+    /// Snapshot now, diff against `baseline`, emit `CounterDeltas`.
+    Delta { baseline: CounterSnapshot },
+}
+
+// ---------------------------------------------------------------------------
 // Task specs (orchestrator -> agent)
 // ---------------------------------------------------------------------------
 
@@ -273,6 +378,10 @@ pub struct AgentTaskSpec {
     pub mem: MemTaskSpec,
     pub disk: DiskTaskSpec,
     pub gpu: GpuTaskSpec,
+    /// Error-counter pass to run after the listed phases; the orchestrator
+    /// sends this in dedicated invocations with an empty phase list.
+    #[serde(default)]
+    pub counters: Option<CounterRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

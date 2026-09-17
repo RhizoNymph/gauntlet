@@ -20,7 +20,7 @@ use crate::proto::{AgentEvent, GpuInventory, IbPortInventory, InventorySnapshot,
 
 /// Upper bound on any single external probe. `collect()` runs at most a
 /// handful of these, keeping the documented < 5s budget with room to spare.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const QUICK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Kernel logs can be huge; a bounded read keeps the Xid scan cheap.
 const MAX_CAPTURE_BYTES: u64 = 8 << 20;
@@ -308,7 +308,7 @@ fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
 
 /// `nvidia-smi` prints "N/A", "[N/A]" or "[Not Supported]" for fields the
 /// device or driver does not expose.
-fn csv_field(raw: &str) -> Option<&str> {
+pub(crate) fn csv_field(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -465,7 +465,7 @@ fn probe_xid_errors() -> Vec<u32> {
     codes.into_iter().collect()
 }
 
-fn parse_xid_line(line: &str) -> Option<u32> {
+pub(crate) fn parse_xid_line(line: &str) -> Option<u32> {
     let (_, rest) = line.split_once("NVRM: Xid")?;
     // Skip the "(PCI:0000:65:00)" device tag when present.
     let rest = match rest.split_once(')') {
@@ -498,7 +498,7 @@ fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
 /// blocking `wait()` would deadlock if the child filled the pipe) and killed
 /// if it outlives the deadline, so a wedged tool can never stall `collect()`.
 /// A missing binary, a non-zero exit, or a timeout all yield `None`.
-fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
