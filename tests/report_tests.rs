@@ -576,6 +576,215 @@ fn absolute_thresholds_apply_to_the_median_of_repeats() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Overlap phase: retention ratios derived at build time
+// ---------------------------------------------------------------------------
+
+fn gpu_metric(test: TestId, gpu: u32, name: &str, value: f64, repeat: u32) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope: Scope::Gpu { index: gpu },
+        name: name.into(),
+        value,
+        unit: Unit::Gflops,
+        repeat,
+    }
+}
+
+/// One host with phase-2 GEMM baselines, overlap GEMM numbers, and the
+/// overlap all-reduce pair (isolated + overlapped bus bandwidth).
+fn overlap_host(
+    baselines: &[(u32, f64)],
+    overlapped: &[(u32, f64)],
+    isolated_bus: f64,
+    overlap_bus: f64,
+) -> HostObservations {
+    let mut obs = HostObservations::default();
+    for (gpu, gflops) in baselines {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    for (gpu, gflops) in overlapped {
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapGemm,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "isolated_bus_gib_per_sec",
+        isolated_bus,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "overlap_bus_gib_per_sec",
+        overlap_bus,
+        Unit::GibPerSec,
+    ));
+    obs
+}
+
+#[test]
+fn overlap_retention_is_derived_per_gpu_and_per_node() {
+    let config = config_for(&["a"]);
+    let obs = overlap_host(
+        &[(0, 1000.0), (1, 800.0)],
+        &[(0, 900.0), (1, 400.0)],
+        100.0,
+        75.0,
+    );
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+
+    let derived: Vec<&MetricRecord> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .collect();
+    let ratio_of = |name: &str, scope: &Scope| -> f64 {
+        derived
+            .iter()
+            .find(|record| record.name == name && record.scope == *scope)
+            .unwrap_or_else(|| panic!("missing retention {name} for {scope:?}"))
+            .value
+    };
+    assert!((ratio_of("gemm_bf16", &Scope::Gpu { index: 0 }) - 0.9).abs() < 1e-12);
+    assert!((ratio_of("gemm_bf16", &Scope::Gpu { index: 1 }) - 0.5).abs() < 1e-12);
+    assert!((ratio_of("all_reduce", &Scope::Node) - 0.75).abs() < 1e-12);
+    for record in &derived {
+        assert_eq!(record.unit, Unit::Ratio);
+    }
+
+    // Retention feeds the aggregate machinery like any measured metric.
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.gemm_bf16")
+    );
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.all_reduce")
+    );
+}
+
+#[test]
+fn overlap_retention_feeds_mad_outliers() {
+    let names = ["n1", "n2", "n3", "n4", "n5"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        // Healthy nodes retain ~95% under combined load; n5 collapses to 50%.
+        let overlapped = if *name == "n5" {
+            500.0
+        } else {
+            940.0 + 10.0 * i as f64
+        };
+        observations.insert(
+            (*name).to_string(),
+            overlap_host(&[(0, 1000.0)], &[(0, overlapped)], 100.0, 95.0),
+        );
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let flagged = results
+        .fleet
+        .outliers
+        .get("overlap_retention.gemm_bf16")
+        .expect("retention outlier group");
+    assert_eq!(flagged.len(), 1, "{flagged:?}");
+    assert!(flagged[0].key.contains("n5"), "{flagged:?}");
+    assert!(flagged[0].deviation_mads < 0.0);
+    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+}
+
+#[test]
+fn overlap_retention_skips_missing_or_degenerate_baselines() {
+    let config = config_for(&["a"]);
+    let mut obs = HostObservations::default();
+    // Overlap GEMM without a phase-2 baseline: no ratio can be formed.
+    obs.metrics
+        .push(gpu_metric(TestId::OverlapGemm, 0, "gflops_bf16", 900.0, 0));
+    // Zero isolated bus bandwidth: division would be non-finite.
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "isolated_bus_gib_per_sec",
+        0.0,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "overlap_bus_gib_per_sec",
+        75.0,
+        Unit::GibPerSec,
+    ));
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    assert!(
+        !results.hosts["a"]
+            .metrics
+            .iter()
+            .any(|record| record.test == TestId::OverlapRetention),
+        "no retention record may be derived without a positive finite baseline"
+    );
+}
+
+#[test]
+fn overlap_retention_joins_baselines_within_each_repeat() {
+    let config = config_for(&["a"]);
+    let mut obs = HostObservations::default();
+    for (repeat, baseline, overlapped) in [(0u32, 1000.0, 900.0), (1, 2000.0, 1000.0)] {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            0,
+            "gflops_bf16",
+            baseline,
+            repeat,
+        ));
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapGemm,
+            0,
+            "gflops_bf16",
+            overlapped,
+            repeat,
+        ));
+    }
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let mut ratios: Vec<(u32, f64)> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .map(|record| (record.repeat, record.value))
+        .collect();
+    ratios.sort_by_key(|(repeat, _)| *repeat);
+    assert_eq!(ratios.len(), 2, "{ratios:?}");
+    assert!((ratios[0].1 - 0.9).abs() < 1e-12, "{ratios:?}");
+    assert!((ratios[1].1 - 0.5).abs() < 1e-12, "{ratios:?}");
+    // The per-subject aggregate summarizes both repeats.
+    let aggregate = &results.aggregates["overlap_retention.gemm_bf16"]["a:gpu0"];
+    assert_eq!(aggregate.moments.n, 2);
+}
+
+#[test]
+fn overlap_retention_appears_in_the_rendered_table() {
+    let config = config_for(&["a"]);
+    let obs = overlap_host(&[(0, 1000.0)], &[(0, 870.0)], 100.0, 75.0);
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(text.contains("overlap ret"), "column present: {text}");
+    // The min across subjects: all-reduce retention 0.75 undercuts the
+    // GEMM's 0.87.
+    assert!(text.contains("0.75"), "worst retention rendered: {text}");
+}
+
 #[test]
 fn rooflines_reduce_over_per_subject_medians() {
     let mut obs = HostObservations::default();

@@ -19,11 +19,13 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig};
 use crate::orchestrator::collect::HostObservations;
-use crate::proto::{Scope, TestId, TestOutcome, Unit, consistency_fields};
+use crate::proto::{MetricRecord, Scope, TestId, TestOutcome, Unit, consistency_fields};
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
-pub const SCHEMA_VERSION: u32 = 2;
+// v3: overlap phase — `overlap_gemm` / `overlap_all_reduce` metrics and
+// derived `overlap_retention` records appended to host metric lists.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Bytes per GiB, for turning a GiB/s reading into microseconds per byte.
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
@@ -150,6 +152,9 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NetBandwidth => "net_bandwidth",
         TestId::NcclAllReduce => "nccl_all_reduce",
         TestId::NcclAllGather => "nccl_all_gather",
+        TestId::OverlapGemm => "overlap_gemm",
+        TestId::OverlapAllReduce => "overlap_all_reduce",
+        TestId::OverlapRetention => "overlap_retention",
     }
 }
 
@@ -192,10 +197,16 @@ pub fn sample_key(host: &str, scope: &Scope) -> String {
 /// rooflines, and link fits.
 pub fn build(
     config: &FleetConfig,
-    observations: BTreeMap<String, HostObservations>,
+    mut observations: BTreeMap<String, HostObservations>,
     started_epoch_secs: u64,
     finished_epoch_secs: u64,
 ) -> RunResults {
+    // Overlap retention ratios are derived here, before grouping, so they
+    // ride the aggregate/outlier/threshold machinery like measured metrics.
+    for obs in observations.values_mut() {
+        let derived = derive_overlap_retention(obs);
+        obs.metrics.extend(derived);
+    }
     let aggregates = aggregate_metrics(&observations);
     let raw_groups = group_samples(&observations);
 
@@ -342,6 +353,98 @@ pub fn aggregate_metrics(observations: &BTreeMap<String, HostObservations>) -> A
         }
     }
     aggregates
+}
+
+/// Derive the overlap phase's primary straggler metrics for one host:
+/// retention = overlapped / isolated, as `overlap_retention.*` records.
+///
+/// - `gemm_<dtype>` per GPU: `overlap_gemm.gflops_<dtype>` divided by the
+///   phase-2 `gpu_gemm_perf.gflops_<dtype>` baseline of the same GPU and
+///   repeat iteration.
+/// - `all_reduce` per node: `overlap_all_reduce.overlap_bus_gib_per_sec`
+///   divided by its `isolated_bus_gib_per_sec` companion of the same
+///   repeat (same communicator, measured seconds apart — the phase-3 NCCL
+///   sweep is a different topology and only exists on rank 0, so it cannot
+///   serve as the denominator).
+///
+/// A ratio is only formed from finite numbers over a positive baseline; a
+/// missing or degenerate baseline yields no record rather than a lie.
+/// Idempotent: a host that already carries retention records (a rebuilt
+/// document) derives nothing new.
+pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
+    if obs
+        .metrics
+        .iter()
+        .any(|record| record.test == TestId::OverlapRetention)
+    {
+        return Vec::new();
+    }
+
+    // Baselines keyed by (repeat, scope label, metric name).
+    let mut gemm_baselines: BTreeMap<(u32, String, &str), f64> = BTreeMap::new();
+    let mut bus_baselines: BTreeMap<u32, f64> = BTreeMap::new();
+    for record in &obs.metrics {
+        if !(record.value.is_finite() && record.value > 0.0) {
+            continue;
+        }
+        match record.test {
+            TestId::GpuGemmPerf if record.name.starts_with("gflops_") => {
+                gemm_baselines.insert(
+                    (
+                        record.repeat,
+                        scope_label(&record.scope).unwrap_or_default(),
+                        record.name.as_str(),
+                    ),
+                    record.value,
+                );
+            }
+            TestId::OverlapAllReduce if record.name == "isolated_bus_gib_per_sec" => {
+                bus_baselines.insert(record.repeat, record.value);
+            }
+            _ => {}
+        }
+    }
+
+    let mut derived = Vec::new();
+    for record in &obs.metrics {
+        if !record.value.is_finite() {
+            continue;
+        }
+        match record.test {
+            TestId::OverlapGemm if record.name.starts_with("gflops_") => {
+                let key = (
+                    record.repeat,
+                    scope_label(&record.scope).unwrap_or_default(),
+                    record.name.as_str(),
+                );
+                if let Some(baseline) = gemm_baselines.get(&key) {
+                    let dtype = record.name.trim_start_matches("gflops_");
+                    derived.push(MetricRecord {
+                        test: TestId::OverlapRetention,
+                        scope: record.scope.clone(),
+                        name: format!("gemm_{dtype}"),
+                        value: record.value / baseline,
+                        unit: Unit::Ratio,
+                        repeat: record.repeat,
+                    });
+                }
+            }
+            TestId::OverlapAllReduce if record.name == "overlap_bus_gib_per_sec" => {
+                if let Some(baseline) = bus_baselines.get(&record.repeat) {
+                    derived.push(MetricRecord {
+                        test: TestId::OverlapRetention,
+                        scope: record.scope.clone(),
+                        name: "all_reduce".to_string(),
+                        value: record.value / baseline,
+                        unit: Unit::Ratio,
+                        repeat: record.repeat,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    derived
 }
 
 pub fn verdict(results: &RunResults) -> Verdict {
@@ -706,6 +809,7 @@ fn render_hosts(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "dram gib/s",
         "gpu hbm gib/s",
         "gpu gflops (min)",
+        "overlap ret (min)",
     ]);
     for (host, obs) in &results.hosts {
         let (passed, failed, skipped) = outcome_counts(obs);
@@ -728,9 +832,32 @@ fn render_hosts(results: &RunResults, out: &mut dyn Write) -> Result<()> {
                 })
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "-".into()),
+            min_overlap_retention(obs)
+                .map_or_else(|| "-".into(), |retention| format!("{retention:.2}")),
         ]);
     }
     section(out, "hosts", &table)
+}
+
+/// The host's worst overlap retention ratio: min across every derived
+/// `overlap_retention` subject of the per-subject median across repeats.
+fn min_overlap_retention(obs: &HostObservations) -> Option<f64> {
+    let mut per_subject: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    for record in &obs.metrics {
+        if record.test == TestId::OverlapRetention && record.value.is_finite() {
+            per_subject
+                .entry((
+                    record.name.clone(),
+                    scope_label(&record.scope).unwrap_or_default(),
+                ))
+                .or_default()
+                .push(record.value);
+        }
+    }
+    per_subject
+        .into_values()
+        .filter_map(|values| stats::median(&values))
+        .reduce(f64::min)
 }
 
 fn outcome_counts(obs: &HostObservations) -> (usize, usize, usize) {
