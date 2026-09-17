@@ -176,3 +176,18 @@ Downstream effects: fleet outliers are flagged on per-subject *medians*
 outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
+
+## Overlap retention (schema v3)
+
+`build` starts by appending derived `overlap_retention` records to each
+host's metric list (`derive_overlap_retention`): `gemm_<dtype>` per GPU
+(overlapped `overlap_gemm.gflops_<dtype>` over the phase-2
+`gpu_gemm_perf.gflops_<dtype>` of the same GPU and repeat) and
+`all_reduce` per node (overlapped over isolated
+`overlap_all_reduce.*_bus_gib_per_sec` of the same repeat). Ratios form
+only over finite, positive baselines; derivation is idempotent (skipped if
+retention records already exist, e.g. a rebuilt document). Because the
+records land before grouping, they flow through aggregates, MAD outliers,
+jitter, and absolute thresholds like measured metrics. The hosts table
+adds an `overlap ret (min)` column: the worst per-subject median retention
+on that host. See docs/features/overlap_phase.md.
