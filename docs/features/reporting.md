@@ -158,7 +158,7 @@ tail progress:
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
-## Error-counter findings (schema v3)
+## Error-counter findings (schema v4)
 
 `hosts.*.counter_deltas` carries the full per-node error-counter delta
 list across the load phases (zeros and resets included);
@@ -188,7 +188,20 @@ outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
 
-## Overlap retention (schema v3)
+## Barrier stragglers (schema v6)
+
+The barrier-skew microbenchmark (docs/features/barrier_skew.md) emits
+per-host `nccl_barrier.*` / `tcp_barrier.*` metrics that flow through the
+ordinary MAD machinery, plus a dedicated rule:
+`report::barrier_straggler_flags` populates `fleet.barrier_stragglers`
+(group -> flagged hosts) when a host's median `slowest_frac` exceeds
+`thresholds.barrier_slowest_frac` and its median `slowest_considered` is
+at least `analysis::skew::MIN_TALLY_ITERS`. Barrier straggler flags count
+toward the `Stragglers` verdict and render as the "barrier stragglers"
+table section. The field is serde-defaulted, so pre-v6 documents load
+with it empty.
+
+## Overlap retention (schema v5)
 
 `build` starts by appending derived `overlap_retention` records to each
 host's metric list (`derive_overlap_retention`): `gemm_<dtype>` per GPU

@@ -4,6 +4,7 @@
 //! nothing in agent mode may print to stdout except through `EventSink`.
 //! Logs go to stderr via `tracing`.
 
+pub mod barrier;
 pub mod counters;
 pub mod cpu;
 pub mod disk;

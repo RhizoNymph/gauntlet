@@ -17,6 +17,9 @@ fn main() -> Result<()> {
             AgentCommand::Probe => gauntlet::agent::probe(),
             AgentCommand::Peer(peer) => runtime.block_on(gauntlet::agent::net::peer(peer)),
             AgentCommand::Nccl => gauntlet::agent::nccl::run_from_stdin(),
+            AgentCommand::Barrier(barrier) => {
+                runtime.block_on(gauntlet::agent::barrier::barrier(barrier))
+            }
         },
     }
 }

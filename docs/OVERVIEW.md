@@ -113,6 +113,20 @@ Features Index:
     entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
+  barrier_skew:
+    description: >
+      Straggler microbenchmark: ~2000 iterations of a tiny collective with
+      per-rank timing. NCCL path (tiny all-reduce on the sweep's fleet
+      communicator; straggler = min local elapsed, the wait-time inversion)
+      plus a pure-TCP star-barrier fallback for CPU-only fleets (straggler
+      = max release-to-response on the coordinator's clock). Per-rank
+      p50/p90/p99/max feed MAD analysis; a slowest-rank tally with a noise
+      margin gets its own flagging rule (fleet.barrier_stragglers, part of
+      the verdict). Fleet-level per-iteration barrier-span distribution is
+      recorded against the lead host.
+    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs]
+    depends_on: [phase3_network]
+    doc: docs/features/barrier_skew.md
   overlap_phase:
     description: >
       Sustained GEMM concurrent with an intra-node NCCL all-reduce on the
@@ -149,7 +163,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew]
     doc: docs/features/reporting.md
   viewer:
     description: >

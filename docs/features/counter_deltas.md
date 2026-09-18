@@ -75,7 +75,7 @@ A counter is `(domain, device, counter)`:
 - `src/proto.rs` — `CounterDomain`, `CounterReading`, `CounterSnapshot`,
   `CounterDelta` (+`increment()`), `CounterDeltas`, `CounterRequest`,
   events `CounterBaseline`/`CounterDeltas`, `AgentTaskSpec.counters`.
-  PROTO_VERSION 2.
+  PROTO_VERSION 3.
 - `src/agent/mod.rs` — runs the counter pass after the listed phases when
   `spec.counters` is set.
 - `src/orchestrator/mod.rs` — `counter_baseline_pass`,
@@ -84,7 +84,7 @@ A counter is `(domain, device, counter)`:
 - `src/orchestrator/collect.rs` — `HostObservations.counter_deltas`.
 - `src/report/mod.rs` — `CounterFinding`,
   `FleetAnalysis.counter_findings`, verdict inclusion,
-  `render_counter_findings`. SCHEMA_VERSION 3.
+  `render_counter_findings`. SCHEMA_VERSION 4.
 - `tests/counter_tests.rs` — fixture sysfs trees + tool-output parsing,
   delta logic, event round-trips, collector/report/render integration.
 

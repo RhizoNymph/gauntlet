@@ -20,7 +20,9 @@ use thiserror::Error;
 // `counter_deltas`) and the `counters` request on `AgentTaskSpec`.
 // v4: overlap phase (`Phase::Overlap`, `AgentTaskSpec.overlap`, overlap test
 // ids).
-pub const PROTO_VERSION: u32 = 4;
+// v5: barrier-skew microbenchmark — `NcclDirective` variants carry an
+// optional `barrier` spec and every rank reports `NcclBarrierTimings`.
+pub const PROTO_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -78,6 +80,16 @@ pub enum AgentEvent {
     /// dead port.
     NcclId {
         unique_id_b64: String,
+    },
+    /// Barrier-skew microbenchmark: one event per NCCL rank carrying that
+    /// rank's local per-iteration completion times (microseconds) of the
+    /// tiny all-reduce. Emitted by *every* rank (this is the one place
+    /// participants speak); the phase-3 driver intercepts and merges them
+    /// before running `analysis::skew`, so one reaching the collector is a
+    /// stray.
+    NcclBarrierTimings {
+        rank: u32,
+        elapsed_us: Vec<f64>,
     },
     /// Error-counter snapshot taken before the load phases. Boxed for the
     /// same reason as `Inventory`. The orchestrator intercepts and holds it;
@@ -161,6 +173,10 @@ pub enum TestId {
     NetBandwidth,
     NcclAllReduce,
     NcclAllGather,
+    /// Barrier-skew microbenchmark over the NCCL group (tiny all-reduce).
+    NcclBarrier,
+    /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
+    TcpBarrier,
     /// GEMM throughput measured while the intra-node all-reduce runs.
     OverlapGemm,
     /// Intra-node all-reduce bandwidth: isolated baseline and under GEMM load.
@@ -493,6 +509,17 @@ pub enum GemmDtype {
     F16,
 }
 
+/// Barrier-skew microbenchmark parameters, appended to the NCCL sweep when
+/// present: many iterations of a tiny all-reduce with per-iteration local
+/// timing on every rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BarrierSpec {
+    pub iters: u32,
+    /// Payload in bytes; rounded up to one f32 element by the agent.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "directive", rename_all = "snake_case")]
 pub enum NcclDirective {
@@ -506,8 +533,12 @@ pub enum NcclDirective {
         iters_per_size: u32,
         /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
         socket_ifname: Option<String>,
+        /// Run the barrier-skew microbenchmark after the sweep.
+        #[serde(default)]
+        barrier: Option<BarrierSpec>,
     },
-    /// Ranks 1..n: join the lead's communicator and run the sweep silently.
+    /// Ranks 1..n: join the lead's communicator and run the sweep silently
+    /// (barrier timings are the one thing participants report).
     Participate {
         unique_id_b64: String,
         rank: u32,
@@ -515,6 +546,8 @@ pub enum NcclDirective {
         sizes: Vec<u64>,
         iters_per_size: u32,
         socket_ifname: Option<String>,
+        #[serde(default)]
+        barrier: Option<BarrierSpec>,
     },
 }
 
@@ -592,4 +625,50 @@ pub fn consistency_fields(inv: &InventorySnapshot) -> BTreeMap<String, String> {
         fields.insert(format!("mtu:{}", nic.name), nic.mtu.to_string());
     }
     fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn barrier_timings_events_round_trip() {
+        let event = AgentEvent::NcclBarrierTimings {
+            rank: 3,
+            elapsed_us: vec![12.5, 240.0, 11.75],
+        };
+        let line = encode_event(&event);
+        assert!(line.contains("nccl_barrier_timings"), "{line}");
+        assert_eq!(decode_event(&line).expect("decode"), event);
+    }
+
+    #[test]
+    fn directives_without_a_barrier_field_still_decode() {
+        // Wire output from a pre-v2 orchestrator build.
+        let old = r#"{"directive":"lead","world_size":4,"sizes":[1024],"iters_per_size":20,"socket_ifname":null}"#;
+        let directive: NcclDirective = serde_json::from_str(old).expect("decode old lead");
+        let NcclDirective::Lead { barrier, .. } = directive else {
+            panic!("expected a Lead directive");
+        };
+        assert_eq!(barrier, None);
+    }
+
+    #[test]
+    fn barrier_specs_ride_the_directive() {
+        let directive = NcclDirective::Participate {
+            unique_id_b64: "abc".into(),
+            rank: 2,
+            world_size: 4,
+            sizes: vec![1024],
+            iters_per_size: 20,
+            socket_ifname: Some("bond0".into()),
+            barrier: Some(BarrierSpec {
+                iters: 2000,
+                bytes: 8,
+            }),
+        };
+        let json = serde_json::to_string(&directive).expect("serialize");
+        let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, directive);
+    }
 }

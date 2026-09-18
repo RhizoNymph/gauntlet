@@ -175,6 +175,7 @@ pub mod imp {
             sizes,
             iters_per_size,
             socket_ifname,
+            barrier,
         } = directive
         else {
             bail!("lead requires a Lead directive");
@@ -190,10 +191,20 @@ pub mod imp {
         sink.emit(&AgentEvent::NcclId {
             unique_id_b64: encode_id(&id),
         });
-        run_rank(Some(&sink), id, 0, *world_size, sizes, *iters_per_size)
+        run_rank(
+            &sink,
+            true,
+            id,
+            0,
+            *world_size,
+            sizes,
+            *iters_per_size,
+            *barrier,
+        )
     }
 
-    /// Ranks 1..n: silent participants; failures ride the exit status.
+    /// Ranks 1..n: sweep silently, but report their own barrier timings —
+    /// per-rank local timing is the whole point of that benchmark.
     pub fn participate(directive: &NcclDirective) -> Result<()> {
         let NcclDirective::Participate {
             unique_id_b64,
@@ -202,6 +213,7 @@ pub mod imp {
             sizes,
             iters_per_size,
             socket_ifname,
+            barrier,
         } = directive
         else {
             bail!("participate requires a Participate directive");
@@ -211,7 +223,21 @@ pub mod imp {
         }
         set_socket_ifname(socket_ifname);
         let id = decode_id(unique_id_b64)?;
-        run_rank(None, id, *rank, *world_size, sizes, *iters_per_size)
+        let sink = EventSink::stdout();
+        sink.emit(&AgentEvent::Hello {
+            proto_version: PROTO_VERSION,
+            hostname: crate::agent::hostname()?,
+        });
+        run_rank(
+            &sink,
+            false,
+            id,
+            *rank,
+            *world_size,
+            sizes,
+            *iters_per_size,
+            *barrier,
+        )
     }
 
     fn set_socket_ifname(socket_ifname: &Option<String>) {
@@ -225,13 +251,16 @@ pub mod imp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_rank(
-        sink: Option<&EventSink>,
+        sink: &EventSink,
+        emit_sweep: bool,
         id: Id,
         rank: u32,
         world_size: u32,
         sizes: &[u64],
         iters_per_size: u32,
+        barrier: Option<crate::proto::BarrierSpec>,
     ) -> Result<()> {
         if world_size == 0 {
             bail!("world_size must be at least 1");
@@ -278,7 +307,7 @@ pub mod imp {
                 .map_err(|error| nccl_error("all_reduce", error))?;
                 Ok(())
             })?;
-            if let Some(sink) = sink {
+            if emit_sweep {
                 emit_collective(
                     sink,
                     TestId::NcclAllReduce,
@@ -302,7 +331,7 @@ pub mod imp {
                     .map_err(|error| nccl_error("all_gather", error))?;
                 Ok(())
             })?;
-            if let Some(sink) = sink {
+            if emit_sweep {
                 emit_collective(
                     sink,
                     TestId::NcclAllGather,
@@ -311,6 +340,44 @@ pub mod imp {
                     world_size,
                 );
             }
+        }
+
+        // Barrier-skew microbenchmark: many iterations of a tiny
+        // all-reduce, each timed locally with the stream synchronized on
+        // both sides. The per-iteration sync aligns iteration boundaries
+        // across ranks (the collective completes everywhere at once), so a
+        // rank that is slow to *launch* the next iteration arrives late,
+        // waits least, and records the shortest local elapsed — the
+        // inversion `analysis::skew::SkewPolarity::LateIsMin` decodes.
+        if let Some(spec) = barrier {
+            let elements = (spec.bytes as usize)
+                .div_ceil(F32_BYTES)
+                .clamp(1, max_elements);
+            // Algorithm/channel selection is per message size; keep setup
+            // for the barrier size out of the first measured iterations.
+            for _ in 0..WARMUP_ITERS {
+                comm.all_reduce(
+                    &send.slice(0..elements),
+                    &mut recv.slice_mut(0..elements),
+                    &ReduceOp::Sum,
+                )
+                .map_err(|error| nccl_error("barrier warmup all_reduce", error))?;
+            }
+            stream.synchronize()?;
+
+            let mut elapsed_us = Vec::with_capacity(spec.iters as usize);
+            for _ in 0..spec.iters {
+                let start = Instant::now();
+                comm.all_reduce(
+                    &send.slice(0..elements),
+                    &mut recv.slice_mut(0..elements),
+                    &ReduceOp::Sum,
+                )
+                .map_err(|error| nccl_error("barrier all_reduce", error))?;
+                stream.synchronize()?;
+                elapsed_us.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            sink.emit(&AgentEvent::NcclBarrierTimings { rank, elapsed_us });
         }
 
         Ok(())

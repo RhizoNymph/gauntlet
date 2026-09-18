@@ -29,6 +29,8 @@ pub enum ConfigError {
     DuplicateHost { addr: String },
     #[error("thresholds.mad_k must be positive, got {got}")]
     BadMadK { got: f64 },
+    #[error("thresholds.barrier_slowest_frac must be in (0, 1], got {got}")]
+    BadBarrierFrac { got: f64 },
     #[error("unknown phase name: {name}")]
     UnknownPhase { name: String },
 }
@@ -125,6 +127,10 @@ pub struct TestConfig {
     /// NCCL sweep message sizes in bytes.
     pub nccl_sizes: Vec<u64>,
     pub nccl_iters_per_size: u32,
+    /// Barrier-skew microbenchmark iterations (0 disables it).
+    pub barrier_iters: u32,
+    /// Payload of the tiny barrier all-reduce, in bytes.
+    pub barrier_bytes: u64,
     /// Overlap phase: wall seconds of GEMM + all-reduce combined load.
     pub overlap_secs: u64,
     /// Overlap phase: isolated intra-node all-reduce baseline window.
@@ -156,6 +162,8 @@ impl Default for TestConfig {
             // 1 KiB .. 1 GiB, powers of 4.
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
+            barrier_iters: 2000,
+            barrier_bytes: 8,
             overlap_secs: 30,
             overlap_baseline_secs: 5,
             overlap_msg_mib: 64,
@@ -172,6 +180,10 @@ pub struct Thresholds {
     /// Optional absolute bounds keyed by "<test>.<metric>", e.g.
     /// "gpu_gemm_perf.gflops" -> { min = 100000 }.
     pub absolute: BTreeMap<String, Bound>,
+    /// Barrier-skew flag: a host is a straggler when it was the (unique,
+    /// beyond-margin) late arriver in more than this fraction of the
+    /// considered barrier iterations.
+    pub barrier_slowest_frac: f64,
 }
 
 impl Default for Thresholds {
@@ -179,6 +191,7 @@ impl Default for Thresholds {
         Self {
             mad_k: 4.0,
             absolute: BTreeMap::new(),
+            barrier_slowest_frac: 0.5,
         }
     }
 }
@@ -225,6 +238,10 @@ impl FleetConfig {
             return Err(ConfigError::BadMadK {
                 got: self.thresholds.mad_k,
             });
+        }
+        let frac = self.thresholds.barrier_slowest_frac;
+        if !(frac > 0.0 && frac <= 1.0) {
+            return Err(ConfigError::BadBarrierFrac { got: frac });
         }
         Ok(())
     }

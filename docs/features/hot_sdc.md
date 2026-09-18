@@ -70,7 +70,7 @@ all-core throughput run so the package is already at thermal steady state.
 
 SDC hits are hard failures, never MAD outliers: Failed outcomes already
 drive `Verdict::Stragglers` (exit code 1). Additionally
-`fleet.sdc_failures` (schema v3) groups Failed outcomes of the four
+`fleet.sdc_failures` (schema v4) groups Failed outcomes of the four
 correctness screens (`cpu_correctness`, `cpu_sdc_hot`,
 `gpu_gemm_correctness`, `gpu_gemm_sdc`) as
 `"host[:scope]: reason"`, and the terminal table renders them in a
@@ -88,11 +88,11 @@ machinery; all-zero mismatch groups have zero MAD and are never flagged.
   `HotCoreReport`.
 - `src/proto.rs` — `TestId::{CpuSdcHot,GpuGemmSdc}`,
   `CpuTaskSpec::sdc_hot_secs`, `GpuTaskSpec::sdc_check_secs`
-  (PROTO_VERSION 2).
+  (PROTO_VERSION 3).
 - `src/config.rs` — `cpu_sdc_hot_secs` (default 10),
   `gemm_sdc_check_secs` (default 5).
 - `src/report/mod.rs` — `FleetAnalysis::sdc_failures`, `render_sdc`,
-  display names (SCHEMA_VERSION 3).
+  display names (SCHEMA_VERSION 4).
 - Tests: `tests/gpu_tests.rs` (`mod sdc`), `tests/host_agent_tests.rs`,
   `tests/proto_tests.rs`, `tests/report_tests.rs`, unit tests in
   `src/agent/gpu/sdc.rs`.

@@ -15,9 +15,10 @@ use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::fit::{AlphaBetaFit, fit_alpha_beta};
+use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
-use crate::config::{Bound, FleetConfig};
+use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
@@ -32,7 +33,14 @@ use crate::proto::{
 // `fleet.counter_findings`.
 // v5: overlap phase — `overlap_gemm` / `overlap_all_reduce` metrics and
 // derived `overlap_retention` records appended to host metric lists.
-pub const SCHEMA_VERSION: u32 = 5;
+// v6: `fleet.barrier_stragglers` (slowest-rank tally flags from the
+// barrier-skew microbenchmark) and the nccl_barrier / tcp_barrier metric
+// groups.
+pub const SCHEMA_VERSION: u32 = 6;
+
+/// Metric groups produced by the barrier-skew microbenchmarks; the
+/// slowest-rank flagging rule scans exactly these.
+const BARRIER_GROUPS: [&str; 2] = ["nccl_barrier", "tcp_barrier"];
 
 /// Bytes per GiB, for turning a GiB/s reading into microseconds per byte.
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
@@ -100,6 +108,22 @@ pub struct FleetAnalysis {
     /// `hosts.*.counter_deltas` only.
     #[serde(default)]
     pub counter_findings: BTreeMap<String, Vec<CounterFinding>>,
+    /// Hosts flagged by the barrier-skew slowest-rank tally, grouped by
+    /// benchmark ("nccl_barrier" / "tcp_barrier"): the host was the late
+    /// arriver in more than `thresholds.barrier_slowest_frac` of the
+    /// margin-passing iterations. Part of the verdict.
+    #[serde(default)]
+    pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
+}
+
+/// One flagged host from the barrier-skew slowest-rank tally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BarrierStraggler {
+    pub key: String,
+    /// Fraction of considered iterations in which this host arrived last.
+    pub slowest_frac: f64,
+    /// Iterations that cleared the noise margin (the tally denominator).
+    pub considered_iters: f64,
 }
 
 /// One error counter that went up between the pre-load and post-load
@@ -186,6 +210,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NetBandwidth => "net_bandwidth",
         TestId::NcclAllReduce => "nccl_all_reduce",
         TestId::NcclAllGather => "nccl_all_gather",
+        TestId::NcclBarrier => "nccl_barrier",
+        TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
         TestId::OverlapAllReduce => "overlap_all_reduce",
         TestId::OverlapRetention => "overlap_retention",
@@ -320,6 +346,7 @@ pub fn build(
         jitter_outliers,
         sdc_failures: sdc_failures(&observations),
         counter_findings: counter_findings(&observations),
+        barrier_stragglers: barrier_straggler_flags(&aggregates, &config.thresholds),
     };
     let calibration = Calibration {
         rooflines: rooflines(&observations),
@@ -389,6 +416,44 @@ pub fn aggregate_metrics(observations: &BTreeMap<String, HostObservations>) -> A
         }
     }
     aggregates
+}
+
+/// Apply the slowest-rank flagging rule to the barrier-skew metric groups:
+/// a host is a straggler when its (median across repeats) `slowest_frac`
+/// exceeds the configured threshold and enough iterations cleared the
+/// noise margin for the tally to mean anything.
+fn barrier_straggler_flags(
+    aggregates: &Aggregates,
+    thresholds: &Thresholds,
+) -> BTreeMap<String, Vec<BarrierStraggler>> {
+    let mut flags = BTreeMap::new();
+    for group in BARRIER_GROUPS {
+        let Some(fracs) = aggregates.get(&format!("{group}.slowest_frac")) else {
+            continue;
+        };
+        let considered = aggregates.get(&format!("{group}.slowest_considered"));
+        let flagged: Vec<BarrierStraggler> = fracs
+            .iter()
+            .filter_map(|(key, aggregate)| {
+                let slowest_frac = aggregate.moments.median;
+                let considered_iters = considered
+                    .and_then(|subjects| subjects.get(key))
+                    .map(|aggregate| aggregate.moments.median)
+                    .unwrap_or(0.0);
+                (considered_iters >= skew::MIN_TALLY_ITERS as f64
+                    && slowest_frac > thresholds.barrier_slowest_frac)
+                    .then(|| BarrierStraggler {
+                        key: key.clone(),
+                        slowest_frac,
+                        considered_iters,
+                    })
+            })
+            .collect();
+        if !flagged.is_empty() {
+            flags.insert(group.to_string(), flagged);
+        }
+    }
+    flags
 }
 
 /// Derive the overlap phase's primary straggler metrics for one host:
@@ -502,12 +567,22 @@ pub fn verdict(results: &RunResults) -> Verdict {
         .threshold_violations
         .values()
         .any(|violators| !violators.is_empty());
+    let has_barrier_stragglers = results
+        .fleet
+        .barrier_stragglers
+        .values()
+        .any(|flagged| !flagged.is_empty());
     let has_counter_findings = results
         .fleet
         .counter_findings
         .values()
         .any(|findings| !findings.is_empty());
-    if has_failed_tests || has_outliers || has_violations || has_counter_findings {
+    if has_failed_tests
+        || has_outliers
+        || has_violations
+        || has_barrier_stragglers
+        || has_counter_findings
+    {
         Verdict::Stragglers
     } else {
         Verdict::Clean
@@ -883,6 +958,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     render_sdc(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
+    render_barrier_stragglers(results, out)?;
     render_counter_findings(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
@@ -1037,6 +1113,24 @@ fn render_jitter(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "jitter outliers (fleet-relative run-to-run spread)",
         &table,
     )
+}
+
+fn render_barrier_stragglers(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.barrier_stragglers.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&["host", "benchmark", "slowest %", "iterations"]);
+    for (group, flagged) in &results.fleet.barrier_stragglers {
+        for straggler in flagged {
+            table.add_row(vec![
+                straggler.key.clone(),
+                group.clone(),
+                format!("{:.1}", straggler.slowest_frac * 100.0),
+                format!("{:.0}", straggler.considered_iters),
+            ]);
+        }
+    }
+    section(out, "barrier stragglers (slowest-rank tally)", &table)
 }
 
 /// Only counters that actually incremented appear; a run with no findings
@@ -1382,6 +1476,92 @@ mod tests {
                 .links
                 .contains_key("nccl_allreduce_fleet")
         );
+    }
+
+    /// Fleet where `straggler` was the late arriver in `frac` of
+    /// `considered` margin-passing barrier iterations.
+    fn barrier_observations(
+        straggler_frac: f64,
+        considered: f64,
+    ) -> BTreeMap<String, HostObservations> {
+        let mut observations = BTreeMap::new();
+        for host in ["n1", "n2", "n3", "n4"] {
+            let mut obs = HostObservations::default();
+            let frac = if host == "n2" { straggler_frac } else { 0.02 };
+            obs.metrics.push(metric(
+                TestId::TcpBarrier,
+                Scope::Node,
+                "slowest_frac",
+                frac,
+            ));
+            obs.metrics.push(metric(
+                TestId::TcpBarrier,
+                Scope::Node,
+                "slowest_considered",
+                considered,
+            ));
+            observations.insert(host.to_string(), obs);
+        }
+        observations
+    }
+
+    fn fleet_config() -> FleetConfig {
+        toml::from_str(r#"hosts = ["n1", "n2", "n3", "n4"]"#).expect("config")
+    }
+
+    #[test]
+    fn a_dominant_slowest_rank_tally_flags_the_host_and_the_verdict() {
+        let results = build(&fleet_config(), barrier_observations(0.92, 1800.0), 1, 2);
+        let flagged = results
+            .fleet
+            .barrier_stragglers
+            .get("tcp_barrier")
+            .expect("tcp_barrier flags");
+        assert_eq!(flagged.len(), 1);
+        assert_eq!(flagged[0].key, "n2");
+        assert!((flagged[0].slowest_frac - 0.92).abs() < 1e-12);
+        assert_eq!(flagged[0].considered_iters, 1800.0);
+        assert_eq!(verdict(&results), Verdict::Stragglers);
+    }
+
+    #[test]
+    fn a_tally_below_the_threshold_is_not_a_straggler() {
+        // 0.4 < the default 0.5 threshold: suspicious but unflagged.
+        let results = build(&fleet_config(), barrier_observations(0.4, 1800.0), 1, 2);
+        assert!(results.fleet.barrier_stragglers.is_empty());
+    }
+
+    #[test]
+    fn too_few_considered_iterations_never_flag() {
+        // Only 12 iterations cleared the noise margin: a 92% share of a
+        // dozen coin flips is not evidence.
+        let results = build(&fleet_config(), barrier_observations(0.92, 12.0), 1, 2);
+        assert!(results.fleet.barrier_stragglers.is_empty());
+    }
+
+    #[test]
+    fn barrier_flags_survive_a_json_round_trip() {
+        let results = build(&fleet_config(), barrier_observations(0.92, 1800.0), 1, 2);
+        let json = serde_json::to_string(&results).expect("serialize");
+        let back: RunResults = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.fleet.barrier_stragglers,
+            results.fleet.barrier_stragglers
+        );
+        assert_eq!(back.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pre_v3_documents_without_barrier_fields_still_load() {
+        let results = build(&fleet_config(), BTreeMap::new(), 1, 2);
+        let mut value = serde_json::to_value(&results).expect("to value");
+        let fleet = value
+            .get_mut("fleet")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("fleet object");
+        fleet.remove("barrier_stragglers");
+        let back: RunResults = serde_json::from_value(value).expect("deserialize v2 shape");
+        assert!(back.fleet.barrier_stragglers.is_empty());
     }
 
     #[test]

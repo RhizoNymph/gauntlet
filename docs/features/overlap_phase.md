@@ -87,13 +87,13 @@ same run for GEMM retention; the all-reduce ratio is self-contained).
 - `src/agent/nccl.rs` — `all_reduce_bus_gib_per_sec` (shared formula).
 - `src/proto.rs` — `Phase::Overlap`, `OverlapTaskSpec`,
   `TestId::{OverlapGemm, OverlapAllReduce, OverlapRetention}`;
-  PROTO_VERSION 2 (AgentTaskSpec is deny_unknown_fields, so old agents
+  PROTO_VERSION 4 (AgentTaskSpec is deny_unknown_fields, so old agents
   cannot decode the new spec; the bump triggers re-deploy).
 - `src/config.rs` — `overlap_*` keys, `task_spec` mapping.
 - `src/agent/mod.rs` — phase dispatch (`overlap_phase`, gpu/non-gpu).
 - `src/orchestrator/mod.rs` — Overlap in the node-local phase arm.
 - `src/report/mod.rs` — `derive_overlap_retention`, display names,
-  `min_overlap_retention` table column; SCHEMA_VERSION 3.
+  `min_overlap_retention` table column; SCHEMA_VERSION 5.
 
 ## Invariants
 - The overlap phase runs after gpu/network (`Phase::ALL` order; the

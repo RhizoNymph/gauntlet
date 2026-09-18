@@ -33,13 +33,15 @@ use tracing::{debug, info, warn};
 
 use self::collect::{Collector, HostObservations};
 use self::session::{HostSession, single_quote};
+use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
+use crate::analysis::skew::{self, BarrierSkew, Margin, RankSeries, SkewPolarity};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::proto::{
-    AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, NcclDirective,
-    Phase, Scope, TestId, Unit,
+    AgentEvent, BarrierSpec, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord,
+    NcclDirective, Phase, Scope, TestId, Unit,
 };
 use crate::report;
 
@@ -621,6 +623,7 @@ async fn network_phase(
 ) {
     pairwise_sweep(config, sessions, sample_pairs, sink).await;
     nccl_sweep(config, sessions, inventories, sink).await;
+    tcp_barrier_sweep(config, sessions, sink).await;
 }
 
 /// Tournament rounds of disjoint pairs: within a round every pair runs
@@ -927,6 +930,17 @@ async fn nccl_sweep(
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let mut tasks = JoinSet::new();
 
+    // Barrier-skew microbenchmark rides the same communicator; a world of
+    // one has no skew to measure.
+    let barrier_spec = (config.tests.barrier_iters > 0 && world_size >= 2).then_some(BarrierSpec {
+        iters: config.tests.barrier_iters,
+        bytes: config.tests.barrier_bytes,
+    });
+    // Every rank reports its per-iteration barrier timings; the callbacks
+    // intercept them here so the fleet-wide skew analysis can run once all
+    // ranks are in.
+    let barrier_timings: Arc<std::sync::Mutex<Vec<RankSeries>>> = Arc::default();
+
     // Rank 0 leads: it mints the rendezvous id in-process (the id's bootstrap
     // listen socket must live in the process that serves as rank 0) and
     // announces it as an NcclId event, which is intercepted here and relayed
@@ -936,6 +950,7 @@ async fn nccl_sweep(
         sizes: config.tests.nccl_sizes.clone(),
         iters_per_size: config.tests.nccl_iters_per_size,
         socket_ifname: config.nccl.socket_ifname.clone(),
+        barrier: barrier_spec,
     };
     let document = match serde_json::to_string(&lead) {
         Ok(document) => document,
@@ -950,18 +965,24 @@ async fn nccl_sweep(
         let session = Arc::clone(rank0);
         let sink = sink.clone();
         let id_slot = Arc::clone(&id_slot);
+        let barrier_timings = Arc::clone(&barrier_timings);
         tasks.spawn(async move {
             let addr = session.addr().to_string();
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["nccl"], Some(document), |event| {
-                    if let AgentEvent::NcclId { unique_id_b64 } = &event {
+                session.run_agent(&["nccl"], Some(document), |event| match event {
+                    AgentEvent::NcclId { unique_id_b64 } => {
                         if let Some(tx) = id_slot.lock().expect("id slot poisoned").take() {
-                            let _ = tx.send(unique_id_b64.clone());
+                            let _ = tx.send(unique_id_b64);
                         }
-                    } else {
-                        sink.event(&addr, event);
                     }
+                    AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
+                        barrier_timings
+                            .lock()
+                            .expect("barrier timings poisoned")
+                            .push(RankSeries { rank, elapsed_us });
+                    }
+                    event => sink.event(&addr, event),
                 }),
             )
             .await;
@@ -994,6 +1015,7 @@ async fn nccl_sweep(
             sizes: config.tests.nccl_sizes.clone(),
             iters_per_size: config.tests.nccl_iters_per_size,
             socket_ifname: config.nccl.socket_ifname.clone(),
+            barrier: barrier_spec,
         };
         let document = match serde_json::to_string(&directive) {
             Ok(document) => document,
@@ -1004,11 +1026,20 @@ async fn nccl_sweep(
         };
         let session = Arc::clone(session);
         let sink = sink.clone();
+        let barrier_timings = Arc::clone(&barrier_timings);
         tasks.spawn(async move {
             let addr = session.addr().to_string();
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["nccl"], Some(document), |event| sink.event(&addr, event)),
+                session.run_agent(&["nccl"], Some(document), |event| match event {
+                    AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
+                        barrier_timings
+                            .lock()
+                            .expect("barrier timings poisoned")
+                            .push(RankSeries { rank, elapsed_us });
+                    }
+                    event => sink.event(&addr, event),
+                }),
             )
             .await;
             report_rank_outcome(&sink, &addr, rank, timeout, outcome);
@@ -1019,12 +1050,242 @@ async fn nccl_sweep(
             warn!(%error, "nccl task did not complete");
         }
     }
+
+    if barrier_spec.is_some() {
+        let series =
+            std::mem::take(&mut *barrier_timings.lock().expect("barrier timings poisoned"));
+        let rank_hosts: Vec<String> = gpu_hosts
+            .iter()
+            .map(|session| session.addr().to_string())
+            .collect();
+        match skew::analyze(&series, SkewPolarity::LateIsMin, Margin::default()) {
+            Some(skew) => emit_barrier_metrics(sink, TestId::NcclBarrier, &rank_hosts, &skew),
+            None => warn!(
+                ranks_reporting = series.len(),
+                world_size, "NCCL barrier produced no analyzable timings"
+            ),
+        }
+    }
 }
 
-/// Hosts with at least one GPU, in fleet order. Inventories collected during
-/// phase 0 are reused; hosts without one (e.g. `--phases network`) are probed.
 /// How long the orchestrator waits for the lead rank's NcclId event.
 const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
+
+/// Turn a barrier-skew analysis into metric records: per-rank distribution
+/// and tally metrics against each rank's host, fleet-level barrier-time
+/// distribution against the coordinator/lead host (index 0), mirroring how
+/// the NCCL sweeps attribute fleet-wide numbers to rank 0.
+///
+/// Metric semantics differ by polarity — under `NcclBarrier` the per-rank
+/// values are local waits (a straggler is a *low* outlier), under
+/// `TcpBarrier` they are release-to-response times (a straggler is a *high*
+/// outlier) — but `slowest_frac` always means "fraction of considered
+/// iterations this host was the late arriver", which is what the report's
+/// flagging rule consumes.
+fn emit_barrier_metrics(
+    sink: &ObservationSink,
+    test: TestId,
+    rank_hosts: &[String],
+    skew: &BarrierSkew,
+) {
+    for rank in &skew.per_rank {
+        let Some(host) = rank_hosts.get(rank.rank as usize) else {
+            warn!(
+                rank = rank.rank,
+                hosts = rank_hosts.len(),
+                "barrier rank has no host"
+            );
+            continue;
+        };
+        for (name, value, unit) in [
+            ("p50_us", rank.p50_us, Unit::Micros),
+            ("p90_us", rank.p90_us, Unit::Micros),
+            ("p99_us", rank.p99_us, Unit::Micros),
+            ("max_us", rank.max_us, Unit::Micros),
+            ("slowest_frac", rank.slowest_frac, Unit::Ratio),
+            (
+                "slowest_considered",
+                skew.considered_iters as f64,
+                Unit::Count,
+            ),
+        ] {
+            sink.metric(
+                host,
+                MetricRecord {
+                    test,
+                    scope: Scope::Node,
+                    name: name.to_string(),
+                    value,
+                    unit,
+                    repeat: 0,
+                },
+            );
+        }
+    }
+    if let Some(host) = rank_hosts.first() {
+        for (name, value) in [
+            ("fleet_span_p50_us", skew.fleet.p50_us),
+            ("fleet_span_p90_us", skew.fleet.p90_us),
+            ("fleet_span_p99_us", skew.fleet.p99_us),
+            ("fleet_span_max_us", skew.fleet.max_us),
+        ] {
+            sink.metric(
+                host,
+                MetricRecord {
+                    test,
+                    scope: Scope::Node,
+                    name: name.to_string(),
+                    value,
+                    unit: Unit::Micros,
+                    repeat: 0,
+                },
+            );
+        }
+    }
+}
+
+/// TCP star-barrier sweep: the CPU-only barrier-skew probe, run across the
+/// whole fleet regardless of GPUs (on GPU fleets it complements the NCCL
+/// barrier with a fabric-independent view). Host 0 coordinates; every host
+/// — including host 0, as a separate process — joins with its fleet index
+/// as rank, so ranks map back to hosts stably.
+async fn tcp_barrier_sweep(
+    config: &FleetConfig,
+    sessions: &[Arc<HostSession>],
+    sink: &ObservationSink,
+) {
+    let iters = config.tests.barrier_iters;
+    if iters == 0 {
+        info!("barrier_iters is 0; skipping the TCP barrier");
+        return;
+    }
+    if sessions.len() < 2 {
+        info!("fewer than two hosts; skipping the TCP barrier");
+        return;
+    }
+    let world = sessions.len() as u32;
+    let server = Arc::clone(&sessions[0]);
+    let server_addr = server.addr().to_string();
+    // The pairwise sweep is over and its listeners are torn down, so the
+    // pairwise port base is free again.
+    let port = config.tests.net_port_base;
+    // Generous ceiling: connect window plus a worst-case per-iteration RTT
+    // allowance; a healthy fleet finishes orders of magnitude sooner.
+    let timeout =
+        Duration::from_secs(60) + Duration::from_millis(u64::from(iters).saturating_mul(50));
+
+    info!(world, coordinator = %server_addr, iters, "TCP barrier sweep");
+
+    let port_text = port.to_string();
+    let world_text = world.to_string();
+    let iters_text = iters.to_string();
+    let serve_task = tokio::spawn({
+        let server = Arc::clone(&server);
+        let args = [
+            "barrier",
+            "serve",
+            "--port",
+            &port_text,
+            "--world",
+            &world_text,
+            "--iters",
+            &iters_text,
+        ]
+        .map(String::from);
+        async move {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            server.run_agent_capture(&args, None).await
+        }
+    });
+    tokio::time::sleep(PEER_BIND_DELAY).await;
+
+    let endpoint = server
+        .host
+        .data_addr
+        .clone()
+        .unwrap_or_else(|| peer_endpoint(&server_addr).to_string());
+    let target = format!("{endpoint}:{port}");
+
+    let mut joins = JoinSet::new();
+    for (rank, session) in sessions.iter().enumerate() {
+        let session = Arc::clone(session);
+        let sink = sink.clone();
+        let target = target.clone();
+        let iters_text = iters_text.clone();
+        joins.spawn(async move {
+            let addr = session.addr().to_string();
+            let rank_text = rank.to_string();
+            let outcome = tokio::time::timeout(
+                timeout,
+                session.run_agent_capture(
+                    &[
+                        "barrier",
+                        "join",
+                        &target,
+                        "--rank",
+                        &rank_text,
+                        "--iters",
+                        &iters_text,
+                    ],
+                    None,
+                ),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(output)) if output.success() => {}
+                Ok(Ok(output)) => sink.error(
+                    &addr,
+                    format!("barrier join rank {rank} failed: {}", output.detail()),
+                ),
+                Ok(Err(error)) => {
+                    sink.error(&addr, format!("barrier join rank {rank} failed: {error:#}"))
+                }
+                Err(_) => sink.error(
+                    &addr,
+                    format!(
+                        "barrier join rank {rank} timed out after {}s",
+                        timeout.as_secs()
+                    ),
+                ),
+            }
+        });
+    }
+    while let Some(joined) = joins.join_next().await {
+        if let Err(error) = joined {
+            warn!(%error, "barrier join task did not complete");
+        }
+    }
+
+    let report = match tokio::time::timeout(timeout, serve_task).await {
+        Ok(Ok(Ok(output))) => agent_json::<TcpBarrierReport>(output, "barrier serve"),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(anyhow::anyhow!("barrier serve task panicked: {error}")),
+        Err(_) => {
+            // The coordinator is wedged; kill it so the phase can move on.
+            let pattern = format!("[g]auntlet-agent barrier serve --port {port}");
+            if let Err(error) = server
+                .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
+                .await
+            {
+                debug!(host = %server_addr, %error, "barrier cleanup command failed");
+            }
+            Err(anyhow::anyhow!(
+                "barrier serve timed out after {}s",
+                timeout.as_secs()
+            ))
+        }
+    };
+    match report {
+        Ok(report) => {
+            let rank_hosts: Vec<String> = sessions
+                .iter()
+                .map(|session| session.addr().to_string())
+                .collect();
+            emit_barrier_metrics(sink, TestId::TcpBarrier, &rank_hosts, &report.skew);
+        }
+        Err(error) => sink.error(&server_addr, format!("TCP barrier failed: {error:#}")),
+    }
+}
 
 fn report_rank_outcome(
     sink: &ObservationSink,
@@ -1044,6 +1305,8 @@ fn report_rank_outcome(
     }
 }
 
+/// Hosts with at least one GPU, in fleet order. Inventories collected during
+/// phase 0 are reused; hosts without one (e.g. `--phases network`) are probed.
 async fn gpu_bearing_hosts(
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
