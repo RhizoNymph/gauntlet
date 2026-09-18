@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapTaskSpec,
-    Phase,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapNcclSpec,
+    OverlapTaskSpec, Phase,
 };
 
 #[derive(Debug, Error)]
@@ -137,6 +137,10 @@ pub struct TestConfig {
     pub overlap_baseline_secs: u64,
     /// Overlap phase: all-reduce message size in MiB.
     pub overlap_msg_mib: u64,
+    /// Overlap phase: also run the fleet-wide combined-load step (GEMM on
+    /// every GPU under a cross-node all-reduce). Skipped quietly on fleets
+    /// with fewer than two GPU-bearing hosts.
+    pub overlap_fleet: bool,
 }
 
 impl Default for TestConfig {
@@ -167,6 +171,7 @@ impl Default for TestConfig {
             overlap_secs: 30,
             overlap_baseline_secs: 5,
             overlap_msg_mib: 64,
+            overlap_fleet: true,
         }
     }
 }
@@ -296,6 +301,20 @@ impl FleetConfig {
             // Counter passes are scheduled by the orchestrator as dedicated
             // invocations; a plain phase spec never carries one.
             counters: None,
+        }
+    }
+
+    /// The fleet-overlap payload sent on the NCCL directives. Same knobs as
+    /// the node-local overlap spec (`task_spec().overlap`): the fleet step
+    /// measures the same contention, one topology level up.
+    pub fn overlap_nccl_spec(&self) -> OverlapNcclSpec {
+        let tests = &self.tests;
+        OverlapNcclSpec {
+            duration_secs: tests.overlap_secs,
+            baseline_secs: tests.overlap_baseline_secs,
+            gemm_dim: tests.gemm_dim,
+            gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
+            msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
         }
     }
 

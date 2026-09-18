@@ -215,3 +215,11 @@ records land before grouping, they flow through aggregates, MAD outliers,
 jitter, and absolute thresholds like measured metrics. The hosts table
 adds an `overlap ret (min)` column: the worst per-subject median retention
 on that host. See docs/features/overlap_phase.md.
+
+Schema v7 adds the fleet overlap step's groups (`overlap_fleet_gemm`,
+`overlap_fleet_all_reduce`) and the corresponding derived names:
+`overlap_retention.fleet_gemm_<dtype>` (per GPU, same phase-2 baseline)
+and `overlap_retention.fleet_all_reduce` (per node, over the fleet step's
+own isolated window — the two steps' communicators are not comparable, so
+their baselines never cross). No field changed shape; pre-v7 documents
+decode unchanged.

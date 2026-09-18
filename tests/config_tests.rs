@@ -154,6 +154,31 @@ fn overlap_defaults_and_task_spec_mapping() {
 }
 
 #[test]
+fn fleet_overlap_defaults_on_and_maps_to_the_nccl_spec() {
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert!(config.tests.overlap_fleet);
+
+    // The fleet step reuses the node-local overlap knobs verbatim.
+    let task = config.task_spec(&[Phase::Overlap]).overlap;
+    let spec = config.overlap_nccl_spec();
+    assert_eq!(spec.duration_secs, task.duration_secs);
+    assert_eq!(spec.baseline_secs, task.baseline_secs);
+    assert_eq!(spec.gemm_dim, task.gemm_dim);
+    assert_eq!(spec.gemm_dtype, task.gemm_dtype);
+    assert_eq!(spec.msg_bytes, task.msg_bytes);
+
+    let off = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        overlap_fleet = false
+        "#,
+    )
+    .expect("overlap_fleet override");
+    assert!(!off.tests.overlap_fleet);
+}
+
+#[test]
 fn task_spec_converts_units() {
     let config = parse(
         r#"

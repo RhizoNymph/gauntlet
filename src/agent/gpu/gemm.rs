@@ -176,12 +176,9 @@ pub fn max_relative_error(expected: &[f64], actual: &[f64]) -> f64 {
 // ---------------------------------------------------------------------------
 
 pub fn dtype_tag(dtype: GemmDtype) -> &'static str {
-    match dtype {
-        GemmDtype::F32 => "f32",
-        GemmDtype::Tf32 => "tf32",
-        GemmDtype::Bf16 => "bf16",
-        GemmDtype::F16 => "f16",
-    }
+    // Single source of truth lives on the wire type, shared with the
+    // orchestrator side.
+    dtype.tag()
 }
 
 /// The value the GPU actually multiplies, given a host f32.

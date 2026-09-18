@@ -198,6 +198,86 @@ fn overlap_metric_events_round_trip() {
 }
 
 #[test]
+fn fleet_overlap_events_round_trip() {
+    use gauntlet::proto::{OverlapFleetReport, OverlapGpuGemm};
+    let event = AgentEvent::OverlapFleetReport {
+        report: Box::new(OverlapFleetReport {
+            rank: 1,
+            msg_bytes: 64 << 20,
+            isolated_bus_gib_per_sec: 44.0,
+            overlap_bus_gib_per_sec: 33.0,
+            gemm: vec![
+                OverlapGpuGemm::Ok {
+                    gpu_index: 0,
+                    gflops: 88_000.0,
+                },
+                OverlapGpuGemm::Failed {
+                    gpu_index: 1,
+                    reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
+                },
+            ],
+        }),
+    };
+    let back = decode_event(&encode_event(&event)).expect("round trip");
+    assert_eq!(back, event);
+
+    // Metric events under the new test ids round-trip like any other.
+    for (test, name, unit) in [
+        (TestId::OverlapFleetGemm, "gflops_bf16", Unit::Gflops),
+        (
+            TestId::OverlapFleetAllReduce,
+            "overlap_bus_gib_per_sec",
+            Unit::GibPerSec,
+        ),
+    ] {
+        let event = AgentEvent::Metric {
+            record: MetricRecord {
+                test,
+                scope: Scope::Node,
+                name: name.into(),
+                value: 12.5,
+                unit,
+                repeat: 0,
+            },
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
+}
+
+#[test]
+fn nccl_directives_default_the_overlap_spec_absent() {
+    use gauntlet::proto::{NcclDirective, OverlapNcclSpec};
+    // Wire output from a pre-v6 orchestrator build: no overlap field.
+    let old = r#"{"directive":"lead","world_size":3,"sizes":[1024],"iters_per_size":20,"socket_ifname":null,"barrier":null}"#;
+    let directive: NcclDirective = serde_json::from_str(old).expect("decode old lead");
+    let NcclDirective::Lead { overlap, .. } = directive else {
+        panic!("expected a Lead directive");
+    };
+    assert_eq!(overlap, None);
+
+    let with_overlap = NcclDirective::Participate {
+        unique_id_b64: "abc".into(),
+        rank: 2,
+        world_size: 3,
+        sizes: Vec::new(),
+        iters_per_size: 0,
+        socket_ifname: Some("bond0".into()),
+        barrier: None,
+        overlap: Some(OverlapNcclSpec {
+            duration_secs: 30,
+            baseline_secs: 5,
+            gemm_dim: 8192,
+            gemm_dtype: gauntlet::proto::GemmDtype::Bf16,
+            msg_bytes: 64 << 20,
+        }),
+    };
+    let json = serde_json::to_string(&with_overlap).expect("serialize");
+    let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, with_overlap);
+}
+
+#[test]
 fn sdc_events_round_trip() {
     let events = vec![
         AgentEvent::Outcome {

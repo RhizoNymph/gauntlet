@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod mem;
 pub mod nccl;
 pub mod net;
+pub mod window;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;

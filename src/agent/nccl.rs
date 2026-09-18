@@ -16,6 +16,14 @@
 //! One process per node, one GPU per rank for v1 (world_size == node count;
 //! intra-node NVLink is covered by the p2p test). `socket_ifname`, when
 //! set, is exported as NCCL_SOCKET_IFNAME before init.
+//!
+//! Fleet overlap: when the directive carries an `overlap` spec, the rank
+//! runs the combined-load protocol *instead of* the sweep — an isolated
+//! fleet all-reduce baseline, then the same all-reduce while every local
+//! GPU hammers GEMMs (`gpu::worker`), with window boundaries agreed
+//! through a MIN-reduced control word (`agent::window`) so every rank
+//! leaves each window in the same iteration without cross-host clock
+//! comparison. Every rank emits its own `OverlapFleetReport`.
 
 use std::io::BufRead;
 
@@ -115,18 +123,22 @@ pub fn all_gather_bus_gib_per_sec(message_bytes: f64, elapsed_secs: f64, world_s
 pub mod imp {
     use std::ffi::c_char;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow, bail};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use cudarc::driver::{CudaContext, CudaStream};
+    use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
     use cudarc::nccl::result::NcclError;
     use cudarc::nccl::{Comm, Id, ReduceOp};
 
     use crate::agent::EventSink;
+    use crate::agent::gpu::gemm::sustained_gflops_value;
+    use crate::agent::gpu::worker::GemmLoad;
+    use crate::agent::window::{self, WindowRole, WindowTally};
     use crate::proto::{
-        AgentEvent, MetricRecord, NcclDirective, PROTO_VERSION, Scope, TestId, Unit,
+        AgentEvent, MetricRecord, NcclDirective, OverlapFleetReport, OverlapGpuGemm,
+        OverlapNcclSpec, PROTO_VERSION, Scope, TestId, Unit,
     };
 
     /// NCCL's opaque rendezvous token is exactly 128 bytes.
@@ -176,6 +188,7 @@ pub mod imp {
             iters_per_size,
             socket_ifname,
             barrier,
+            overlap,
         } = directive
         else {
             bail!("lead requires a Lead directive");
@@ -200,11 +213,13 @@ pub mod imp {
             sizes,
             *iters_per_size,
             *barrier,
+            *overlap,
         )
     }
 
-    /// Ranks 1..n: sweep silently, but report their own barrier timings —
-    /// per-rank local timing is the whole point of that benchmark.
+    /// Ranks 1..n: sweep silently, but report their own barrier timings and
+    /// fleet-overlap results — per-rank local measurement is the whole
+    /// point of those benchmarks.
     pub fn participate(directive: &NcclDirective) -> Result<()> {
         let NcclDirective::Participate {
             unique_id_b64,
@@ -214,6 +229,7 @@ pub mod imp {
             iters_per_size,
             socket_ifname,
             barrier,
+            overlap,
         } = directive
         else {
             bail!("participate requires a Participate directive");
@@ -237,6 +253,7 @@ pub mod imp {
             sizes,
             *iters_per_size,
             *barrier,
+            *overlap,
         )
     }
 
@@ -261,6 +278,7 @@ pub mod imp {
         sizes: &[u64],
         iters_per_size: u32,
         barrier: Option<crate::proto::BarrierSpec>,
+        overlap: Option<crate::proto::OverlapNcclSpec>,
     ) -> Result<()> {
         if world_size == 0 {
             bail!("world_size must be at least 1");
@@ -276,6 +294,12 @@ pub mod imp {
         let stream = ctx.default_stream();
         let comm = Comm::from_rank(Arc::clone(&stream), rank as usize, world_size as usize, id)
             .map_err(|error| nccl_error("ncclCommInitRank", error))?;
+
+        // Fleet overlap replaces the sweep: same communicator shape, a
+        // completely different measurement protocol.
+        if let Some(spec) = overlap {
+            return overlap_fleet(sink, &ctx, &stream, &comm, rank, world_size, &spec);
+        }
 
         let max_elements = sizes
             .iter()
@@ -381,6 +405,181 @@ pub mod imp {
         }
 
         Ok(())
+    }
+
+    /// Payload all-reduces between window-consensus steps: enough to
+    /// amortize the (tiny) control reduce, few enough that a window
+    /// boundary lands within a fraction of a second on 64 MiB messages.
+    const OVERLAP_CONTROL_INTERVAL: u32 = 4;
+
+    /// Fleet overlap protocol for one rank: isolated all-reduce baseline,
+    /// then the same all-reduce while every local GPU runs the sustained
+    /// GEMM (`gpu::worker`), on the same communicator. Window boundaries
+    /// are agreed through the MIN-reduced control word (`agent::window`),
+    /// so every rank leaves each window in the same iteration with no
+    /// cross-host clock comparison. Every rank emits its own
+    /// `OverlapFleetReport` — local bus bandwidths plus per-GPU overlapped
+    /// GFLOPS.
+    ///
+    /// The collective leg runs one rank per node on device 0 (the fleet
+    /// sweep's shape — this is what exercises the GPU<->NIC path); the
+    /// compute leg spans every local GPU, so host-side PCIe/power pressure
+    /// from the whole node bears on that path.
+    fn overlap_fleet(
+        sink: &EventSink,
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        comm: &Comm,
+        rank: u32,
+        world_size: u32,
+        spec: &OverlapNcclSpec,
+    ) -> Result<()> {
+        let elements = (spec.msg_bytes as usize / F32_BYTES).max(1);
+        let message_bytes = (elements * F32_BYTES) as f64;
+        let send = stream.alloc_zeros::<f32>(elements)?;
+        let mut recv = stream.alloc_zeros::<f32>(elements)?;
+        // One-element buffers for the window-consensus control word.
+        let mut ctrl_send = stream.alloc_zeros::<f32>(1)?;
+        let mut ctrl_recv = stream.alloc_zeros::<f32>(1)?;
+
+        for _ in 0..WARMUP_ITERS {
+            comm.all_reduce(&send, &mut recv, &ReduceOp::Sum)
+                .map_err(|error| nccl_error("overlap warmup all_reduce", error))?;
+        }
+        stream.synchronize()?;
+
+        // Only rank 0's clock ever closes a window.
+        let role = if rank == 0 {
+            WindowRole::Lead
+        } else {
+            WindowRole::Follower
+        };
+
+        // Isolated baseline: same communicator, quiet GPUs (the GEMM
+        // workers are not even spawned yet).
+        let isolated_per_iter = consensus_window(
+            stream,
+            comm,
+            &send,
+            &mut recv,
+            &mut ctrl_send,
+            &mut ctrl_recv,
+            role,
+            spec.baseline_secs,
+        )?;
+
+        // GEMM load on every local GPU; device 0 reuses the rank's context.
+        let contexts = local_contexts(ctx)?;
+        let load = GemmLoad::spawn(&contexts, spec.gemm_dim, spec.gemm_dtype);
+        load.start();
+        let overlapped = consensus_window(
+            stream,
+            comm,
+            &send,
+            &mut recv,
+            &mut ctrl_send,
+            &mut ctrl_recv,
+            role,
+            spec.duration_secs,
+        );
+        // Workers are stopped and joined before any collective error
+        // propagates, so a failed group never leaks GEMM threads.
+        let throughputs = load.finish();
+        let overlapped_per_iter = overlapped?;
+
+        let n = spec.gemm_dim.max(1) as usize;
+        let gemm = throughputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| match outcome {
+                Ok(throughput) => OverlapGpuGemm::Ok {
+                    gpu_index: index as u32,
+                    gflops: sustained_gflops_value(n, throughput.iters, throughput.elapsed_secs),
+                },
+                Err(reason) => OverlapGpuGemm::Failed {
+                    gpu_index: index as u32,
+                    reason,
+                },
+            })
+            .collect();
+
+        sink.emit(&AgentEvent::OverlapFleetReport {
+            report: Box::new(OverlapFleetReport {
+                rank,
+                msg_bytes: (elements * F32_BYTES) as u64,
+                isolated_bus_gib_per_sec: super::all_reduce_bus_gib_per_sec(
+                    message_bytes,
+                    isolated_per_iter,
+                    world_size,
+                ),
+                overlap_bus_gib_per_sec: super::all_reduce_bus_gib_per_sec(
+                    message_bytes,
+                    overlapped_per_iter,
+                    world_size,
+                ),
+                gemm,
+            }),
+        });
+        Ok(())
+    }
+
+    /// One consensus-coordinated measurement window: batches of payload
+    /// all-reduces, then one MIN-reduced control word, until the lead's
+    /// clock closes the window for everyone. Returns the mean seconds per
+    /// payload iteration; the control steps stay outside the tally, so the
+    /// figure measures the collective, not the consensus overhead.
+    #[allow(clippy::too_many_arguments)]
+    fn consensus_window(
+        stream: &Arc<CudaStream>,
+        comm: &Comm,
+        send: &CudaSlice<f32>,
+        recv: &mut CudaSlice<f32>,
+        ctrl_send: &mut CudaSlice<f32>,
+        ctrl_recv: &mut CudaSlice<f32>,
+        role: WindowRole,
+        budget_secs: u64,
+    ) -> Result<f64> {
+        let deadline = Instant::now() + Duration::from_secs(budget_secs.max(1));
+        let mut tally = WindowTally::default();
+        stream.synchronize()?;
+        loop {
+            let batch = Instant::now();
+            for _ in 0..OVERLAP_CONTROL_INTERVAL {
+                comm.all_reduce(send, recv, &ReduceOp::Sum)
+                    .map_err(|error| nccl_error("overlap all_reduce", error))?;
+            }
+            stream.synchronize()?;
+            tally.record(
+                u64::from(OVERLAP_CONTROL_INTERVAL),
+                batch.elapsed().as_secs_f64(),
+            );
+
+            let word = window::contribution(role, Instant::now() >= deadline);
+            stream.memcpy_htod(&[word], ctrl_send)?;
+            comm.all_reduce(ctrl_send, ctrl_recv, &ReduceOp::Min)
+                .map_err(|error| nccl_error("overlap control all_reduce", error))?;
+            stream.synchronize()?;
+            let reduced = stream.clone_dtoh(ctrl_recv)?;
+            if window::window_closed(reduced.first().copied().unwrap_or(window::CONTROL_CLOSE)) {
+                return Ok(tally.per_iter_secs());
+            }
+        }
+    }
+
+    /// One context per visible GPU, reusing the rank's device-0 context.
+    fn local_contexts(ctx0: &Arc<CudaContext>) -> Result<Vec<Arc<CudaContext>>> {
+        let count = CudaContext::device_count()
+            .context("counting cuda devices")?
+            .max(1) as usize;
+        let mut contexts = Vec::with_capacity(count);
+        contexts.push(Arc::clone(ctx0));
+        for index in 1..count {
+            contexts.push(
+                CudaContext::new(index)
+                    .with_context(|| format!("creating cuda context for gpu {index}"))?,
+            );
+        }
+        Ok(contexts)
     }
 
     /// Total wall seconds for `iters` collectives. The stream is synchronized

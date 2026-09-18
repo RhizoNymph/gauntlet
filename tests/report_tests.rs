@@ -877,6 +877,160 @@ fn overlap_retention_appears_in_the_rendered_table() {
     assert!(text.contains("0.75"), "worst retention rendered: {text}");
 }
 
+// ---------------------------------------------------------------------------
+// Fleet overlap: retention against the step's own baseline window
+// ---------------------------------------------------------------------------
+
+/// One host with phase-2 GEMM baselines, fleet-overlap GEMM numbers, and
+/// the fleet all-reduce pair (isolated + overlapped bus bandwidth).
+fn fleet_overlap_host(
+    baselines: &[(u32, f64)],
+    overlapped: &[(u32, f64)],
+    isolated_bus: f64,
+    overlap_bus: f64,
+) -> HostObservations {
+    let mut obs = HostObservations::default();
+    for (gpu, gflops) in baselines {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    for (gpu, gflops) in overlapped {
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapFleetGemm,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "isolated_bus_gib_per_sec",
+        isolated_bus,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "overlap_bus_gib_per_sec",
+        overlap_bus,
+        Unit::GibPerSec,
+    ));
+    obs
+}
+
+#[test]
+fn fleet_overlap_retention_is_derived_per_gpu_and_per_node() {
+    let config = config_for(&["a"]);
+    let obs = fleet_overlap_host(
+        &[(0, 1000.0), (1, 800.0)],
+        &[(0, 900.0), (1, 400.0)],
+        40.0,
+        30.0,
+    );
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+
+    let derived: Vec<&MetricRecord> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .collect();
+    let ratio_of = |name: &str, scope: &Scope| -> f64 {
+        derived
+            .iter()
+            .find(|record| record.name == name && record.scope == *scope)
+            .unwrap_or_else(|| panic!("missing retention {name} for {scope:?}"))
+            .value
+    };
+    assert!((ratio_of("fleet_gemm_bf16", &Scope::Gpu { index: 0 }) - 0.9).abs() < 1e-12);
+    assert!((ratio_of("fleet_gemm_bf16", &Scope::Gpu { index: 1 }) - 0.5).abs() < 1e-12);
+    assert!((ratio_of("fleet_all_reduce", &Scope::Node) - 0.75).abs() < 1e-12);
+    for record in &derived {
+        assert_eq!(record.unit, Unit::Ratio);
+    }
+
+    // The derived groups ride the aggregate machinery like measured metrics.
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.fleet_gemm_bf16")
+    );
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.fleet_all_reduce")
+    );
+}
+
+#[test]
+fn fleet_and_intra_node_overlap_baselines_never_cross() {
+    // Both steps present, with different isolated baselines (they run on
+    // different communicators): each retention must divide its own.
+    let config = config_for(&["a"]);
+    let mut obs = overlap_host(&[(0, 1000.0)], &[(0, 900.0)], 100.0, 80.0);
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "isolated_bus_gib_per_sec",
+        40.0,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "overlap_bus_gib_per_sec",
+        30.0,
+        Unit::GibPerSec,
+    ));
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let retention: BTreeMap<&str, f64> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention && record.scope == Scope::Node)
+        .map(|record| (record.name.as_str(), record.value))
+        .collect();
+    assert!(
+        (retention["all_reduce"] - 0.8).abs() < 1e-12,
+        "{retention:?}"
+    );
+    assert!(
+        (retention["fleet_all_reduce"] - 0.75).abs() < 1e-12,
+        "{retention:?}"
+    );
+}
+
+#[test]
+fn fleet_overlap_retention_feeds_mad_outliers() {
+    let names = ["n1", "n2", "n3", "n4", "n5"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        // Healthy nodes retain ~75% of the fleet all-reduce under combined
+        // load; n3's GPU<->NIC path collapses to 30%.
+        let overlapped = if *name == "n3" {
+            12.0
+        } else {
+            30.0 + 0.1 * i as f64
+        };
+        observations.insert(
+            (*name).to_string(),
+            fleet_overlap_host(&[(0, 1000.0)], &[(0, 950.0)], 40.0, overlapped),
+        );
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let flagged = results
+        .fleet
+        .outliers
+        .get("overlap_retention.fleet_all_reduce")
+        .expect("fleet retention outlier group");
+    assert_eq!(flagged.len(), 1, "{flagged:?}");
+    assert_eq!(flagged[0].key, "n3", "{flagged:?}");
+    assert!(flagged[0].deviation_mads < 0.0);
+    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+}
+
 #[test]
 fn rooflines_reduce_over_per_subject_medians() {
     let mut obs = HostObservations::default();

@@ -12,6 +12,7 @@ pub mod gemm;
 pub mod overlap;
 pub mod p2p;
 pub mod sdc;
+pub mod worker;
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};

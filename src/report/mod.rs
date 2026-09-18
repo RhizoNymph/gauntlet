@@ -36,7 +36,11 @@ use crate::proto::{
 // v6: `fleet.barrier_stragglers` (slowest-rank tally flags from the
 // barrier-skew microbenchmark) and the nccl_barrier / tcp_barrier metric
 // groups.
-pub const SCHEMA_VERSION: u32 = 6;
+// v7: fleet overlap — overlap_fleet_gemm / overlap_fleet_all_reduce metric
+// groups and derived overlap_retention.fleet_gemm_<dtype> /
+// overlap_retention.fleet_all_reduce records. No field changed shape, so
+// pre-v7 documents decode unchanged (they simply lack the new groups).
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -214,6 +218,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
         TestId::OverlapAllReduce => "overlap_all_reduce",
+        TestId::OverlapFleetGemm => "overlap_fleet_gemm",
+        TestId::OverlapFleetAllReduce => "overlap_fleet_all_reduce",
         TestId::OverlapRetention => "overlap_retention",
     }
 }
@@ -467,6 +473,11 @@ fn barrier_straggler_flags(
 ///   repeat (same communicator, measured seconds apart — the phase-3 NCCL
 ///   sweep is a different topology and only exists on rank 0, so it cannot
 ///   serve as the denominator).
+/// - `fleet_gemm_<dtype>` per GPU and `fleet_all_reduce` per node: the same
+///   two ratios for the fleet overlap step — GEMM against the same phase-2
+///   baseline, all-reduce against the step's own isolated window
+///   (`overlap_fleet_all_reduce.isolated_bus_gib_per_sec`, same fleet
+///   communicator).
 ///
 /// A ratio is only formed from finite numbers over a positive baseline; a
 /// missing or degenerate baseline yields no record rather than a lie.
@@ -481,9 +492,12 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
         return Vec::new();
     }
 
-    // Baselines keyed by (repeat, scope label, metric name).
+    // Baselines keyed by (repeat, scope label, metric name); the two
+    // all-reduce steps (intra-node, fleet) keep separate per-repeat
+    // baselines because they run on different communicators.
     let mut gemm_baselines: BTreeMap<(u32, String, &str), f64> = BTreeMap::new();
     let mut bus_baselines: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut fleet_bus_baselines: BTreeMap<u32, f64> = BTreeMap::new();
     for record in &obs.metrics {
         if !(record.value.is_finite() && record.value > 0.0) {
             continue;
@@ -502,6 +516,9 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
             TestId::OverlapAllReduce if record.name == "isolated_bus_gib_per_sec" => {
                 bus_baselines.insert(record.repeat, record.value);
             }
+            TestId::OverlapFleetAllReduce if record.name == "isolated_bus_gib_per_sec" => {
+                fleet_bus_baselines.insert(record.repeat, record.value);
+            }
             _ => {}
         }
     }
@@ -511,8 +528,15 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
         if !record.value.is_finite() {
             continue;
         }
-        match record.test {
-            TestId::OverlapGemm if record.name.starts_with("gflops_") => {
+        // Both overlap steps divide their GEMM leg by the same phase-2
+        // baseline; only the derived name differs.
+        let gemm_prefix = match record.test {
+            TestId::OverlapGemm => Some("gemm"),
+            TestId::OverlapFleetGemm => Some("fleet_gemm"),
+            _ => None,
+        };
+        if let Some(prefix) = gemm_prefix {
+            if record.name.starts_with("gflops_") {
                 let key = (
                     record.repeat,
                     scope_label(&record.scope).unwrap_or_default(),
@@ -523,26 +547,32 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
                     derived.push(MetricRecord {
                         test: TestId::OverlapRetention,
                         scope: record.scope.clone(),
-                        name: format!("gemm_{dtype}"),
+                        name: format!("{prefix}_{dtype}"),
                         value: record.value / baseline,
                         unit: Unit::Ratio,
                         repeat: record.repeat,
                     });
                 }
             }
-            TestId::OverlapAllReduce if record.name == "overlap_bus_gib_per_sec" => {
-                if let Some(baseline) = bus_baselines.get(&record.repeat) {
-                    derived.push(MetricRecord {
-                        test: TestId::OverlapRetention,
-                        scope: record.scope.clone(),
-                        name: "all_reduce".to_string(),
-                        value: record.value / baseline,
-                        unit: Unit::Ratio,
-                        repeat: record.repeat,
-                    });
-                }
-            }
-            _ => {}
+            continue;
+        }
+        let bus = match record.test {
+            TestId::OverlapAllReduce => Some(("all_reduce", &bus_baselines)),
+            TestId::OverlapFleetAllReduce => Some(("fleet_all_reduce", &fleet_bus_baselines)),
+            _ => None,
+        };
+        if let Some((name, baselines)) = bus
+            && record.name == "overlap_bus_gib_per_sec"
+            && let Some(baseline) = baselines.get(&record.repeat)
+        {
+            derived.push(MetricRecord {
+                test: TestId::OverlapRetention,
+                scope: record.scope.clone(),
+                name: name.to_string(),
+                value: record.value / baseline,
+                unit: Unit::Ratio,
+                repeat: record.repeat,
+            });
         }
     }
     derived
@@ -1562,6 +1592,25 @@ mod tests {
         fleet.remove("barrier_stragglers");
         let back: RunResults = serde_json::from_value(value).expect("deserialize v2 shape");
         assert!(back.fleet.barrier_stragglers.is_empty());
+    }
+
+    /// v7 added metric groups, not fields: a document written by a v6 build
+    /// (no overlap_fleet_* groups, no fleet_* retention names, old
+    /// schema_version stamp) must keep decoding unchanged.
+    #[test]
+    fn pre_v7_documents_decode() {
+        let results = build(&fleet_config(), barrier_observations(0.92, 1800.0), 1, 2);
+        let mut value = serde_json::to_value(&results).expect("to value");
+        value["schema_version"] = serde_json::json!(6);
+        let back: RunResults = serde_json::from_value(value).expect("deserialize v6 document");
+        assert_eq!(back.schema_version, 6);
+        assert_eq!(back.hosts.len(), results.hosts.len());
+        assert!(
+            back.hosts
+                .values()
+                .flat_map(|obs| obs.metrics.iter())
+                .all(|record| record.test != TestId::OverlapRetention)
+        );
     }
 
     #[test]
