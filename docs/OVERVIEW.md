@@ -28,10 +28,13 @@ Overview:
       beyond the driver stack). Emits JSON-lines events over stdout. Has peer
       (two-sided TCP tests) and nccl subcommand modes.
     scheduler: >
-      Phase DAG. Phases 0-2 are embarrassingly parallel across nodes. Phase 3
-      pairwise tests use round-robin tournament scheduling: n-1 rounds of n/2
-      disjoint pairs, wall time linear in n. Target scale 32-256 nodes; a
-      sampled mode exists for quick runs.
+      Phase DAG. Phases 0-2 and the overlap phase are embarrassingly
+      parallel across nodes. Phase 3 pairwise tests use round-robin
+      tournament scheduling: n-1 rounds of n/2 disjoint pairs, wall time
+      linear in n. The overlap phase (compute + comms under combined load)
+      runs last: its retention ratios divide the isolated phase-2 baselines
+      from the same run. Target scale 32-256 nodes; a sampled mode exists
+      for quick runs.
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
       MADs, applies optional absolute thresholds, renders table + JSON, sets
@@ -89,6 +92,18 @@ Features Index:
     entry_points: [agent/gpu/]
     depends_on: [phase0_inventory]
     doc: docs/features/phase2_gpu.md
+  hot_sdc:
+    description: >
+      Silent-data-corruption screens under thermal load (SDC is
+      temperature/voltage dependent): periodic bitwise verification of the
+      sustained GEMM output during the loaded window (busy-time scheduled,
+      throughput-neutral), and an all-core CPU screen interleaving checksum
+      rounds with the power-heavy FMA workload. Mismatches are hard
+      per-scope failures with clock/temp context; fleet.sdc_failures +
+      dedicated table section.
+    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs]
+    depends_on: [phase1_cpu_mem_disk, phase2_gpu]
+    doc: docs/features/hot_sdc.md
   phase3_network:
     description: >
       Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
@@ -112,6 +127,33 @@ Features Index:
     entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs]
     depends_on: [phase3_network]
     doc: docs/features/barrier_skew.md
+  overlap_phase:
+    description: >
+      Sustained GEMM concurrent with an intra-node NCCL all-reduce on the
+      same GPUs (single process, one rank per GPU, ncclCommInitAll; GEMM on
+      a second stream per device from one thread per GPU). Emits overlapped
+      GFLOPS per GPU and isolated + overlapped all-reduce bus bandwidth;
+      report::build derives retention ratios (overlapped/isolated) against
+      the phase-2 GEMM baselines and the phase-local collective baseline,
+      which feed the MAD outlier analysis as the primary combined-load
+      straggler signal. Runs last. Multi-node overlap is a documented
+      follow-up.
+    entry_points: [agent/gpu/overlap.rs, report/mod.rs]
+    depends_on: [phase2_gpu, phase3_network]
+    doc: docs/features/overlap_phase.md
+  counter_deltas:
+    description: >
+      Error-counter delta detection across the load phases: the agent
+      snapshots PCIe AER, GPU ECC/row-remap, dmesg Xid, NVLink, EDAC, IB
+      port and NVMe error counters before the first load phase (baseline
+      held by the orchestrator) and again after the last repeat, diffs on
+      the agent, and emits per-node CounterDeltas. Any positive increment
+      is a per-host finding (verdict Stragglers) rendered in its own table
+      section; full deltas (zeros included) land in the JSON. Collection
+      is best effort — nodes without a subsystem contribute nothing.
+    entry_points: [agent/counters.rs, orchestrator/mod.rs]
+    depends_on: [phase0_inventory]
+    doc: docs/features/counter_deltas.md
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
@@ -121,7 +163,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew]
     doc: docs/features/reporting.md
   viewer:
     description: >

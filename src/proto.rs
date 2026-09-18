@@ -12,9 +12,17 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// v2: barrier-skew microbenchmark — `NcclDirective` variants carry an
+// v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
+// on the wire plus `CpuTaskSpec::sdc_hot_secs` / `GpuTaskSpec::sdc_check_secs`
+// in the task spec (which is `deny_unknown_fields`, so a v1 agent would
+// reject a v2 spec; the version handshake forces a re-deploy instead).
+// v3: error-counter snapshot/delta events (`counter_baseline`,
+// `counter_deltas`) and the `counters` request on `AgentTaskSpec`.
+// v4: overlap phase (`Phase::Overlap`, `AgentTaskSpec.overlap`, overlap test
+// ids).
+// v5: barrier-skew microbenchmark — `NcclDirective` variants carry an
 // optional `barrier` spec and every rank reports `NcclBarrierTimings`.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -83,6 +91,17 @@ pub enum AgentEvent {
         rank: u32,
         elapsed_us: Vec<f64>,
     },
+    /// Error-counter snapshot taken before the load phases. Boxed for the
+    /// same reason as `Inventory`. The orchestrator intercepts and holds it;
+    /// it never reaches the collector on the happy path.
+    CounterBaseline {
+        snapshot: Box<CounterSnapshot>,
+    },
+    /// Per-node counter deltas across the load phases, computed on the agent
+    /// from the baseline the orchestrator handed back in the task spec.
+    CounterDeltas {
+        deltas: Box<CounterDeltas>,
+    },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
         message: String,
@@ -96,10 +115,20 @@ pub enum Phase {
     CpuMem,
     Gpu,
     Network,
+    /// Sustained GEMM concurrent with an intra-node NCCL all-reduce. Runs
+    /// last: its straggler signal is *retention* against the isolated
+    /// phase-2 GEMM baselines from the same run.
+    Overlap,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 4] = [Phase::Inventory, Phase::CpuMem, Phase::Gpu, Phase::Network];
+    pub const ALL: [Phase; 5] = [
+        Phase::Inventory,
+        Phase::CpuMem,
+        Phase::Gpu,
+        Phase::Network,
+        Phase::Overlap,
+    ];
 
     pub fn parse(s: &str) -> Option<Phase> {
         match s {
@@ -107,6 +136,7 @@ impl Phase {
             "cpu_mem" | "cpu" => Some(Phase::CpuMem),
             "gpu" => Some(Phase::Gpu),
             "network" | "net" => Some(Phase::Network),
+            "overlap" => Some(Phase::Overlap),
             _ => None,
         }
     }
@@ -127,10 +157,16 @@ pub enum TestId {
     Inventory,
     CpuCorrectness,
     CpuGflops,
+    /// Correctness screen re-run while every core burns power: silent data
+    /// corruption is temperature/voltage dependent, so the cold screen alone
+    /// is not sufficient.
+    CpuSdcHot,
     MemBandwidth,
     DiskIo,
     GpuGemmCorrectness,
     GpuGemmPerf,
+    /// Periodic bitwise output verification during the sustained (hot) GEMM.
+    GpuGemmSdc,
     GpuMemBandwidth,
     GpuP2p,
     NetLatency,
@@ -141,6 +177,13 @@ pub enum TestId {
     NcclBarrier,
     /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
     TcpBarrier,
+    /// GEMM throughput measured while the intra-node all-reduce runs.
+    OverlapGemm,
+    /// Intra-node all-reduce bandwidth: isolated baseline and under GEMM load.
+    OverlapAllReduce,
+    /// Derived orchestrator-side (`report::build`): overlapped/isolated
+    /// ratios. Agents never emit this test id.
+    OverlapRetention,
 }
 
 /// What a metric is *about*. Per-core / per-GPU granularity is the point:
@@ -198,7 +241,9 @@ pub enum Unit {
     Mhz,
     Bytes,
     Count,
-    /// Relative error vs a higher-precision reference.
+    /// Error vs a reference result: relative error against a
+    /// higher-precision recomputation, or absolute deviation from a
+    /// baseline output of the identical computation.
     Residual,
     Ratio,
 }
@@ -278,6 +323,98 @@ pub struct IbPortInventory {
 }
 
 // ---------------------------------------------------------------------------
+// Error counters
+// ---------------------------------------------------------------------------
+
+/// Which hardware subsystem an error counter belongs to. Order matters only
+/// for deterministic rendering (deltas sort by (domain, device, counter)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CounterDomain {
+    PcieAer,
+    GpuEcc,
+    GpuXid,
+    Nvlink,
+    Edac,
+    IbPort,
+    Nvme,
+}
+
+impl CounterDomain {
+    pub fn label(self) -> &'static str {
+        match self {
+            CounterDomain::PcieAer => "pcie_aer",
+            CounterDomain::GpuEcc => "gpu_ecc",
+            CounterDomain::GpuXid => "gpu_xid",
+            CounterDomain::Nvlink => "nvlink",
+            CounterDomain::Edac => "edac",
+            CounterDomain::IbPort => "ib_port",
+            CounterDomain::Nvme => "nvme",
+        }
+    }
+}
+
+/// One monotonic error counter at one instant. Identity is
+/// (domain, device, counter); a snapshot never carries the same identity
+/// twice.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterReading {
+    pub domain: CounterDomain,
+    /// The hardware unit the counter belongs to: a PCI address
+    /// ("0000:65:00.0"), "gpu0", "mc0/dimm1", "mlx5_0/1" (device/port),
+    /// "gpu0/link1", "nvme0", or "dmesg" for the kernel-log Xid tally.
+    pub device: String,
+    pub counter: String,
+    pub value: u64,
+}
+
+/// Everything counted on a node at one instant. Absence of a subsystem
+/// (no IB, no NVMe, ...) is simply absence of its readings, never an error.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterSnapshot {
+    pub readings: Vec<CounterReading>,
+}
+
+/// Before/after values of one counter across the load phases.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterDelta {
+    pub domain: CounterDomain,
+    pub device: String,
+    pub counter: String,
+    pub before: u64,
+    pub after: u64,
+}
+
+impl CounterDelta {
+    /// Signed change. Negative means the counter reset between snapshots
+    /// (driver reload, log rotation) — recorded, but not an error finding.
+    pub fn increment(&self) -> i128 {
+        i128::from(self.after) - i128::from(self.before)
+    }
+}
+
+/// Full delta list for a node, zero deltas included: the JSON document keeps
+/// everything; only nonzero increments become report findings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CounterDeltas {
+    pub deltas: Vec<CounterDelta>,
+}
+
+/// What the orchestrator wants from a counter pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CounterRequest {
+    /// Snapshot now and emit `CounterBaseline`.
+    Baseline,
+    /// Snapshot now, diff against `baseline`, emit `CounterDeltas`.
+    Delta { baseline: CounterSnapshot },
+}
+
+// ---------------------------------------------------------------------------
 // Task specs (orchestrator -> agent)
 // ---------------------------------------------------------------------------
 
@@ -289,6 +426,11 @@ pub struct AgentTaskSpec {
     pub mem: MemTaskSpec,
     pub disk: DiskTaskSpec,
     pub gpu: GpuTaskSpec,
+    pub overlap: OverlapTaskSpec,
+    /// Error-counter pass to run after the listed phases; the orchestrator
+    /// sends this in dedicated invocations with an empty phase list.
+    #[serde(default)]
+    pub counters: Option<CounterRequest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +438,13 @@ pub struct AgentTaskSpec {
 pub struct CpuTaskSpec {
     pub correctness_secs_per_core: u64,
     pub gflops_secs: u64,
+    /// Wall seconds for the hot SDC screen: correctness rounds interleaved
+    /// with the power-heavy FMA workload on every core simultaneously, so
+    /// correctness is exercised at max package power/temperature. 0 disables
+    /// (the phase emits a Skipped outcome). Additional to — never a
+    /// replacement for — the isolated per-core screen.
+    #[serde(default)]
+    pub sdc_hot_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -320,6 +469,35 @@ pub struct GpuTaskSpec {
     /// Square GEMM dimension for the sustained-perf run.
     pub gemm_dim: u32,
     pub bandwidth_bytes: u64,
+    /// Loaded seconds between bitwise output checks during the sustained
+    /// GEMM (the hot SDC screen). Verification happens outside the timed
+    /// throughput windows, so it never pollutes the reported GFLOPS.
+    /// 0 disables (a Skipped outcome is emitted).
+    #[serde(default)]
+    pub sdc_check_secs: u64,
+}
+
+/// Phase "overlap": sustained GEMM on every GPU concurrently with an
+/// intra-node NCCL all-reduce across those same GPUs. An isolated all-reduce
+/// baseline (`baseline_secs`) precedes the combined window so the collective
+/// retention ratio compares like against like — same communicator, same
+/// topology, seconds apart. The GEMM retention baseline is the phase-2
+/// sustained number, joined orchestrator-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapTaskSpec {
+    /// Wall seconds of combined GEMM + all-reduce load.
+    pub duration_secs: u64,
+    /// Wall seconds of the isolated intra-node all-reduce baseline.
+    pub baseline_secs: u64,
+    /// Square GEMM dimension for the compute leg (same as the phase-2 dim,
+    /// so retention divides comparable numbers).
+    pub gemm_dim: u32,
+    /// Single dtype for the compute leg: the phase measures contention,
+    /// not dtype coverage.
+    pub gemm_dtype: GemmDtype,
+    /// All-reduce message size in bytes.
+    pub msg_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -158,6 +158,17 @@ tail progress:
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
+## Error-counter findings (schema v4)
+
+`hosts.*.counter_deltas` carries the full per-node error-counter delta
+list across the load phases (zeros and resets included);
+`fleet.counter_findings` keeps only counters with `after > before`, keyed
+by host. Any finding makes the verdict at least Stragglers. `render_table`
+adds an "error-counter deltas (across load phases)" section (host, domain,
+device, counter, before, after, +increment), omitted entirely when there
+are no findings. See docs/features/counter_deltas.md for collection and
+scheduling.
+
 ## Repeats and distribution moments (schema v2)
 
 `gauntlet run --repeat N` executes the measurement phases N times over the
@@ -177,7 +188,7 @@ outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
 
-## Barrier stragglers (schema v3)
+## Barrier stragglers (schema v6)
 
 The barrier-skew microbenchmark (docs/features/barrier_skew.md) emits
 per-host `nccl_barrier.*` / `tcp_barrier.*` metrics that flow through the
@@ -187,5 +198,20 @@ ordinary MAD machinery, plus a dedicated rule:
 `thresholds.barrier_slowest_frac` and its median `slowest_considered` is
 at least `analysis::skew::MIN_TALLY_ITERS`. Barrier straggler flags count
 toward the `Stragglers` verdict and render as the "barrier stragglers"
-table section. The field is serde-defaulted, so pre-v3 documents load
+table section. The field is serde-defaulted, so pre-v6 documents load
 with it empty.
+
+## Overlap retention (schema v5)
+
+`build` starts by appending derived `overlap_retention` records to each
+host's metric list (`derive_overlap_retention`): `gemm_<dtype>` per GPU
+(overlapped `overlap_gemm.gflops_<dtype>` over the phase-2
+`gpu_gemm_perf.gflops_<dtype>` of the same GPU and repeat) and
+`all_reduce` per node (overlapped over isolated
+`overlap_all_reduce.*_bus_gib_per_sec` of the same repeat). Ratios form
+only over finite, positive baselines; derivation is idempotent (skipped if
+retention records already exist, e.g. a rebuilt document). Because the
+records land before grouping, they flow through aggregates, MAD outliers,
+jitter, and absolute thresholds like measured metrics. The hosts table
+adds an `overlap ret (min)` column: the worst per-subject median retention
+on that host. See docs/features/overlap_phase.md.

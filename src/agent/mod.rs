@@ -5,6 +5,7 @@
 //! Logs go to stderr via `tracing`.
 
 pub mod barrier;
+pub mod counters;
 pub mod cpu;
 pub mod disk;
 pub mod inventory;
@@ -110,6 +111,7 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             // Network tests are driven pairwise by the orchestrator through
             // `agent peer` / `agent nccl`, not from the phase loop.
             Phase::Network => Ok(()),
+            Phase::Overlap => overlap_phase(&sink, &spec),
         };
         if let Err(error) = result {
             sink.emit(&AgentEvent::Fatal {
@@ -118,6 +120,11 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             return Err(error);
         }
         sink.emit(&AgentEvent::PhaseEnd { phase: *phase });
+    }
+    // Counter passes run after any listed phases; the orchestrator sends
+    // them as dedicated invocations with an empty phase list.
+    if let Some(request) = &spec.counters {
+        counters::run(&sink, request);
     }
     Ok(())
 }
@@ -138,6 +145,23 @@ fn gpu_phase(sink: &EventSink, spec: &AgentTaskSpec) -> Result<()> {
 fn gpu_phase(sink: &EventSink, _spec: &AgentTaskSpec) -> Result<()> {
     sink.outcome(
         TestId::GpuGemmCorrectness,
+        Scope::Node,
+        TestOutcome::Skipped {
+            reason: "agent built without gpu feature".into(),
+        },
+    );
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn overlap_phase(sink: &EventSink, spec: &AgentTaskSpec) -> Result<()> {
+    gpu::overlap::run(sink, &spec.overlap)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn overlap_phase(sink: &EventSink, _spec: &AgentTaskSpec) -> Result<()> {
+    sink.outcome(
+        TestId::OverlapGemm,
         Scope::Node,
         TestOutcome::Skipped {
             reason: "agent built without gpu feature".into(),

@@ -117,6 +117,43 @@ fn data_addr_parses_and_defaults_off() {
 }
 
 #[test]
+fn overlap_defaults_and_task_spec_mapping() {
+    use gauntlet::proto::GemmDtype;
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert_eq!(config.tests.overlap_secs, 30);
+    assert_eq!(config.tests.overlap_baseline_secs, 5);
+    assert_eq!(config.tests.overlap_msg_mib, 64);
+
+    let spec = config.task_spec(&[Phase::Overlap]);
+    assert_eq!(spec.overlap.duration_secs, 30);
+    assert_eq!(spec.overlap.baseline_secs, 5);
+    assert_eq!(spec.overlap.msg_bytes, 64 * 1024 * 1024);
+    assert_eq!(spec.overlap.gemm_dim, config.tests.gemm_dim);
+    // The compute leg uses the first configured GEMM dtype.
+    assert_eq!(
+        Some(&spec.overlap.gemm_dtype),
+        config.tests.gemm_dtypes.first()
+    );
+
+    let custom = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        overlap_secs = 12
+        overlap_baseline_secs = 3
+        overlap_msg_mib = 16
+        gemm_dtypes = ["bf16", "f16"]
+        "#,
+    )
+    .expect("custom overlap config");
+    let spec = custom.task_spec(&[Phase::Overlap]);
+    assert_eq!(spec.overlap.duration_secs, 12);
+    assert_eq!(spec.overlap.baseline_secs, 3);
+    assert_eq!(spec.overlap.msg_bytes, 16 * 1024 * 1024);
+    assert_eq!(spec.overlap.gemm_dtype, GemmDtype::Bf16);
+}
+
+#[test]
 fn task_spec_converts_units() {
     let config = parse(
         r#"
@@ -133,4 +170,27 @@ fn task_spec_converts_units() {
     assert_eq!(spec.mem.buffer_bytes_per_numa, 2 * 1024 * 1024);
     assert_eq!(spec.disk.file_bytes, 3 * 1024 * 1024);
     assert_eq!(spec.gpu.bandwidth_bytes, 5 * 1024 * 1024);
+}
+
+#[test]
+fn hot_sdc_knobs_default_on_and_flow_into_the_spec() {
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    let spec = config.task_spec(&[Phase::CpuMem, Phase::Gpu]);
+    // The hot screens default to enabled: they only matter on fleets that
+    // never touch the config knobs.
+    assert!(spec.cpu.sdc_hot_secs > 0);
+    assert!(spec.gpu.sdc_check_secs > 0);
+
+    let tuned = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        cpu_sdc_hot_secs = 7
+        gemm_sdc_check_secs = 0
+        "#,
+    )
+    .expect("config");
+    let spec = tuned.task_spec(&[Phase::CpuMem, Phase::Gpu]);
+    assert_eq!(spec.cpu.sdc_hot_secs, 7);
+    assert_eq!(spec.gpu.sdc_check_secs, 0);
 }

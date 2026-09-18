@@ -20,14 +20,23 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::orchestrator::collect::HostObservations;
-use crate::proto::{Scope, TestId, TestOutcome, Unit, consistency_fields};
+use crate::proto::{
+    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
+    consistency_fields,
+};
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
-// v3: `fleet.barrier_stragglers` (slowest-rank tally flags from the
+// v3: hot SDC screens — `fleet.sdc_failures` plus the `cpu_sdc_hot` /
+// `gpu_gemm_sdc` test groups appearing in outcomes and metrics.
+// v4: per-host error-counter deltas (`hosts.*.counter_deltas`) and
+// `fleet.counter_findings`.
+// v5: overlap phase — `overlap_gemm` / `overlap_all_reduce` metrics and
+// derived `overlap_retention` records appended to host metric lists.
+// v6: `fleet.barrier_stragglers` (slowest-rank tally flags from the
 // barrier-skew microbenchmark) and the nccl_barrier / tcp_barrier metric
 // groups.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -86,6 +95,19 @@ pub struct FleetAnalysis {
     /// does not affect the verdict. Empty unless the run used `--repeat`.
     #[serde(default)]
     pub jitter_outliers: BTreeMap<String, Vec<Outlier>>,
+    /// Silent-data-corruption findings: Failed outcomes from the
+    /// correctness screens (isolated and hot), grouped by test display
+    /// name; entries are "host[:scope]: reason". Hard failures — these are
+    /// absolute findings on a node, never fleet-relative outliers, and any
+    /// entry makes the verdict at least `Stragglers`.
+    #[serde(default)]
+    pub sdc_failures: BTreeMap<String, Vec<String>>,
+    /// Error counters that incremented across the load phases, per host.
+    /// Any positive increment is a finding (marginal hardware accumulating
+    /// errors under load); zero and negative deltas stay in
+    /// `hosts.*.counter_deltas` only.
+    #[serde(default)]
+    pub counter_findings: BTreeMap<String, Vec<CounterFinding>>,
     /// Hosts flagged by the barrier-skew slowest-rank tally, grouped by
     /// benchmark ("nccl_barrier" / "tcp_barrier"): the host was the late
     /// arriver in more than `thresholds.barrier_slowest_frac` of the
@@ -102,6 +124,18 @@ pub struct BarrierStraggler {
     pub slowest_frac: f64,
     /// Iterations that cleared the noise margin (the tally denominator).
     pub considered_iters: f64,
+}
+
+/// One error counter that went up between the pre-load and post-load
+/// snapshots on a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterFinding {
+    pub domain: CounterDomain,
+    /// The hardware unit: PCI address, "gpu0", "mc0/dimm1", "mlx5_0/1", ...
+    pub device: String,
+    pub counter: String,
+    pub before: u64,
+    pub after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,10 +198,12 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::Inventory => "inventory",
         TestId::CpuCorrectness => "cpu_correctness",
         TestId::CpuGflops => "cpu_gflops",
+        TestId::CpuSdcHot => "cpu_sdc_hot",
         TestId::MemBandwidth => "mem_bandwidth",
         TestId::DiskIo => "disk_io",
         TestId::GpuGemmCorrectness => "gpu_gemm_correctness",
         TestId::GpuGemmPerf => "gpu_gemm_perf",
+        TestId::GpuGemmSdc => "gpu_gemm_sdc",
         TestId::GpuMemBandwidth => "gpu_mem_bandwidth",
         TestId::GpuP2p => "gpu_p2p",
         TestId::NetLatency => "net_latency",
@@ -176,6 +212,9 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NcclAllGather => "nccl_all_gather",
         TestId::NcclBarrier => "nccl_barrier",
         TestId::TcpBarrier => "tcp_barrier",
+        TestId::OverlapGemm => "overlap_gemm",
+        TestId::OverlapAllReduce => "overlap_all_reduce",
+        TestId::OverlapRetention => "overlap_retention",
     }
 }
 
@@ -218,10 +257,16 @@ pub fn sample_key(host: &str, scope: &Scope) -> String {
 /// rooflines, and link fits.
 pub fn build(
     config: &FleetConfig,
-    observations: BTreeMap<String, HostObservations>,
+    mut observations: BTreeMap<String, HostObservations>,
     started_epoch_secs: u64,
     finished_epoch_secs: u64,
 ) -> RunResults {
+    // Overlap retention ratios are derived here, before grouping, so they
+    // ride the aggregate/outlier/threshold machinery like measured metrics.
+    for obs in observations.values_mut() {
+        let derived = derive_overlap_retention(obs);
+        obs.metrics.extend(derived);
+    }
     let aggregates = aggregate_metrics(&observations);
     let raw_groups = group_samples(&observations);
 
@@ -299,6 +344,8 @@ pub fn build(
         consistency: consistency_findings(&observations),
         failed_hosts,
         jitter_outliers,
+        sdc_failures: sdc_failures(&observations),
+        counter_findings: counter_findings(&observations),
         barrier_stragglers: barrier_straggler_flags(&aggregates, &config.thresholds),
     };
     let calibration = Calibration {
@@ -409,6 +456,98 @@ fn barrier_straggler_flags(
     flags
 }
 
+/// Derive the overlap phase's primary straggler metrics for one host:
+/// retention = overlapped / isolated, as `overlap_retention.*` records.
+///
+/// - `gemm_<dtype>` per GPU: `overlap_gemm.gflops_<dtype>` divided by the
+///   phase-2 `gpu_gemm_perf.gflops_<dtype>` baseline of the same GPU and
+///   repeat iteration.
+/// - `all_reduce` per node: `overlap_all_reduce.overlap_bus_gib_per_sec`
+///   divided by its `isolated_bus_gib_per_sec` companion of the same
+///   repeat (same communicator, measured seconds apart — the phase-3 NCCL
+///   sweep is a different topology and only exists on rank 0, so it cannot
+///   serve as the denominator).
+///
+/// A ratio is only formed from finite numbers over a positive baseline; a
+/// missing or degenerate baseline yields no record rather than a lie.
+/// Idempotent: a host that already carries retention records (a rebuilt
+/// document) derives nothing new.
+pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
+    if obs
+        .metrics
+        .iter()
+        .any(|record| record.test == TestId::OverlapRetention)
+    {
+        return Vec::new();
+    }
+
+    // Baselines keyed by (repeat, scope label, metric name).
+    let mut gemm_baselines: BTreeMap<(u32, String, &str), f64> = BTreeMap::new();
+    let mut bus_baselines: BTreeMap<u32, f64> = BTreeMap::new();
+    for record in &obs.metrics {
+        if !(record.value.is_finite() && record.value > 0.0) {
+            continue;
+        }
+        match record.test {
+            TestId::GpuGemmPerf if record.name.starts_with("gflops_") => {
+                gemm_baselines.insert(
+                    (
+                        record.repeat,
+                        scope_label(&record.scope).unwrap_or_default(),
+                        record.name.as_str(),
+                    ),
+                    record.value,
+                );
+            }
+            TestId::OverlapAllReduce if record.name == "isolated_bus_gib_per_sec" => {
+                bus_baselines.insert(record.repeat, record.value);
+            }
+            _ => {}
+        }
+    }
+
+    let mut derived = Vec::new();
+    for record in &obs.metrics {
+        if !record.value.is_finite() {
+            continue;
+        }
+        match record.test {
+            TestId::OverlapGemm if record.name.starts_with("gflops_") => {
+                let key = (
+                    record.repeat,
+                    scope_label(&record.scope).unwrap_or_default(),
+                    record.name.as_str(),
+                );
+                if let Some(baseline) = gemm_baselines.get(&key) {
+                    let dtype = record.name.trim_start_matches("gflops_");
+                    derived.push(MetricRecord {
+                        test: TestId::OverlapRetention,
+                        scope: record.scope.clone(),
+                        name: format!("gemm_{dtype}"),
+                        value: record.value / baseline,
+                        unit: Unit::Ratio,
+                        repeat: record.repeat,
+                    });
+                }
+            }
+            TestId::OverlapAllReduce if record.name == "overlap_bus_gib_per_sec" => {
+                if let Some(baseline) = bus_baselines.get(&record.repeat) {
+                    derived.push(MetricRecord {
+                        test: TestId::OverlapRetention,
+                        scope: record.scope.clone(),
+                        name: "all_reduce".to_string(),
+                        value: record.value / baseline,
+                        unit: Unit::Ratio,
+                        repeat: record.repeat,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    derived
+}
+
 pub fn verdict(results: &RunResults) -> Verdict {
     if !results.fleet.failed_hosts.is_empty() {
         return Verdict::HostFailures;
@@ -433,11 +572,49 @@ pub fn verdict(results: &RunResults) -> Verdict {
         .barrier_stragglers
         .values()
         .any(|flagged| !flagged.is_empty());
-    if has_failed_tests || has_outliers || has_violations || has_barrier_stragglers {
+    let has_counter_findings = results
+        .fleet
+        .counter_findings
+        .values()
+        .any(|findings| !findings.is_empty());
+    if has_failed_tests
+        || has_outliers
+        || has_violations
+        || has_barrier_stragglers
+        || has_counter_findings
+    {
         Verdict::Stragglers
     } else {
         Verdict::Clean
     }
+}
+
+/// Error counters that went up under load, per host. Zero deltas stay in
+/// the raw `counter_deltas`; negative deltas are resets, not errors.
+fn counter_findings(
+    observations: &BTreeMap<String, HostObservations>,
+) -> BTreeMap<String, Vec<CounterFinding>> {
+    let mut findings = BTreeMap::new();
+    for (host, obs) in observations {
+        let Some(CounterDeltas { deltas }) = &obs.counter_deltas else {
+            continue;
+        };
+        let increments: Vec<CounterFinding> = deltas
+            .iter()
+            .filter(|delta| delta.after > delta.before)
+            .map(|delta| CounterFinding {
+                domain: delta.domain,
+                device: delta.device.clone(),
+                counter: delta.counter.clone(),
+                before: delta.before,
+                after: delta.after,
+            })
+            .collect();
+        if !increments.is_empty() {
+            findings.insert(host.clone(), increments);
+        }
+    }
+    findings
 }
 
 /// Every metric in the fleet, bucketed into comparison groups.
@@ -457,6 +634,42 @@ fn group_samples(
         }
     }
     groups
+}
+
+/// Tests whose Failed outcomes mean data corruption rather than degraded
+/// performance. They share a dedicated report section because they are the
+/// findings that silently poison training runs.
+fn is_sdc_test(test: TestId) -> bool {
+    matches!(
+        test,
+        TestId::CpuCorrectness
+            | TestId::CpuSdcHot
+            | TestId::GpuGemmCorrectness
+            | TestId::GpuGemmSdc
+    )
+}
+
+/// Failed correctness-screen outcomes, grouped by test display name.
+/// Derived from `hosts[].outcomes` (never a second source of truth) so JSON
+/// consumers get the hard findings without re-scanning every outcome.
+fn sdc_failures(
+    observations: &BTreeMap<String, HostObservations>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (host, obs) in observations {
+        for (test, scope, outcome) in &obs.outcomes {
+            if !is_sdc_test(*test) {
+                continue;
+            }
+            if let TestOutcome::Failed { reason } = outcome {
+                failures
+                    .entry(test_display_name(*test).to_string())
+                    .or_default()
+                    .push(format!("{}: {reason}", sample_key(host, scope)));
+            }
+        }
+    }
+    failures
 }
 
 fn violates(bound: &Bound, value: f64) -> bool {
@@ -742,9 +955,11 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     )?;
 
     render_hosts(results, out)?;
+    render_sdc(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
     render_barrier_stragglers(results, out)?;
+    render_counter_findings(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
     render_failures(results, out)?;
@@ -777,6 +992,7 @@ fn render_hosts(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "dram gib/s",
         "gpu hbm gib/s",
         "gpu gflops (min)",
+        "overlap ret (min)",
     ]);
     for (host, obs) in &results.hosts {
         let (passed, failed, skipped) = outcome_counts(obs);
@@ -799,9 +1015,32 @@ fn render_hosts(results: &RunResults, out: &mut dyn Write) -> Result<()> {
                 })
                 .filter(|text| !text.is_empty())
                 .unwrap_or_else(|| "-".into()),
+            min_overlap_retention(obs)
+                .map_or_else(|| "-".into(), |retention| format!("{retention:.2}")),
         ]);
     }
     section(out, "hosts", &table)
+}
+
+/// The host's worst overlap retention ratio: min across every derived
+/// `overlap_retention` subject of the per-subject median across repeats.
+fn min_overlap_retention(obs: &HostObservations) -> Option<f64> {
+    let mut per_subject: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    for record in &obs.metrics {
+        if record.test == TestId::OverlapRetention && record.value.is_finite() {
+            per_subject
+                .entry((
+                    record.name.clone(),
+                    scope_label(&record.scope).unwrap_or_default(),
+                ))
+                .or_default()
+                .push(record.value);
+        }
+    }
+    per_subject
+        .into_values()
+        .filter_map(|values| stats::median(&values))
+        .reduce(f64::min)
 }
 
 fn outcome_counts(obs: &HostObservations) -> (usize, usize, usize) {
@@ -814,6 +1053,23 @@ fn outcome_counts(obs: &HostObservations) -> (usize, usize, usize) {
         }
     }
     counts
+}
+
+/// Hard correctness findings get their own section, above the
+/// fleet-relative noise: a node computing wrong answers is never "just an
+/// outlier".
+fn render_sdc(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.sdc_failures.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&["test", "subject", "reason"]);
+    for (group, entries) in &results.fleet.sdc_failures {
+        for entry in entries {
+            let (subject, reason) = entry.split_once(": ").unwrap_or((entry.as_str(), ""));
+            table.add_row(vec![group.clone(), subject.to_string(), reason.to_string()]);
+        }
+    }
+    section(out, "silent data corruption (hard failures)", &table)
 }
 
 fn render_outliers(results: &RunResults, out: &mut dyn Write) -> Result<()> {
@@ -875,6 +1131,31 @@ fn render_barrier_stragglers(results: &RunResults, out: &mut dyn Write) -> Resul
         }
     }
     section(out, "barrier stragglers (slowest-rank tally)", &table)
+}
+
+/// Only counters that actually incremented appear; a run with no findings
+/// omits the section entirely (the full delta list lives in the JSON).
+fn render_counter_findings(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.counter_findings.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&[
+        "host", "domain", "device", "counter", "before", "after", "+",
+    ]);
+    for (host, findings) in &results.fleet.counter_findings {
+        for finding in findings {
+            table.add_row(vec![
+                host.clone(),
+                finding.domain.label().to_string(),
+                finding.device.clone(),
+                finding.counter.clone(),
+                finding.before.to_string(),
+                finding.after.to_string(),
+                format!("+{}", finding.after.saturating_sub(finding.before)),
+            ]);
+        }
+    }
+    section(out, "error-counter deltas (across load phases)", &table)
 }
 
 fn render_violations(results: &RunResults, out: &mut dyn Write) -> Result<()> {

@@ -109,14 +109,14 @@ straggler experiences.
    count toward the `Stragglers` verdict and render as their own table
    section.
 
-## Wire / protocol changes (proto v2, schema v3)
+## Wire / protocol changes (proto v5, schema v6)
 
-- `PROTO_VERSION` 1 → 2: `NcclDirective::{Lead,Participate}` gain
+- `PROTO_VERSION` 4 → 5: `NcclDirective::{Lead,Participate}` gain
   `barrier: Option<BarrierSpec>` (serde-defaulted, so old documents still
   decode), and `AgentEvent::NcclBarrierTimings` is new. Participants now
   emit `Hello` before their timings.
 - `TestId::{NcclBarrier,TcpBarrier}` ("nccl_barrier" / "tcp_barrier").
-- `SCHEMA_VERSION` 2 → 3: `RunResults.fleet.barrier_stragglers`
+- `SCHEMA_VERSION` 5 → 6: `RunResults.fleet.barrier_stragglers`
   (serde-defaulted; pre-v3 documents load with it empty).
 - TCP barrier wire format: client hello `[0xB7][rank: u32 be]`, then per
   iteration one release byte (0x52) answered by one ack byte (0x41);
@@ -132,12 +132,12 @@ straggler experiences.
 - `src/agent/nccl.rs` — barrier loop after the sweep (gpu feature only);
   participants emit Hello + `NcclBarrierTimings`.
 - `src/proto.rs` — `BarrierSpec`, `NcclBarrierTimings`, new `TestId`s,
-  `PROTO_VERSION` 2.
+  `PROTO_VERSION` 5.
 - `src/orchestrator/mod.rs` — barrier spec in directives, timing
   interception, `emit_barrier_metrics`, `tcp_barrier_sweep`.
 - `src/orchestrator/collect.rs` — stray `NcclBarrierTimings` ignored.
 - `src/report/mod.rs` — `barrier_stragglers` field + flagging rule +
-  verdict + table section, `SCHEMA_VERSION` 3.
+  verdict + table section, `SCHEMA_VERSION` 6.
 - `src/config.rs` — `tests.barrier_iters` (2000), `tests.barrier_bytes`
   (8), `thresholds.barrier_slowest_frac` (0.5, validated in (0, 1]).
 - `src/cli.rs` — `agent barrier serve|join`.
