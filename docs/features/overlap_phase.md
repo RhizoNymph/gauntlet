@@ -124,10 +124,16 @@ without a GPU):
   rank runs identical batches, so the floor decides identically everywhere
   and can never split the group.
 - **Follower failsafe** (`failsafe_secs`: 2× the window budget, floor
-  10s): a follower whose lead never closes the window ends the protocol
-  with a structured error instead of hammering the fabric until an
-  external kill. It only helps while collectives still complete; a rank
-  blocked *inside* a collective is reaped by the orchestrator's phase
+  10s; trip decision in `failsafe_tripped`): a follower that has never
+  *seen* the lead's close signal by the failsafe ends the protocol with a
+  structured error instead of hammering the fabric until an external
+  kill. Observing the close word disarms the failsafe — the lead is
+  provably alive and the iteration floor bounds the loop — so a degraded
+  fabric where the floor legitimately outlasts the failsafe (e.g. 5s
+  baseline, seconds-per-iteration link) runs to its floor instead of
+  being cut down mid-consensus. It only helps while collectives still
+  complete; a rank blocked *inside* a collective (including one whose
+  lead died after signaling close) is reaped by the orchestrator's phase
   timeout, as before.
 - Control steps and the alignment round stay outside the bandwidth tally
   (`WindowTally`), so per-iteration timings measure the payload collective
@@ -232,7 +238,8 @@ self-contained).
   solely by rank 0's clock through the MIN-reduced control word (subject
   to the deterministic iteration floor); followers never consult their own
   clocks except for the dead-lead failsafe, which ends the protocol with
-  an error rather than closing a window.
+  an error rather than closing a window and disarms permanently once the
+  lead's close signal has been observed.
 - Every tallied window figure rests on at least `MIN_WINDOW_ITERS` payload
   iterations, measured from an aligned start (untallied alignment round).
 - A failed fleet-overlap NCCL group, rank, or gate is visible in the

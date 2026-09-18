@@ -77,14 +77,27 @@ pub fn should_close(reduced_min: f32, tallied_iters: u64) -> bool {
 pub const FAILSAFE_FLOOR_SECS: u64 = 10;
 
 /// Follower failsafe budget for one window, in seconds: if the lead has
-/// not closed the window within twice its configured duration (with a
-/// floor), the lead is presumed dead and the follower must end the
-/// protocol with a structured error instead of hammering the fabric until
-/// an external kill. Only helps while collectives still complete — a rank
-/// blocked *inside* a collective can only be reaped by the orchestrator's
-/// phase timeout.
+/// not been seen to *signal* close within twice the window's configured
+/// duration (with a floor), the lead is presumed dead and the follower
+/// must end the protocol with a structured error instead of hammering the
+/// fabric until an external kill. Only helps while collectives still
+/// complete — a rank blocked *inside* a collective can only be reaped by
+/// the orchestrator's phase timeout.
 pub fn failsafe_secs(budget_secs: u64) -> u64 {
     budget_secs.saturating_mul(2).max(FAILSAFE_FLOOR_SECS)
+}
+
+/// Whether a follower should abandon the protocol: only while the lead's
+/// close signal has *never* been observed. Once the close word has been
+/// seen the lead is provably alive and the loop is bounded by the
+/// iteration floor — on a degraded fabric a window legitimately runs past
+/// the failsafe while it accumulates its floor, and cutting it down there
+/// would strand the other ranks in a blocking collective, the exact
+/// failure the failsafe exists to prevent. (A lead that dies *after*
+/// signaling close leaves ranks blocked inside a collective, which is the
+/// phase timeout's job.)
+pub fn failsafe_tripped(close_seen: bool, elapsed_secs: f64, failsafe_secs: u64) -> bool {
+    !close_seen && elapsed_secs > failsafe_secs as f64
 }
 
 /// Payload-iteration accounting for one consensus window. Only payload
@@ -173,6 +186,21 @@ mod tests {
         assert!(should_close(closed, MIN_WINDOW_ITERS + 100));
         // No amount of iterations closes a window the lead holds open.
         assert!(!should_close(CONTROL_OPEN, u64::MAX));
+    }
+
+    #[test]
+    fn the_failsafe_never_trips_once_the_close_signal_was_seen() {
+        // Degraded-fabric scenario the iteration floor was added for: a
+        // healthy lead signaled close at its 5s deadline, but slow
+        // iterations hold the window open past the 10s failsafe while the
+        // floor accumulates. The follower must keep going.
+        assert!(!failsafe_tripped(true, 25.0, 10));
+        // A lead that has never signaled close past the failsafe is
+        // presumed dead.
+        assert!(failsafe_tripped(false, 10.5, 10));
+        // Before the failsafe elapses nothing trips either way.
+        assert!(!failsafe_tripped(false, 9.5, 10));
+        assert!(!failsafe_tripped(true, 9.5, 10));
     }
 
     #[test]

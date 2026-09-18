@@ -609,8 +609,9 @@ pub mod imp {
 
         let started = Instant::now();
         let deadline = started + Duration::from_secs(budget_secs.max(1));
-        let failsafe = Duration::from_secs(window::failsafe_secs(budget_secs));
+        let failsafe_secs = window::failsafe_secs(budget_secs);
         let mut tally = WindowTally::default();
+        let mut close_seen = false;
         loop {
             let batch = Instant::now();
             payload_batch(stream, comm, send, recv)?;
@@ -626,18 +627,27 @@ pub mod imp {
             stream.synchronize()?;
             let reduced = stream.clone_dtoh(ctrl_recv)?;
             let word = reduced.first().copied().unwrap_or(window::CONTROL_CLOSE);
+            close_seen |= window::window_closed(word);
             if window::should_close(word, tally.iters()) {
                 return Ok(tally.per_iter_secs());
             }
-            // Failsafe: a follower whose lead never closes the window (a
+            // Failsafe: a follower whose lead has never *signaled* close (a
             // dead rank 0 whose collectives still drain, a wedged clock)
             // must end the protocol with an error instead of hammering the
-            // fabric until an external kill. The lead needs no failsafe —
-            // its own deadline plus the iteration floor bound the loop.
-            if role == WindowRole::Follower && started.elapsed() > failsafe {
+            // fabric until an external kill. Once the close word has been
+            // seen the lead is provably alive and the iteration floor
+            // bounds the loop, so a slow window on a degraded fabric runs
+            // to its floor instead of being cut down here. The lead needs
+            // no failsafe — its own deadline plus the floor bound the loop.
+            if role == WindowRole::Follower
+                && window::failsafe_tripped(
+                    close_seen,
+                    started.elapsed().as_secs_f64(),
+                    failsafe_secs,
+                )
+            {
                 bail!(
-                    "fleet overlap window failsafe: no close signal from rank 0 within {}s",
-                    failsafe.as_secs()
+                    "fleet overlap window failsafe: no close signal from rank 0 within {failsafe_secs}s"
                 );
             }
         }
