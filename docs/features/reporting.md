@@ -158,6 +158,17 @@ tail progress:
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
+## Error-counter findings (schema v3)
+
+`hosts.*.counter_deltas` carries the full per-node error-counter delta
+list across the load phases (zeros and resets included);
+`fleet.counter_findings` keeps only counters with `after > before`, keyed
+by host. Any finding makes the verdict at least Stragglers. `render_table`
+adds an "error-counter deltas (across load phases)" section (host, domain,
+device, counter, before, after, +increment), omitted entirely when there
+are no findings. See docs/features/counter_deltas.md for collection and
+scheduling.
+
 ## Repeats and distribution moments (schema v2)
 
 `gauntlet run --repeat N` executes the measurement phases N times over the

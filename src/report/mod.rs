@@ -19,13 +19,20 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig};
 use crate::orchestrator::collect::HostObservations;
-use crate::proto::{MetricRecord, Scope, TestId, TestOutcome, Unit, consistency_fields};
+use crate::proto::{
+    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
+    consistency_fields,
+};
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
-// v3: overlap phase — `overlap_gemm` / `overlap_all_reduce` metrics and
+// v3: hot SDC screens — `fleet.sdc_failures` plus the `cpu_sdc_hot` /
+// `gpu_gemm_sdc` test groups appearing in outcomes and metrics.
+// v4: per-host error-counter deltas (`hosts.*.counter_deltas`) and
+// `fleet.counter_findings`.
+// v5: overlap phase — `overlap_gemm` / `overlap_all_reduce` metrics and
 // derived `overlap_retention` records appended to host metric lists.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Bytes per GiB, for turning a GiB/s reading into microseconds per byte.
 const BYTES_PER_GIB: f64 = (1u64 << 30) as f64;
@@ -80,6 +87,31 @@ pub struct FleetAnalysis {
     /// does not affect the verdict. Empty unless the run used `--repeat`.
     #[serde(default)]
     pub jitter_outliers: BTreeMap<String, Vec<Outlier>>,
+    /// Silent-data-corruption findings: Failed outcomes from the
+    /// correctness screens (isolated and hot), grouped by test display
+    /// name; entries are "host[:scope]: reason". Hard failures — these are
+    /// absolute findings on a node, never fleet-relative outliers, and any
+    /// entry makes the verdict at least `Stragglers`.
+    #[serde(default)]
+    pub sdc_failures: BTreeMap<String, Vec<String>>,
+    /// Error counters that incremented across the load phases, per host.
+    /// Any positive increment is a finding (marginal hardware accumulating
+    /// errors under load); zero and negative deltas stay in
+    /// `hosts.*.counter_deltas` only.
+    #[serde(default)]
+    pub counter_findings: BTreeMap<String, Vec<CounterFinding>>,
+}
+
+/// One error counter that went up between the pre-load and post-load
+/// snapshots on a node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterFinding {
+    pub domain: CounterDomain,
+    /// The hardware unit: PCI address, "gpu0", "mc0/dimm1", "mlx5_0/1", ...
+    pub device: String,
+    pub counter: String,
+    pub before: u64,
+    pub after: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -142,10 +174,12 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::Inventory => "inventory",
         TestId::CpuCorrectness => "cpu_correctness",
         TestId::CpuGflops => "cpu_gflops",
+        TestId::CpuSdcHot => "cpu_sdc_hot",
         TestId::MemBandwidth => "mem_bandwidth",
         TestId::DiskIo => "disk_io",
         TestId::GpuGemmCorrectness => "gpu_gemm_correctness",
         TestId::GpuGemmPerf => "gpu_gemm_perf",
+        TestId::GpuGemmSdc => "gpu_gemm_sdc",
         TestId::GpuMemBandwidth => "gpu_mem_bandwidth",
         TestId::GpuP2p => "gpu_p2p",
         TestId::NetLatency => "net_latency",
@@ -284,6 +318,8 @@ pub fn build(
         consistency: consistency_findings(&observations),
         failed_hosts,
         jitter_outliers,
+        sdc_failures: sdc_failures(&observations),
+        counter_findings: counter_findings(&observations),
     };
     let calibration = Calibration {
         rooflines: rooflines(&observations),
@@ -466,11 +502,44 @@ pub fn verdict(results: &RunResults) -> Verdict {
         .threshold_violations
         .values()
         .any(|violators| !violators.is_empty());
-    if has_failed_tests || has_outliers || has_violations {
+    let has_counter_findings = results
+        .fleet
+        .counter_findings
+        .values()
+        .any(|findings| !findings.is_empty());
+    if has_failed_tests || has_outliers || has_violations || has_counter_findings {
         Verdict::Stragglers
     } else {
         Verdict::Clean
     }
+}
+
+/// Error counters that went up under load, per host. Zero deltas stay in
+/// the raw `counter_deltas`; negative deltas are resets, not errors.
+fn counter_findings(
+    observations: &BTreeMap<String, HostObservations>,
+) -> BTreeMap<String, Vec<CounterFinding>> {
+    let mut findings = BTreeMap::new();
+    for (host, obs) in observations {
+        let Some(CounterDeltas { deltas }) = &obs.counter_deltas else {
+            continue;
+        };
+        let increments: Vec<CounterFinding> = deltas
+            .iter()
+            .filter(|delta| delta.after > delta.before)
+            .map(|delta| CounterFinding {
+                domain: delta.domain,
+                device: delta.device.clone(),
+                counter: delta.counter.clone(),
+                before: delta.before,
+                after: delta.after,
+            })
+            .collect();
+        if !increments.is_empty() {
+            findings.insert(host.clone(), increments);
+        }
+    }
+    findings
 }
 
 /// Every metric in the fleet, bucketed into comparison groups.
@@ -490,6 +559,42 @@ fn group_samples(
         }
     }
     groups
+}
+
+/// Tests whose Failed outcomes mean data corruption rather than degraded
+/// performance. They share a dedicated report section because they are the
+/// findings that silently poison training runs.
+fn is_sdc_test(test: TestId) -> bool {
+    matches!(
+        test,
+        TestId::CpuCorrectness
+            | TestId::CpuSdcHot
+            | TestId::GpuGemmCorrectness
+            | TestId::GpuGemmSdc
+    )
+}
+
+/// Failed correctness-screen outcomes, grouped by test display name.
+/// Derived from `hosts[].outcomes` (never a second source of truth) so JSON
+/// consumers get the hard findings without re-scanning every outcome.
+fn sdc_failures(
+    observations: &BTreeMap<String, HostObservations>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (host, obs) in observations {
+        for (test, scope, outcome) in &obs.outcomes {
+            if !is_sdc_test(*test) {
+                continue;
+            }
+            if let TestOutcome::Failed { reason } = outcome {
+                failures
+                    .entry(test_display_name(*test).to_string())
+                    .or_default()
+                    .push(format!("{}: {reason}", sample_key(host, scope)));
+            }
+        }
+    }
+    failures
 }
 
 fn violates(bound: &Bound, value: f64) -> bool {
@@ -775,8 +880,10 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     )?;
 
     render_hosts(results, out)?;
+    render_sdc(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
+    render_counter_findings(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
     render_failures(results, out)?;
@@ -872,6 +979,23 @@ fn outcome_counts(obs: &HostObservations) -> (usize, usize, usize) {
     counts
 }
 
+/// Hard correctness findings get their own section, above the
+/// fleet-relative noise: a node computing wrong answers is never "just an
+/// outlier".
+fn render_sdc(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.sdc_failures.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&["test", "subject", "reason"]);
+    for (group, entries) in &results.fleet.sdc_failures {
+        for entry in entries {
+            let (subject, reason) = entry.split_once(": ").unwrap_or((entry.as_str(), ""));
+            table.add_row(vec![group.clone(), subject.to_string(), reason.to_string()]);
+        }
+    }
+    section(out, "silent data corruption (hard failures)", &table)
+}
+
 fn render_outliers(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     if results.fleet.outliers.is_empty() {
         writeln!(out, "\noutliers: none")?;
@@ -913,6 +1037,31 @@ fn render_jitter(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "jitter outliers (fleet-relative run-to-run spread)",
         &table,
     )
+}
+
+/// Only counters that actually incremented appear; a run with no findings
+/// omits the section entirely (the full delta list lives in the JSON).
+fn render_counter_findings(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    if results.fleet.counter_findings.is_empty() {
+        return Ok(());
+    }
+    let mut table = new_table(&[
+        "host", "domain", "device", "counter", "before", "after", "+",
+    ]);
+    for (host, findings) in &results.fleet.counter_findings {
+        for finding in findings {
+            table.add_row(vec![
+                host.clone(),
+                finding.domain.label().to_string(),
+                finding.device.clone(),
+                finding.counter.clone(),
+                finding.before.to_string(),
+                finding.after.to_string(),
+                format!("+{}", finding.after.saturating_sub(finding.before)),
+            ]);
+        }
+    }
+    section(out, "error-counter deltas (across load phases)", &table)
 }
 
 fn render_violations(results: &RunResults, out: &mut dyn Write) -> Result<()> {

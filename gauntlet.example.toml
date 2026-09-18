@@ -24,6 +24,9 @@ phase_timeout_secs = 900
 gemm_secs = 30
 gemm_dim = 8192
 gemm_dtypes = ["f32", "bf16", "f16"]
+# Hot SDC screens: correctness checked *under* thermal load. 0 disables.
+gemm_sdc_check_secs = 5      # loaded secs between bitwise checks in the sustained GEMM
+cpu_sdc_hot_secs = 10        # all-core correctness-under-power screen duration
 disk_paths = ["/tmp"]
 net_port_base = 29500
 overlap_secs = 30            # combined GEMM + all-reduce window

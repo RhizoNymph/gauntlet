@@ -140,6 +140,7 @@ fn overlap_task_spec_round_trips() {
         cpu: CpuTaskSpec {
             correctness_secs_per_core: 1,
             gflops_secs: 1,
+            sdc_hot_secs: 0,
         },
         mem: MemTaskSpec {
             buffer_bytes_per_numa: 1 << 20,
@@ -154,6 +155,7 @@ fn overlap_task_spec_round_trips() {
             gemm_dtypes: vec![GemmDtype::Bf16],
             gemm_dim: 2048,
             bandwidth_bytes: 1 << 20,
+            sdc_check_secs: 0,
         },
         overlap: OverlapTaskSpec {
             duration_secs: 30,
@@ -162,6 +164,7 @@ fn overlap_task_spec_round_trips() {
             gemm_dtype: GemmDtype::Bf16,
             msg_bytes: 64 << 20,
         },
+        counters: None,
     };
     let json = serde_json::to_string(&spec).expect("serialize");
     let back: AgentTaskSpec = serde_json::from_str(&json).expect("deserialize");
@@ -192,6 +195,79 @@ fn overlap_metric_events_round_trip() {
         let back = decode_event(&encode_event(&event)).expect("round trip");
         assert_eq!(back, event);
     }
+}
+
+#[test]
+fn sdc_events_round_trip() {
+    let events = vec![
+        AgentEvent::Outcome {
+            test: TestId::CpuSdcHot,
+            scope: Scope::Core { id: 5 },
+            outcome: TestOutcome::Failed {
+                reason: "2 mismatches over 811 hot rounds".into(),
+            },
+        },
+        AgentEvent::Outcome {
+            test: TestId::GpuGemmSdc,
+            scope: Scope::Gpu { index: 1 },
+            outcome: TestOutcome::Failed {
+                reason: "bf16: check #3 deviated by 1.2e-1 at 1410 MHz / 84 C".into(),
+            },
+        },
+        AgentEvent::Metric {
+            record: MetricRecord {
+                test: TestId::GpuGemmSdc,
+                scope: Scope::Gpu { index: 0 },
+                name: "mismatches_f32".into(),
+                value: 0.0,
+                unit: Unit::Count,
+                repeat: 0,
+            },
+        },
+    ];
+    for event in events {
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
+}
+
+#[test]
+fn task_spec_sdc_fields_round_trip() {
+    use gauntlet::proto::AgentTaskSpec;
+    let spec: AgentTaskSpec = serde_json::from_str(
+        r#"{
+            "phases": ["cpu_mem", "gpu"],
+            "cpu": {"correctness_secs_per_core": 5, "gflops_secs": 5, "sdc_hot_secs": 8},
+            "mem": {"buffer_bytes_per_numa": 1048576, "iters": 3},
+            "disk": {"paths": [], "file_bytes": 0},
+            "gpu": {"gemm_secs": 30, "gemm_dtypes": ["f32"], "gemm_dim": 4096,
+                    "bandwidth_bytes": 1048576, "sdc_check_secs": 5},
+            "overlap": {"duration_secs": 30, "baseline_secs": 5, "gemm_dim": 4096,
+                        "gemm_dtype": "f32", "msg_bytes": 1048576}
+        }"#,
+    )
+    .expect("spec with sdc fields decodes");
+    assert_eq!(spec.cpu.sdc_hot_secs, 8);
+    assert_eq!(spec.gpu.sdc_check_secs, 5);
+
+    let text = serde_json::to_string(&spec).expect("encode");
+    let back: AgentTaskSpec = serde_json::from_str(&text).expect("decode");
+    assert_eq!(back, spec);
+}
+
+/// v1 task specs (no sdc fields) must keep decoding: absence means disabled.
+#[test]
+fn task_spec_sdc_fields_default_to_disabled() {
+    use gauntlet::proto::{CpuTaskSpec, GpuTaskSpec};
+    let cpu: CpuTaskSpec =
+        serde_json::from_str(r#"{"correctness_secs_per_core": 5, "gflops_secs": 5}"#)
+            .expect("v1 cpu spec decodes");
+    assert_eq!(cpu.sdc_hot_secs, 0);
+    let gpu: GpuTaskSpec = serde_json::from_str(
+        r#"{"gemm_secs": 30, "gemm_dtypes": [], "gemm_dim": 4096, "bandwidth_bytes": 1}"#,
+    )
+    .expect("v1 gpu spec decodes");
+    assert_eq!(gpu.sdc_check_secs, 0);
 }
 
 #[test]

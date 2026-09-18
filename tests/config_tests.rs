@@ -171,3 +171,26 @@ fn task_spec_converts_units() {
     assert_eq!(spec.disk.file_bytes, 3 * 1024 * 1024);
     assert_eq!(spec.gpu.bandwidth_bytes, 5 * 1024 * 1024);
 }
+
+#[test]
+fn hot_sdc_knobs_default_on_and_flow_into_the_spec() {
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    let spec = config.task_spec(&[Phase::CpuMem, Phase::Gpu]);
+    // The hot screens default to enabled: they only matter on fleets that
+    // never touch the config knobs.
+    assert!(spec.cpu.sdc_hot_secs > 0);
+    assert!(spec.gpu.sdc_check_secs > 0);
+
+    let tuned = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        cpu_sdc_hot_secs = 7
+        gemm_sdc_check_secs = 0
+        "#,
+    )
+    .expect("config");
+    let spec = tuned.task_spec(&[Phase::CpuMem, Phase::Gpu]);
+    assert_eq!(spec.cpu.sdc_hot_secs, 7);
+    assert_eq!(spec.gpu.sdc_check_secs, 0);
+}

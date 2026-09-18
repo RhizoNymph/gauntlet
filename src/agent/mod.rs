@@ -4,6 +4,7 @@
 //! nothing in agent mode may print to stdout except through `EventSink`.
 //! Logs go to stderr via `tracing`.
 
+pub mod counters;
 pub mod cpu;
 pub mod disk;
 pub mod inventory;
@@ -118,6 +119,11 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             return Err(error);
         }
         sink.emit(&AgentEvent::PhaseEnd { phase: *phase });
+    }
+    // Counter passes run after any listed phases; the orchestrator sends
+    // them as dedicated invocations with an empty phase list.
+    if let Some(request) = &spec.counters {
+        counters::run(&sink, request);
     }
     Ok(())
 }

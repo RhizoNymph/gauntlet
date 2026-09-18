@@ -11,9 +11,16 @@
 //! comparison, never bit-exactness. The residual VALUE is the straggler
 //! signal fleet-wide even when it passes.
 //!
-//! Throughput: repeated GEMM for `gemm_secs` wall seconds; report sustained
-//! (not first-iteration) GFLOPS per GPU+dtype under `gpu_gemm_perf.gflops`;
-//! metric name carries the dtype: "gflops_f32", "gflops_bf16", ...
+//! Throughput: repeated GEMM for `gemm_secs` of loaded (busy) time; report
+//! sustained (not first-iteration) GFLOPS per GPU+dtype under
+//! `gpu_gemm_perf.gflops`; metric name carries the dtype: "gflops_f32",
+//! "gflops_bf16", ...
+//!
+//! Hot SDC: during the sustained loop the output is verified bitwise against
+//! a baseline every `sdc_check_secs` of busy time (`gpu_gemm_sdc`, see the
+//! `sdc` module) — SDC is temperature/voltage dependent, so correctness must
+//! be checked at load temperature, not just at start-of-phase. Verification
+//! runs between timed windows so it never pollutes the GFLOPS figure.
 
 use std::ffi::c_void;
 use std::process::Command;
@@ -30,6 +37,7 @@ use cudarc::driver::{
 use half::{bf16, f16};
 
 use crate::agent::EventSink;
+use crate::agent::gpu::sdc::{self, CheckScheduler, SdcStats};
 use crate::proto::{GemmDtype, GpuTaskSpec, MetricRecord, Scope, TestId, TestOutcome, Unit};
 
 /// Per-dtype residual tolerance for correctness classification.
@@ -541,16 +549,7 @@ pub fn run_on_gpu(sink: &EventSink, gpu_index: u32, spec: &GpuTaskSpec) -> Resul
     // stopped and joined before the result is propagated.
     let sampler = ClockSampler::start(gpu_index);
     let sustained = sustained_pass(
-        sink,
-        &scope,
-        &blas,
-        &stream,
-        &mut c_dev,
-        &host_a,
-        &host_b,
-        dtypes,
-        n,
-        spec.gemm_secs,
+        sink, &scope, &blas, &stream, &mut c_dev, &host_a, &host_b, dtypes, n, spec, gpu_index,
     );
     let samples = sampler.map(ClockSampler::finish).unwrap_or_default();
 
@@ -577,13 +576,22 @@ pub fn run_on_gpu(sink: &EventSink, gpu_index: u32, spec: &GpuTaskSpec) -> Resul
 
     // Telemetry is emitted even when a dtype's sustained run failed: the
     // clocks are what explain the failure.
-    sustained?;
+    let sdc_summary = sustained?;
+    // Hot-SDC verdict: any bitwise mismatch during the loaded window is a
+    // hard per-GPU failure, with the clock/temperature at each failure in
+    // the reason.
+    sink.outcome(
+        TestId::GpuGemmSdc,
+        scope.clone(),
+        sdc::summary_outcome(spec.sdc_check_secs > 0, &sdc_summary),
+    );
     sink.outcome(TestId::GpuGemmPerf, scope, TestOutcome::Passed);
     Ok(())
 }
 
 /// The sustained-throughput half of `run_on_gpu`, split out so the telemetry
-/// thread is always joined regardless of how this returns.
+/// thread is always joined regardless of how this returns. Returns the hot
+/// SDC accounting per dtype for the per-GPU verdict.
 #[allow(clippy::too_many_arguments)]
 fn sustained_pass(
     sink: &EventSink,
@@ -595,15 +603,25 @@ fn sustained_pass(
     host_b: &[f32],
     dtypes: &[GemmDtype],
     n: usize,
-    secs: u64,
-) -> Result<()> {
+    spec: &GpuTaskSpec,
+    gpu_index: u32,
+) -> Result<Vec<(&'static str, SdcStats)>> {
+    let mut summary = Vec::with_capacity(dtypes.len());
     for &dtype in dtypes {
         let tag = dtype_tag(dtype);
         let operands = upload_operands(stream, host_a, host_b, dtype)?;
-        let (a_ptr, b_ptr) = operands.device_ptrs(stream);
-        let c_ptr = write_ptr(c_dev, stream);
-        let gflops = sustained_gflops(blas, stream, dtype, n, secs, a_ptr, b_ptr, c_ptr)
-            .with_context(|| format!("sustained gemm ({tag})"))?;
+        let (gflops, stats) = sustained_gflops(
+            blas,
+            stream,
+            dtype,
+            n,
+            spec.gemm_secs,
+            &operands,
+            c_dev,
+            Duration::from_secs(spec.sdc_check_secs),
+            gpu_index,
+        )
+        .with_context(|| format!("sustained gemm ({tag})"))?;
         drop(operands);
         sink.metric(MetricRecord {
             test: TestId::GpuGemmPerf,
@@ -613,16 +631,53 @@ fn sustained_pass(
             unit: Unit::Gflops,
             repeat: 0,
         });
+        // Hot-SDC accounting per dtype: check and mismatch counts plus the
+        // worst absolute deviation (0.0 when clean, saturated when the
+        // deviation was unquantifiable).
+        for (name, value, unit) in [
+            (format!("checks_{tag}"), stats.checks as f64, Unit::Count),
+            (
+                format!("mismatches_{tag}"),
+                stats.mismatches as f64,
+                Unit::Count,
+            ),
+            (
+                format!("max_abs_dev_{tag}"),
+                stats.reportable_max_abs_dev(),
+                Unit::Residual,
+            ),
+        ] {
+            sink.metric(MetricRecord {
+                test: TestId::GpuGemmSdc,
+                scope: scope.clone(),
+                name,
+                value,
+                unit,
+                repeat: 0,
+            });
+        }
+        summary.push((tag, stats));
     }
-    Ok(())
+    Ok(summary)
 }
 
-/// Repeat the GEMM for `secs` wall seconds and report sustained GFLOPS.
+/// Repeat the GEMM for `secs` loaded seconds and report sustained GFLOPS,
+/// verifying the hot output bitwise against a baseline every
+/// `check_interval` of loaded time.
 ///
 /// Launches are queued in batches so kernel-launch latency does not dominate,
 /// and the stream is synchronized once per batch so the elapsed wall time
 /// covers completed work only — the reported number is steady-state, not the
 /// first (cold-clock) iteration.
+///
+/// Throughput accounting: the loop accumulates *busy* time (launch +
+/// synchronize windows only) and both the budget and the reported GFLOPS
+/// run against it, so verification overhead — the C download, the host
+/// compare, the telemetry query on failure — never pollutes the number.
+///
+/// The baseline is C after the first (warm-up) GEMM: cuBLAS produces
+/// bit-identical output for identical calls on the same GPU, so any later
+/// deviation is corruption under load (see `sdc` module docs).
 #[allow(clippy::too_many_arguments)]
 fn sustained_gflops(
     blas: &CudaBlas,
@@ -630,27 +685,62 @@ fn sustained_gflops(
     dtype: GemmDtype,
     n: usize,
     secs: u64,
-    a_ptr: driver_sys::CUdeviceptr,
-    b_ptr: driver_sys::CUdeviceptr,
-    c_ptr: driver_sys::CUdeviceptr,
-) -> Result<f64> {
-    // SAFETY (both launches): pointers come from live allocations on this
+    operands: &Operands,
+    c_dev: &mut CudaSlice<f32>,
+    check_interval: Duration,
+    gpu_index: u32,
+) -> Result<(f64, SdcStats)> {
+    let (a_ptr, b_ptr) = operands.device_ptrs(stream);
+    let c_ptr = write_ptr(c_dev, stream);
+    // SAFETY (all launches): pointers come from live allocations on this
     // stream's context, sized n*n as required by `launch_gemm`.
     unsafe { launch_gemm(blas, dtype, n as i32, a_ptr, b_ptr, c_ptr) }?;
     stream.synchronize()?;
 
+    let mut scheduler = CheckScheduler::new(check_interval);
+    let mut stats = SdcStats::default();
+    // The baseline download is skipped entirely when checks are disabled,
+    // so the disabled path costs nothing.
+    let baseline: Option<Vec<f32>> = if scheduler.enabled() {
+        Some(stream.clone_dtoh(c_dev)?)
+    } else {
+        None
+    };
+
     let budget = Duration::from_secs(secs.max(1));
-    let start = Instant::now();
+    let mut busy = Duration::ZERO;
     let mut iters = 0_u64;
-    while start.elapsed() < budget {
+    while busy < budget {
+        let window = Instant::now();
         for _ in 0..SUSTAINED_BATCH {
             unsafe { launch_gemm(blas, dtype, n as i32, a_ptr, b_ptr, c_ptr) }?;
         }
         stream.synchronize()?;
+        busy += window.elapsed();
         iters += SUSTAINED_BATCH;
+
+        if let Some(baseline) = &baseline
+            && scheduler.due(busy)
+        {
+            // Outside the timed window: this cost is excluded from `busy`.
+            let current = stream.clone_dtoh(c_dev)?;
+            let mismatch = sdc::bitwise_mismatch(baseline, &current);
+            // Clock/temperature are captured at the moment of failure —
+            // that context is the point of checking hot.
+            let telemetry = if mismatch.is_some() {
+                query_clocks(gpu_index)
+            } else {
+                None
+            };
+            stats.record(
+                mismatch,
+                telemetry.map(|sample| sample.clock_mhz),
+                telemetry.map(|sample| sample.temp_c),
+            );
+        }
     }
-    let elapsed = start.elapsed().as_secs_f64().max(1e-9);
-    Ok(sustained_gflops_value(n, iters, elapsed))
+    let elapsed = busy.as_secs_f64().max(1e-9);
+    Ok((sustained_gflops_value(n, iters, elapsed), stats))
 }
 
 /// 2·n³ flops per GEMM (one multiply and one add per inner-product term).

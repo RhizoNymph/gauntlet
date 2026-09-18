@@ -38,7 +38,8 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::proto::{
-    AgentEvent, InventorySnapshot, MetricRecord, NcclDirective, Phase, Scope, TestId, Unit,
+    AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, NcclDirective,
+    Phase, Scope, TestId, Unit,
 };
 use crate::report;
 
@@ -51,6 +52,9 @@ const PAIR_TIMEOUT_SLACK: Duration = Duration::from_secs(60);
 const PEER_BIND_DELAY: Duration = Duration::from_millis(500);
 /// How often the collector publishes a partial snapshot of a run in flight.
 const PARTIAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound on one error-counter pass (a handful of sysfs reads and
+/// bounded tool probes; nothing like a full phase).
+const COUNTER_PASS_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Observation plumbing
@@ -220,6 +224,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
     );
 
     let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
+    // Error-counter baselines, taken once before the first load phase; the
+    // matching delta pass runs after the last load phase of the last repeat.
+    let mut counter_baselines: BTreeMap<String, CounterSnapshot> = BTreeMap::new();
+    let mut counters_started = false;
     for repeat in 0..args.repeat {
         let sink = sink.with_repeat(repeat);
         if args.repeat > 1 {
@@ -229,6 +237,13 @@ pub async fn run(args: RunArgs) -> Result<()> {
             // The inventory is a census, not a measurement.
             if *phase == Phase::Inventory && repeat > 0 {
                 continue;
+            }
+            // Snapshot error counters after any leading inventory and
+            // before the first phase that puts the hardware under load.
+            if *phase != Phase::Inventory && !counters_started {
+                counters_started = true;
+                info!("counter baseline");
+                counter_baselines = counter_baseline_pass(&config, &sessions).await;
             }
             info!(?phase, "phase start");
             match phase {
@@ -253,6 +268,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
             info!(?phase, "phase end");
         }
+    }
+    if !counter_baselines.is_empty() {
+        info!("counter delta pass");
+        counter_delta_pass(&config, &sessions, &counter_baselines, &sink).await;
     }
 
     drop(sink);
@@ -462,6 +481,124 @@ async fn node_phase(
         }
     }
     inventories
+}
+
+// ---------------------------------------------------------------------------
+// Error-counter passes (baseline before load, deltas after)
+// ---------------------------------------------------------------------------
+
+/// Snapshot error counters on every host. Baselines are held here, not sent
+/// to the collector: they only exist to be handed back for the delta pass.
+/// Failures are logged and the host simply has no baseline (and therefore
+/// no deltas) — counter collection never fails a host.
+async fn counter_baseline_pass(
+    config: &FleetConfig,
+    sessions: &[Arc<HostSession>],
+) -> BTreeMap<String, CounterSnapshot> {
+    let mut spec = config.task_spec(&[]);
+    spec.counters = Some(CounterRequest::Baseline);
+    let document = match serde_json::to_string(&spec) {
+        Ok(document) => document,
+        Err(error) => {
+            warn!(%error, "cannot serialize the counter baseline spec; skipping counters");
+            return BTreeMap::new();
+        }
+    };
+
+    let mut tasks = JoinSet::new();
+    for session in sessions {
+        let session = Arc::clone(session);
+        let document = document.clone();
+        tasks.spawn(async move {
+            let addr = session.addr().to_string();
+            let mut baseline = None;
+            let outcome = tokio::time::timeout(
+                COUNTER_PASS_TIMEOUT,
+                session.run_agent(&["run"], Some(document), |event| {
+                    if let AgentEvent::CounterBaseline { snapshot } = event {
+                        baseline = Some(*snapshot);
+                    }
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
+                    warn!(host = %addr, %status, "counter baseline exited abnormally")
+                }
+                Ok(Err(error)) => warn!(host = %addr, %error, "counter baseline failed"),
+                Err(_) => warn!(host = %addr, "counter baseline timed out"),
+            }
+            (addr, baseline)
+        });
+    }
+
+    let mut baselines = BTreeMap::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((addr, Some(baseline))) => {
+                baselines.insert(addr, baseline);
+            }
+            Ok((_, None)) => {}
+            Err(error) => warn!(%error, "counter baseline task did not complete"),
+        }
+    }
+    baselines
+}
+
+/// Re-snapshot on every baselined host, diff on the agent, and feed the
+/// resulting `CounterDeltas` events into the collector.
+async fn counter_delta_pass(
+    config: &FleetConfig,
+    sessions: &[Arc<HostSession>],
+    baselines: &BTreeMap<String, CounterSnapshot>,
+    sink: &ObservationSink,
+) {
+    let mut tasks = JoinSet::new();
+    for session in sessions {
+        let Some(baseline) = baselines.get(session.addr()) else {
+            warn!(host = %session.addr(), "no counter baseline; skipping delta pass");
+            continue;
+        };
+        let mut spec = config.task_spec(&[]);
+        spec.counters = Some(CounterRequest::Delta {
+            baseline: baseline.clone(),
+        });
+        let document = match serde_json::to_string(&spec) {
+            Ok(document) => document,
+            Err(error) => {
+                warn!(host = %session.addr(), %error, "cannot serialize the counter delta spec");
+                continue;
+            }
+        };
+        let session = Arc::clone(session);
+        let sink = sink.clone();
+        tasks.spawn(async move {
+            let addr = session.addr().to_string();
+            let outcome = tokio::time::timeout(
+                COUNTER_PASS_TIMEOUT,
+                session.run_agent(&["run"], Some(document), |event| {
+                    if matches!(&event, AgentEvent::CounterDeltas { .. }) {
+                        sink.event(&addr, event);
+                    }
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
+                    warn!(host = %addr, %status, "counter delta pass exited abnormally")
+                }
+                Ok(Err(error)) => warn!(host = %addr, %error, "counter delta pass failed"),
+                Err(_) => warn!(host = %addr, "counter delta pass timed out"),
+            }
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            warn!(%error, "counter delta task did not complete");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

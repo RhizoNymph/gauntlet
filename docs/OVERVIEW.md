@@ -92,6 +92,18 @@ Features Index:
     entry_points: [agent/gpu/]
     depends_on: [phase0_inventory]
     doc: docs/features/phase2_gpu.md
+  hot_sdc:
+    description: >
+      Silent-data-corruption screens under thermal load (SDC is
+      temperature/voltage dependent): periodic bitwise verification of the
+      sustained GEMM output during the loaded window (busy-time scheduled,
+      throughput-neutral), and an all-core CPU screen interleaving checksum
+      rounds with the power-heavy FMA workload. Mismatches are hard
+      per-scope failures with clock/temp context; fleet.sdc_failures +
+      dedicated table section.
+    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs]
+    depends_on: [phase1_cpu_mem_disk, phase2_gpu]
+    doc: docs/features/hot_sdc.md
   phase3_network:
     description: >
       Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
@@ -115,6 +127,19 @@ Features Index:
     entry_points: [agent/gpu/overlap.rs, report/mod.rs]
     depends_on: [phase2_gpu, phase3_network]
     doc: docs/features/overlap_phase.md
+  counter_deltas:
+    description: >
+      Error-counter delta detection across the load phases: the agent
+      snapshots PCIe AER, GPU ECC/row-remap, dmesg Xid, NVLink, EDAC, IB
+      port and NVMe error counters before the first load phase (baseline
+      held by the orchestrator) and again after the last repeat, diffs on
+      the agent, and emits per-node CounterDeltas. Any positive increment
+      is a per-host finding (verdict Stragglers) rendered in its own table
+      section; full deltas (zeros included) land in the JSON. Collection
+      is best effort — nodes without a subsystem contribute nothing.
+    entry_points: [agent/counters.rs, orchestrator/mod.rs]
+    depends_on: [phase0_inventory]
+    doc: docs/features/counter_deltas.md
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
@@ -124,7 +149,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas]
     doc: docs/features/reporting.md
   viewer:
     description: >

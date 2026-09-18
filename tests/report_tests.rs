@@ -177,6 +177,98 @@ fn absolute_thresholds_flag_independently_of_mad() {
     assert_eq!(report::verdict(&results), Verdict::Stragglers);
 }
 
+/// The `fleet()` observations with the straggler and dissenter healed, so a
+/// test can prove one added finding flips the verdict by itself.
+fn healed_fleet() -> (FleetConfig, BTreeMap<String, HostObservations>) {
+    let (config, mut observations) = fleet();
+    if let Some(obs) = observations.get_mut("n6") {
+        obs.metrics.clear();
+        obs.metrics.push(node_metric(
+            TestId::MemBandwidth,
+            "triad",
+            201.5,
+            Unit::GibPerSec,
+        ));
+    }
+    if let Some(obs) = observations.get_mut("n3") {
+        obs.inventory = Some(inventory("n3", "6.8.0"));
+    }
+    (config, observations)
+}
+
+#[test]
+fn sdc_failures_alone_are_hard_failures_and_rendered() {
+    let (config, mut observations) = healed_fleet();
+    let obs = observations.get_mut("n4").expect("n4");
+    obs.outcomes.push((
+        TestId::GpuGemmSdc,
+        Scope::Gpu { index: 1 },
+        TestOutcome::Failed {
+            reason: "bf16: check #3 deviated by 1.2e-1 at 1410 MHz / 84 C".into(),
+        },
+    ));
+    obs.outcomes.push((
+        TestId::CpuSdcHot,
+        Scope::Core { id: 7 },
+        TestOutcome::Failed {
+            reason: "2 mismatches over 811 hot rounds".into(),
+        },
+    ));
+    // Passing SDC outcomes elsewhere must not be reported as failures.
+    observations.get_mut("n1").expect("n1").outcomes.push((
+        TestId::GpuGemmSdc,
+        Scope::Gpu { index: 0 },
+        TestOutcome::Passed,
+    ));
+
+    let results = report::build(&config, observations, 1_700_000_000, 1_700_000_600);
+
+    let gpu = results
+        .fleet
+        .sdc_failures
+        .get("gpu_gemm_sdc")
+        .expect("gpu sdc group present");
+    assert_eq!(gpu.len(), 1);
+    assert!(gpu[0].contains("n4:gpu1"), "{gpu:?}");
+    assert!(gpu[0].contains("1410 MHz"), "{gpu:?}");
+
+    let cpu = results
+        .fleet
+        .sdc_failures
+        .get("cpu_sdc_hot")
+        .expect("cpu sdc group present");
+    assert_eq!(cpu.len(), 1);
+    assert!(cpu[0].contains("n4:core7"), "{cpu:?}");
+
+    // SDC is exit-code relevant even on an otherwise clean fleet.
+    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(text.contains("silent data corruption"), "{text}");
+    assert!(text.contains("n4:gpu1"), "{text}");
+    assert!(text.contains("1410 MHz"), "{text}");
+}
+
+#[test]
+fn clean_runs_report_no_sdc_failures() {
+    let (config, mut observations) = healed_fleet();
+    observations.get_mut("n1").expect("n1").outcomes.push((
+        TestId::CpuSdcHot,
+        Scope::Core { id: 0 },
+        TestOutcome::Passed,
+    ));
+    let results = report::build(&config, observations, 1_700_000_000, 1_700_000_600);
+    assert!(results.fleet.sdc_failures.is_empty());
+    assert_eq!(report::verdict(&results), Verdict::Clean);
+
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(!text.contains("silent data corruption"), "{text}");
+}
+
 #[test]
 fn rooflines_take_the_worst_gpu() {
     let names = ["n1", "n2", "n3", "n4"];
