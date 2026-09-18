@@ -12,9 +12,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// v2: error-counter snapshot/delta events (`counter_baseline`,
+// v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
+// on the wire plus `CpuTaskSpec::sdc_hot_secs` / `GpuTaskSpec::sdc_check_secs`
+// in the task spec (which is `deny_unknown_fields`, so a v1 agent would
+// reject a v2 spec; the version handshake forces a re-deploy instead).
+// v3: error-counter snapshot/delta events (`counter_baseline`,
 // `counter_deltas`) and the `counters` request on `AgentTaskSpec`.
-pub const PROTO_VERSION: u32 = 2;
+pub const PROTO_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -128,10 +132,16 @@ pub enum TestId {
     Inventory,
     CpuCorrectness,
     CpuGflops,
+    /// Correctness screen re-run while every core burns power: silent data
+    /// corruption is temperature/voltage dependent, so the cold screen alone
+    /// is not sufficient.
+    CpuSdcHot,
     MemBandwidth,
     DiskIo,
     GpuGemmCorrectness,
     GpuGemmPerf,
+    /// Periodic bitwise output verification during the sustained (hot) GEMM.
+    GpuGemmSdc,
     GpuMemBandwidth,
     GpuP2p,
     NetLatency,
@@ -195,7 +205,9 @@ pub enum Unit {
     Mhz,
     Bytes,
     Count,
-    /// Relative error vs a higher-precision reference.
+    /// Error vs a reference result: relative error against a
+    /// higher-precision recomputation, or absolute deviation from a
+    /// baseline output of the identical computation.
     Residual,
     Ratio,
 }
@@ -389,6 +401,13 @@ pub struct AgentTaskSpec {
 pub struct CpuTaskSpec {
     pub correctness_secs_per_core: u64,
     pub gflops_secs: u64,
+    /// Wall seconds for the hot SDC screen: correctness rounds interleaved
+    /// with the power-heavy FMA workload on every core simultaneously, so
+    /// correctness is exercised at max package power/temperature. 0 disables
+    /// (the phase emits a Skipped outcome). Additional to — never a
+    /// replacement for — the isolated per-core screen.
+    #[serde(default)]
+    pub sdc_hot_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -413,6 +432,12 @@ pub struct GpuTaskSpec {
     /// Square GEMM dimension for the sustained-perf run.
     pub gemm_dim: u32,
     pub bandwidth_bytes: u64,
+    /// Loaded seconds between bitwise output checks during the sustained
+    /// GEMM (the hot SDC screen). Verification happens outside the timed
+    /// throughput windows, so it never pollutes the reported GFLOPS.
+    /// 0 disables (a Skipped outcome is emitted).
+    #[serde(default)]
+    pub sdc_check_secs: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

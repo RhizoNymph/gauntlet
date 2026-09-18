@@ -102,6 +102,9 @@ pub struct TestConfig {
     pub phase_timeout_secs: u64,
     pub cpu_correctness_secs_per_core: u64,
     pub cpu_gflops_secs: u64,
+    /// Wall seconds for the hot SDC screen (correctness interleaved with the
+    /// all-core power workload). 0 disables.
+    pub cpu_sdc_hot_secs: u64,
     pub mem_buffer_mib_per_numa: u64,
     pub mem_iters: u32,
     /// Paths exercised by the disk test (dataset dir, checkpoint dir).
@@ -110,6 +113,9 @@ pub struct TestConfig {
     pub gemm_secs: u64,
     pub gemm_dim: u32,
     pub gemm_dtypes: Vec<GemmDtype>,
+    /// Loaded seconds between bitwise output checks during the sustained
+    /// GEMM (hot SDC screen). 0 disables.
+    pub gemm_sdc_check_secs: u64,
     pub gpu_bandwidth_mib: u64,
     pub net_latency_secs: u64,
     pub net_bandwidth_secs: u64,
@@ -127,6 +133,7 @@ impl Default for TestConfig {
             phase_timeout_secs: 900,
             cpu_correctness_secs_per_core: 10,
             cpu_gflops_secs: 10,
+            cpu_sdc_hot_secs: 10,
             mem_buffer_mib_per_numa: 1024,
             mem_iters: 20,
             disk_paths: vec!["/tmp".into()],
@@ -134,6 +141,7 @@ impl Default for TestConfig {
             gemm_secs: 30,
             gemm_dim: 8192,
             gemm_dtypes: vec![GemmDtype::F32, GemmDtype::Bf16, GemmDtype::F16],
+            gemm_sdc_check_secs: 5,
             gpu_bandwidth_mib: 1024,
             net_latency_secs: 3,
             net_bandwidth_secs: 5,
@@ -231,6 +239,7 @@ impl FleetConfig {
             cpu: CpuTaskSpec {
                 correctness_secs_per_core: tests.cpu_correctness_secs_per_core,
                 gflops_secs: tests.cpu_gflops_secs,
+                sdc_hot_secs: tests.cpu_sdc_hot_secs,
             },
             mem: MemTaskSpec {
                 buffer_bytes_per_numa: tests.mem_buffer_mib_per_numa * 1024 * 1024,
@@ -245,6 +254,7 @@ impl FleetConfig {
                 gemm_dtypes: tests.gemm_dtypes.clone(),
                 gemm_dim: tests.gemm_dim,
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
+                sdc_check_secs: tests.gemm_sdc_check_secs,
             },
             // Counter passes are scheduled by the orchestrator as dedicated
             // invocations; a plain phase spec never carries one.

@@ -87,6 +87,7 @@ fn cpu_run_covers_every_core() {
     let spec = CpuTaskSpec {
         correctness_secs_per_core: 1,
         gflops_secs: 1,
+        sdc_hot_secs: 0,
     };
     cpu::run(&sink, &spec).expect("cpu phase");
     let events = common::decode_events(&buf);
@@ -140,6 +141,127 @@ fn cpu_run_covers_every_core() {
                 && record.name == "gflops_allcore")
     });
     assert!(allcore, "all-core aggregate metric missing");
+}
+
+#[test]
+fn hot_sdc_screen_covers_every_core() {
+    let (sink, buf) = common::capturing_sink();
+    let spec = CpuTaskSpec {
+        correctness_secs_per_core: 0,
+        gflops_secs: 0,
+        sdc_hot_secs: 1,
+    };
+    cpu::run(&sink, &spec).expect("cpu phase");
+    let events = common::decode_events(&buf);
+
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .expect("parallelism");
+
+    let mut outcome_cores = BTreeSet::new();
+    for event in &events {
+        if let AgentEvent::Outcome {
+            test: TestId::CpuSdcHot,
+            scope: Scope::Core { id },
+            outcome,
+        } = event
+        {
+            outcome_cores.insert(*id);
+            assert!(
+                !matches!(outcome, gauntlet::proto::TestOutcome::Failed { .. }),
+                "healthy machine flagged SDC on core {id}: {outcome:?}"
+            );
+        }
+    }
+    assert_eq!(
+        outcome_cores.len() as u32,
+        cores,
+        "one hot-SDC outcome per logical core"
+    );
+
+    // Every core that ran (not Skipped) reports its mismatch count — zero on
+    // healthy hardware — and a positive hot-round count.
+    let mut mismatch_cores = BTreeSet::new();
+    let mut round_cores = BTreeSet::new();
+    for event in &events {
+        if let AgentEvent::Metric { record } = event
+            && record.test == TestId::CpuSdcHot
+        {
+            let Scope::Core { id } = record.scope else {
+                panic!("hot-SDC metrics are per-core, got {:?}", record.scope);
+            };
+            assert_eq!(record.unit, Unit::Count);
+            match record.name.as_str() {
+                "mismatches" => {
+                    assert_eq!(record.value, 0.0, "core {id} mismatches");
+                    mismatch_cores.insert(id);
+                }
+                "rounds" => {
+                    assert!(record.value > 0.0, "core {id} did no hot rounds");
+                    round_cores.insert(id);
+                }
+                other => panic!("unexpected hot-SDC metric {other}"),
+            }
+        }
+    }
+    assert!(!mismatch_cores.is_empty(), "no mismatch counts emitted");
+    assert_eq!(mismatch_cores, round_cores);
+}
+
+#[test]
+fn hot_sdc_disabled_emits_node_skip() {
+    let (sink, buf) = common::capturing_sink();
+    let spec = CpuTaskSpec {
+        correctness_secs_per_core: 0,
+        gflops_secs: 0,
+        sdc_hot_secs: 0,
+    };
+    cpu::run(&sink, &spec).expect("cpu phase");
+    let events = common::decode_events(&buf);
+    let hot: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Outcome {
+                test: TestId::CpuSdcHot,
+                scope,
+                outcome,
+            } => Some((scope, outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hot.len(), 1, "exactly one disabled marker");
+    assert_eq!(*hot[0].0, Scope::Node);
+    assert!(matches!(
+        hot[0].1,
+        gauntlet::proto::TestOutcome::Skipped { .. }
+    ));
+}
+
+#[test]
+fn hot_core_report_classifies_mismatches() {
+    use gauntlet::agent::cpu::HotCoreReport;
+    let clean = HotCoreReport {
+        rounds: 500,
+        mismatches: 0,
+        first_mismatch: None,
+    };
+    assert!(matches!(
+        clean.outcome(),
+        gauntlet::proto::TestOutcome::Passed
+    ));
+
+    let corrupt = HotCoreReport {
+        rounds: 500,
+        mismatches: 3,
+        first_mismatch: Some("float checksum mismatch on round 17".into()),
+    };
+    match corrupt.outcome() {
+        gauntlet::proto::TestOutcome::Failed { reason } => {
+            assert!(reason.contains('3'), "count missing: {reason}");
+            assert!(reason.contains("round 17"), "context missing: {reason}");
+        }
+        other => panic!("mismatches must fail hard, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
