@@ -85,6 +85,11 @@ impl Collector {
             AgentEvent::NcclBarrierTimings { .. } => {
                 tracing::debug!(host = host_addr, "ignoring stray barrier timings event");
             }
+            // Same: the fleet-overlap driver intercepts and merges per-rank
+            // reports into ordinary metric records.
+            AgentEvent::OverlapFleetReport { .. } => {
+                tracing::debug!(host = host_addr, "ignoring stray fleet overlap report");
+            }
             // The counter driver intercepts and holds baselines; one
             // arriving here is a stray duplicate.
             AgentEvent::CounterBaseline { .. } => {

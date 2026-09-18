@@ -154,6 +154,27 @@ fn overlap_defaults_and_task_spec_mapping() {
 }
 
 #[test]
+fn fleet_overlap_toggle_defaults_on() {
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert!(config.tests.overlap_fleet);
+    // Both steps are handed the same spec value — one mapper, no drift.
+    assert_eq!(
+        config.task_spec(&[Phase::Overlap]).overlap,
+        config.overlap_spec()
+    );
+
+    let off = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        overlap_fleet = false
+        "#,
+    )
+    .expect("overlap_fleet override");
+    assert!(!off.tests.overlap_fleet);
+}
+
+#[test]
 fn task_spec_converts_units() {
     let config = parse(
         r#"

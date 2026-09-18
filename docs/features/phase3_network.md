@@ -19,6 +19,13 @@ Orchestrator phase-3 driver:
    node); rendezvous = orchestrator relays `NcclUniqueId` from rank 0's
    GenerateId to all Participate stdin docs. Pair-level sweeps optional in
    v1 (config flag) since full-fleet + TCP pairwise usually localizes.
+   The world selection (`nccl_world`: GPU-bearing + loadable libnccl) and
+   the rendezvous-relay/participant-supervision driver
+   (`NcclJob`/`drive_fleet_nccl`, in `src/orchestrator/nccl.rs`) are
+   shared with the overlap phase's fleet step
+   (docs/features/overlap_phase.md), which runs the same world shape under
+   combined GEMM load; the directive's `NcclWorkload` selects sweep vs
+   overlap.
 4. `analysis::fit::fit_alpha_beta` over (size, elapsed_us) → calibration
    `links` entries ("tcp_pairwise" from latency+bandwidth points per pair
    class, "nccl_allreduce_fleet" from the sweep).
@@ -61,7 +68,8 @@ by construction.
 ## Files
 `src/agent/net.rs`, `src/agent/nccl.rs`, `src/analysis/schedule.rs`,
 `src/analysis/fit.rs`, orchestrator phase-3 driver in
-`src/orchestrator/mod.rs`.
+`src/orchestrator/mod.rs` (pairwise + TCP barrier) and
+`src/orchestrator/nccl.rs` (fleet NCCL jobs).
 
 ## Invariants
 - RTT metrics report distribution (p50/p99/max), never mean-only.

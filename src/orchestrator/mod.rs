@@ -17,6 +17,7 @@
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+mod nccl;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -36,12 +37,12 @@ use self::session::{HostSession, single_quote};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
-use crate::analysis::skew::{self, BarrierSkew, Margin, RankSeries, SkewPolarity};
+use crate::analysis::skew::BarrierSkew;
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::proto::{
-    AgentEvent, BarrierSpec, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord,
-    NcclDirective, Phase, Scope, TestId, Unit,
+    AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
+    TestId, Unit,
 };
 use crate::report;
 
@@ -249,13 +250,22 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
             info!(?phase, "phase start");
             match phase {
-                // Overlap is node-local like phases 0-2 (single process,
-                // intra-node NCCL world); it is scheduled after gpu/network
-                // so its retention ratios divide isolated baselines from the
-                // same run.
-                Phase::Inventory | Phase::CpuMem | Phase::Gpu | Phase::Overlap => {
+                Phase::Inventory | Phase::CpuMem | Phase::Gpu => {
                     let seen = node_phase(&config, &sessions, *phase, &sink).await;
                     inventories.extend(seen);
+                }
+                // The overlap phase is scheduled after gpu/network so its
+                // retention ratios divide isolated baselines from the same
+                // run. The node-local fan-out (single process, intra-node
+                // NCCL world) runs first; the fleet-wide combined-load step
+                // follows on the cross-node fabric.
+                Phase::Overlap => {
+                    let seen = node_phase(&config, &sessions, *phase, &sink).await;
+                    inventories.extend(seen);
+                    if config.tests.overlap_fleet {
+                        nccl::overlap_fleet_sweep(&config, &sessions, &mut inventories, &sink)
+                            .await;
+                    }
                 }
                 Phase::Network => {
                     network_phase(
@@ -622,7 +632,7 @@ async fn network_phase(
     sink: &ObservationSink,
 ) {
     pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl_sweep(config, sessions, inventories, sink).await;
+    nccl::nccl_sweep(config, sessions, inventories, sink).await;
     tcp_barrier_sweep(config, sessions, sink).await;
 }
 
@@ -879,198 +889,6 @@ fn peer_endpoint(ssh_addr: &str) -> &str {
     host
 }
 
-/// Fleet-wide NCCL sweep: rank 0 mints the unique id, this process relays it
-/// to every rank, and rank 0's event stream carries the measurements.
-async fn nccl_sweep(
-    config: &FleetConfig,
-    sessions: &[Arc<HostSession>],
-    inventories: &mut BTreeMap<String, InventorySnapshot>,
-    sink: &ObservationSink,
-) {
-    let gpu_hosts = gpu_bearing_hosts(sessions, inventories).await;
-    if gpu_hosts.is_empty() {
-        info!("no GPU-bearing hosts; skipping the NCCL sweep");
-        return;
-    }
-    // The inventory dlopen probe knows whether libnccl actually loads. A
-    // fleet without the NCCL stack skips the sweep as a structural finding
-    // (visible in the inventory/consistency/bootstrap output) instead of
-    // manufacturing a host failure out of a loader panic. Hosts predating
-    // the probe (empty map) are given the benefit of the doubt.
-    let nccl_hosts: Vec<_> = gpu_hosts
-        .iter()
-        .filter(|session| {
-            inventories
-                .get(session.addr())
-                .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    if nccl_hosts.is_empty() {
-        warn!(
-            gpu_hosts = gpu_hosts.len(),
-            "libnccl is not loadable on any GPU-bearing host; skipping the NCCL sweep"
-        );
-        return;
-    }
-    if nccl_hosts.len() < gpu_hosts.len() {
-        warn!(
-            with_nccl = nccl_hosts.len(),
-            without_nccl = gpu_hosts.len() - nccl_hosts.len(),
-            "some GPU-bearing hosts lack a loadable libnccl and are excluded from the sweep"
-        );
-    }
-    let gpu_hosts = nccl_hosts;
-    let rank0 = &gpu_hosts[0];
-    let world_size = gpu_hosts.len() as u32;
-
-    info!(world_size, rank0 = %rank0.addr(), "NCCL sweep");
-
-    let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
-    let mut tasks = JoinSet::new();
-
-    // Barrier-skew microbenchmark rides the same communicator; a world of
-    // one has no skew to measure.
-    let barrier_spec = (config.tests.barrier_iters > 0 && world_size >= 2).then_some(BarrierSpec {
-        iters: config.tests.barrier_iters,
-        bytes: config.tests.barrier_bytes,
-    });
-    // Every rank reports its per-iteration barrier timings; the callbacks
-    // intercept them here so the fleet-wide skew analysis can run once all
-    // ranks are in.
-    let barrier_timings: Arc<std::sync::Mutex<Vec<RankSeries>>> = Arc::default();
-
-    // Rank 0 leads: it mints the rendezvous id in-process (the id's bootstrap
-    // listen socket must live in the process that serves as rank 0) and
-    // announces it as an NcclId event, which is intercepted here and relayed
-    // to the other ranks.
-    let lead = NcclDirective::Lead {
-        world_size,
-        sizes: config.tests.nccl_sizes.clone(),
-        iters_per_size: config.tests.nccl_iters_per_size,
-        socket_ifname: config.nccl.socket_ifname.clone(),
-        barrier: barrier_spec,
-    };
-    let document = match serde_json::to_string(&lead) {
-        Ok(document) => document,
-        Err(error) => {
-            warn!(%error, "cannot serialize the NCCL lead directive");
-            return;
-        }
-    };
-    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
-    let id_slot = Arc::new(std::sync::Mutex::new(Some(id_tx)));
-    {
-        let session = Arc::clone(rank0);
-        let sink = sink.clone();
-        let id_slot = Arc::clone(&id_slot);
-        let barrier_timings = Arc::clone(&barrier_timings);
-        tasks.spawn(async move {
-            let addr = session.addr().to_string();
-            let outcome = tokio::time::timeout(
-                timeout,
-                session.run_agent(&["nccl"], Some(document), |event| match event {
-                    AgentEvent::NcclId { unique_id_b64 } => {
-                        if let Some(tx) = id_slot.lock().expect("id slot poisoned").take() {
-                            let _ = tx.send(unique_id_b64);
-                        }
-                    }
-                    AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
-                        barrier_timings
-                            .lock()
-                            .expect("barrier timings poisoned")
-                            .push(RankSeries { rank, elapsed_us });
-                    }
-                    event => sink.event(&addr, event),
-                }),
-            )
-            .await;
-            report_rank_outcome(&sink, &addr, 0, timeout, outcome);
-        });
-    }
-
-    let unique_id_b64 = match tokio::time::timeout(NCCL_ID_WAIT, id_rx).await {
-        Ok(Ok(id)) => id,
-        Ok(Err(_)) | Err(_) => {
-            // The lead task reports its own failure; just stop recruiting.
-            warn!(
-                rank0 = %rank0.addr(),
-                "NCCL lead produced no rendezvous id; aborting the sweep"
-            );
-            while let Some(joined) = tasks.join_next().await {
-                if let Err(error) = joined {
-                    warn!(%error, "nccl task did not complete");
-                }
-            }
-            return;
-        }
-    };
-
-    for (rank, session) in gpu_hosts.iter().enumerate().skip(1) {
-        let directive = NcclDirective::Participate {
-            unique_id_b64: unique_id_b64.clone(),
-            rank: rank as u32,
-            world_size,
-            sizes: config.tests.nccl_sizes.clone(),
-            iters_per_size: config.tests.nccl_iters_per_size,
-            socket_ifname: config.nccl.socket_ifname.clone(),
-            barrier: barrier_spec,
-        };
-        let document = match serde_json::to_string(&directive) {
-            Ok(document) => document,
-            Err(error) => {
-                warn!(%error, rank, "cannot serialize the NCCL directive");
-                continue;
-            }
-        };
-        let session = Arc::clone(session);
-        let sink = sink.clone();
-        let barrier_timings = Arc::clone(&barrier_timings);
-        tasks.spawn(async move {
-            let addr = session.addr().to_string();
-            let outcome = tokio::time::timeout(
-                timeout,
-                session.run_agent(&["nccl"], Some(document), |event| match event {
-                    AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
-                        barrier_timings
-                            .lock()
-                            .expect("barrier timings poisoned")
-                            .push(RankSeries { rank, elapsed_us });
-                    }
-                    event => sink.event(&addr, event),
-                }),
-            )
-            .await;
-            report_rank_outcome(&sink, &addr, rank, timeout, outcome);
-        });
-    }
-    while let Some(joined) = tasks.join_next().await {
-        if let Err(error) = joined {
-            warn!(%error, "nccl task did not complete");
-        }
-    }
-
-    if barrier_spec.is_some() {
-        let series =
-            std::mem::take(&mut *barrier_timings.lock().expect("barrier timings poisoned"));
-        let rank_hosts: Vec<String> = gpu_hosts
-            .iter()
-            .map(|session| session.addr().to_string())
-            .collect();
-        match skew::analyze(&series, SkewPolarity::LateIsMin, Margin::default()) {
-            Some(skew) => emit_barrier_metrics(sink, TestId::NcclBarrier, &rank_hosts, &skew),
-            None => warn!(
-                ranks_reporting = series.len(),
-                world_size, "NCCL barrier produced no analyzable timings"
-            ),
-        }
-    }
-}
-
-/// How long the orchestrator waits for the lead rank's NcclId event.
-const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
-
 /// Turn a barrier-skew analysis into metric records: per-rank distribution
 /// and tally metrics against each rank's host, fleet-level barrier-time
 /// distribution against the coordinator/lead host (index 0), mirroring how
@@ -1284,24 +1102,6 @@ async fn tcp_barrier_sweep(
             emit_barrier_metrics(sink, TestId::TcpBarrier, &rank_hosts, &report.skew);
         }
         Err(error) => sink.error(&server_addr, format!("TCP barrier failed: {error:#}")),
-    }
-}
-
-fn report_rank_outcome(
-    sink: &ObservationSink,
-    addr: &str,
-    rank: usize,
-    timeout: Duration,
-    outcome: Result<anyhow::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
-) {
-    match outcome {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => sink.error(addr, format!("nccl rank {rank} exited with {status}")),
-        Ok(Err(error)) => sink.error(addr, format!("nccl rank {rank} failed: {error:#}")),
-        Err(_) => sink.error(
-            addr,
-            format!("nccl rank {rank} timed out after {}s", timeout.as_secs()),
-        ),
     }
 }
 

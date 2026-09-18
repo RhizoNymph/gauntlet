@@ -132,8 +132,7 @@ fn overlap_phase_exists_and_runs_last() {
 #[test]
 fn overlap_task_spec_round_trips() {
     use gauntlet::proto::{
-        AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec,
-        OverlapTaskSpec,
+        AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
     };
     let spec = AgentTaskSpec {
         phases: vec![Phase::Gpu, Phase::Overlap],
@@ -157,7 +156,7 @@ fn overlap_task_spec_round_trips() {
             bandwidth_bytes: 1 << 20,
             sdc_check_secs: 0,
         },
-        overlap: OverlapTaskSpec {
+        overlap: OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,
             gemm_dim: 2048,
@@ -195,6 +194,88 @@ fn overlap_metric_events_round_trip() {
         let back = decode_event(&encode_event(&event)).expect("round trip");
         assert_eq!(back, event);
     }
+}
+
+#[test]
+fn fleet_overlap_events_round_trip() {
+    use gauntlet::proto::{OverlapFleetReport, OverlapGpuGemm};
+    let event = AgentEvent::OverlapFleetReport {
+        report: Box::new(OverlapFleetReport {
+            rank: 1,
+            msg_bytes: 64 << 20,
+            isolated_bus_gib_per_sec: 44.0,
+            overlap_bus_gib_per_sec: 33.0,
+            gemm: vec![
+                OverlapGpuGemm::Ok {
+                    gpu_index: 0,
+                    gflops: 88_000.0,
+                },
+                OverlapGpuGemm::Failed {
+                    gpu_index: 1,
+                    reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
+                },
+            ],
+        }),
+    };
+    let back = decode_event(&encode_event(&event)).expect("round trip");
+    assert_eq!(back, event);
+
+    // Metric events under the new test ids round-trip like any other.
+    for (test, name, unit) in [
+        (TestId::OverlapFleetGemm, "gflops_bf16", Unit::Gflops),
+        (
+            TestId::OverlapFleetAllReduce,
+            "overlap_bus_gib_per_sec",
+            Unit::GibPerSec,
+        ),
+    ] {
+        let event = AgentEvent::Metric {
+            record: MetricRecord {
+                test,
+                scope: Scope::Node,
+                name: name.into(),
+                value: 12.5,
+                unit,
+                repeat: 0,
+            },
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
+}
+
+#[test]
+fn nccl_workloads_are_mutually_exclusive_by_construction() {
+    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec};
+    // A sweep workload written without the optional barrier probe.
+    let sweep = r#"{"directive":"lead","world_size":3,"socket_ifname":null,
+        "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+    let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
+    let NcclDirective::Lead {
+        workload: NcclWorkload::Sweep { barrier, .. },
+        ..
+    } = directive
+    else {
+        panic!("expected a Lead sweep directive");
+    };
+    assert_eq!(barrier, None);
+
+    let with_overlap = NcclDirective::Participate {
+        unique_id_b64: "abc".into(),
+        rank: 2,
+        world_size: 3,
+        socket_ifname: Some("bond0".into()),
+        workload: NcclWorkload::Overlap(OverlapSpec {
+            duration_secs: 30,
+            baseline_secs: 5,
+            gemm_dim: 8192,
+            gemm_dtype: gauntlet::proto::GemmDtype::Bf16,
+            msg_bytes: 64 << 20,
+        }),
+    };
+    let json = serde_json::to_string(&with_overlap).expect("serialize");
+    let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, with_overlap);
 }
 
 #[test]

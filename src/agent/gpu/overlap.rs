@@ -17,50 +17,35 @@
 //! Topology: one process, one NCCL rank per visible GPU
 //! (`ncclCommInitAll`), collectives driven from a single thread inside
 //! `ncclGroupStart`/`ncclGroupEnd`, each rank on its device's default
-//! stream. The compute leg runs on a *separate* stream per GPU from one
-//! plain thread per GPU, so the collective and the GEMM genuinely contend.
-//! Multi-node overlap (GEMM under the fleet/pair NCCL worlds) is a
-//! documented follow-up; the single-process intra-node form needs no
-//! rendezvous and no orchestrator relay.
+//! stream. The compute leg runs on a *separate* stream per GPU
+//! (`gpu::worker`, one plain thread per GPU), so the collective and the
+//! GEMM genuinely contend. The fleet-wide sibling of this phase — the same
+//! GEMM load under the cross-node NCCL world — lives in `agent::nccl`
+//! (`overlap_fleet`) and shares the worker machinery.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 use cudarc::nccl::result::NcclError;
 use cudarc::nccl::{Comm, ReduceOp, result as nccl_result};
 
-use super::gemm::{
-    GEMM_SEED, Operands, Xorshift64, dtype_tag, fill_matrix, launch_gemm, sustained_gflops_value,
-    upload_operands, write_ptr,
-};
+use super::gemm::{dtype_tag, sustained_gflops_value};
 use super::guard;
+use super::worker::GemmLoad;
 use crate::agent::EventSink;
-use crate::agent::nccl::all_reduce_bus_gib_per_sec;
+use crate::agent::nccl::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
 use crate::proto::{
-    GemmDtype, LogLevel, MetricRecord, OverlapTaskSpec, Scope, TestId, TestOutcome, Unit,
+    LogLevel, MetricRecord, OverlapSpec, Scope, TestId, TestOutcome, Unit, overlap_metric,
 };
 
-const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// Untimed all-reduce rounds before any timed window, so channel setup and
 /// algorithm selection stay out of the isolated baseline.
 const WARMUP_ROUNDS: u32 = 5;
 /// All-reduce rounds queued between stream synchronizations in a timed
 /// window.
 const ROUND_ITERS: u32 = 4;
-/// GEMM launches queued between synchronizations. Smaller than phase 2's
-/// batch so the stop flag is observed promptly under contention.
-const GEMM_BATCH: u64 = 4;
-
-/// All-reduce payload element count for a requested message size; never
-/// zero, so a degenerate spec still exercises the collective.
-fn message_elements(msg_bytes: u64) -> usize {
-    (msg_bytes as usize / F32_BYTES).max(1)
-}
 
 /// Mean seconds per iteration over a timed window.
 fn per_iter_secs(elapsed_secs: f64, iters: u64) -> f64 {
@@ -80,7 +65,7 @@ fn nccl_error(what: &str, error: NcclError) -> anyhow::Error {
 /// Run the overlap test. Node-level failures (driver init, communicator
 /// init) become Failed outcomes; fewer than two GPUs is a Skipped outcome
 /// (a world of one moves nothing, so there is no contention to measure).
-pub fn run(sink: &EventSink, spec: &OverlapTaskSpec) -> Result<()> {
+pub fn run(sink: &EventSink, spec: &OverlapSpec) -> Result<()> {
     let device_count = match guard("cuda driver init", || Ok(CudaContext::device_count()?)) {
         Ok(count) => count.max(0) as u32,
         Err(reason) => {
@@ -116,7 +101,7 @@ fn node_outcomes(sink: &EventSink, outcome: impl Fn(String) -> TestOutcome, reas
 // Combined-load driver
 // ---------------------------------------------------------------------------
 
-fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Result<()> {
+fn execute(sink: &EventSink, spec: &OverlapSpec, device_count: u32) -> Result<()> {
     let elements = message_elements(spec.msg_bytes);
     let message_bytes = (elements * F32_BYTES) as f64;
 
@@ -153,23 +138,12 @@ fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Resul
         spec.baseline_secs,
     )?;
 
-    // One GEMM worker per GPU. Workers set up (fill, upload, warm launch)
-    // off the timed path, then everyone meets at the barrier and the
-    // combined window begins.
-    let stop = Arc::new(AtomicBool::new(false));
-    let start = Arc::new(Barrier::new(device_count as usize + 1));
-    let workers: Vec<JoinHandle<Result<GemmThroughput, String>>> = contexts
-        .iter()
-        .map(|ctx| {
-            let ctx = Arc::clone(ctx);
-            let stop = Arc::clone(&stop);
-            let start = Arc::clone(&start);
-            let dim = spec.gemm_dim;
-            let dtype = spec.gemm_dtype;
-            std::thread::spawn(move || gemm_worker(ctx, dim, dtype, &stop, &start))
-        })
-        .collect();
-    start.wait();
+    // One GEMM worker per GPU (`gpu::worker`). Workers set up (upload,
+    // warm launch) off the timed path; `wait_ready` + `start` releases
+    // them together and the combined window begins.
+    let mut load = GemmLoad::spawn(&contexts, spec.gemm_dim, spec.gemm_dtype);
+    load.wait_ready();
+    load.start();
 
     let overlapped = timed_rounds(
         &comms,
@@ -180,27 +154,19 @@ fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Resul
     );
     // The workers are stopped and joined before any error propagates, so a
     // failed collective never leaks GEMM threads.
-    stop.store(true, Ordering::Relaxed);
-    let throughputs: Vec<Result<GemmThroughput, String>> = workers
-        .into_iter()
-        .map(|worker| {
-            worker
-                .join()
-                .unwrap_or_else(|_| Err("overlap gemm worker panicked".to_string()))
-        })
-        .collect();
+    let throughputs = load.finish();
     let overlapped_per_iter = overlapped?;
 
     // Collective results, node scope.
     for (name, value, unit) in [
-        ("msg_bytes", message_bytes, Unit::Bytes),
+        (overlap_metric::MSG_BYTES, message_bytes, Unit::Bytes),
         (
-            "isolated_bus_gib_per_sec",
+            overlap_metric::ISOLATED_BUS,
             all_reduce_bus_gib_per_sec(message_bytes, isolated_per_iter, device_count),
             Unit::GibPerSec,
         ),
         (
-            "overlap_bus_gib_per_sec",
+            overlap_metric::OVERLAP_BUS,
             all_reduce_bus_gib_per_sec(message_bytes, overlapped_per_iter, device_count),
             Unit::GibPerSec,
         ),
@@ -290,115 +256,9 @@ fn sync_all(streams: &[Arc<CudaStream>]) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// GEMM worker (one plain thread per GPU)
-// ---------------------------------------------------------------------------
-
-struct GemmThroughput {
-    iters: u64,
-    elapsed_secs: f64,
-}
-
-/// Device-side state a worker holds through the combined window. The
-/// operand slices are kept alive here; raw pointers are re-derived inside
-/// the loop.
-struct GemmState {
-    stream: Arc<CudaStream>,
-    blas: CudaBlas,
-    operands: Operands,
-    c: CudaSlice<f32>,
-    n: usize,
-    dtype: GemmDtype,
-}
-
-/// Set up, meet the barrier, then hammer GEMMs until told to stop.
-///
-/// The barrier is reached on *every* path — including a failed setup — so
-/// the driver thread can never deadlock waiting for a worker.
-fn gemm_worker(
-    ctx: Arc<CudaContext>,
-    dim: u32,
-    dtype: GemmDtype,
-    stop: &AtomicBool,
-    start: &Barrier,
-) -> Result<GemmThroughput, String> {
-    let prepared = guard("overlap gemm setup", || prepare(&ctx, dim, dtype));
-    start.wait();
-    let mut state = prepared?;
-    guard("overlap gemm loop", || gemm_loop(&mut state, stop))
-}
-
-fn prepare(ctx: &Arc<CudaContext>, dim: u32, dtype: GemmDtype) -> Result<GemmState> {
-    ctx.bind_to_thread()?;
-    // The collective owns the default stream; the GEMM gets its own so the
-    // two workloads genuinely run concurrently on the device.
-    let stream = ctx.new_stream()?;
-    let blas = CudaBlas::new(Arc::clone(&stream)).context("creating cublas handle")?;
-    let n = dim.max(1) as usize;
-    let mut rng = Xorshift64::new(GEMM_SEED);
-    let host_a = fill_matrix(&mut rng, n * n);
-    let host_b = fill_matrix(&mut rng, n * n);
-    let operands = upload_operands(&stream, &host_a, &host_b, dtype)?;
-    let mut c = stream.alloc_zeros::<f32>(n * n)?;
-    // One warm launch so cuBLAS heuristics run outside the timed window.
-    let (a_ptr, b_ptr) = operands.device_ptrs(&stream);
-    let c_ptr = write_ptr(&mut c, &stream);
-    // SAFETY: a_ptr/b_ptr address n*n operands of `dtype` and c_ptr n*n f32,
-    // all just allocated on this stream, which is the handle's stream.
-    unsafe { launch_gemm(&blas, dtype, n as i32, a_ptr, b_ptr, c_ptr) }
-        .context("warmup gemm launch")?;
-    stream.synchronize()?;
-    Ok(GemmState {
-        stream,
-        blas,
-        operands,
-        c,
-        n,
-        dtype,
-    })
-}
-
-fn gemm_loop(state: &mut GemmState, stop: &AtomicBool) -> Result<GemmThroughput> {
-    let (a_ptr, b_ptr) = state.operands.device_ptrs(&state.stream);
-    let c_ptr = write_ptr(&mut state.c, &state.stream);
-    let started = Instant::now();
-    let mut iters = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        for _ in 0..GEMM_BATCH {
-            // SAFETY: the pointers come from the live allocations held in
-            // `state`, sized n*n as `launch_gemm` requires, on the stream
-            // the handle is bound to.
-            unsafe {
-                launch_gemm(
-                    &state.blas,
-                    state.dtype,
-                    state.n as i32,
-                    a_ptr,
-                    b_ptr,
-                    c_ptr,
-                )
-            }?;
-        }
-        state.stream.synchronize()?;
-        iters += GEMM_BATCH;
-    }
-    Ok(GemmThroughput {
-        iters,
-        elapsed_secs: started.elapsed().as_secs_f64().max(1e-9),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn message_elements_are_f32_sized_and_never_zero() {
-        assert_eq!(message_elements(64 << 20), (64 << 20) / 4);
-        assert_eq!(message_elements(4), 1);
-        assert_eq!(message_elements(0), 1);
-        assert_eq!(message_elements(3), 1);
-    }
 
     #[test]
     fn per_iter_secs_divides_and_survives_zero_iters() {

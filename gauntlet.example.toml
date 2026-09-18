@@ -34,8 +34,9 @@ net_port_base = 29500
 barrier_iters = 2000
 barrier_bytes = 8
 overlap_secs = 30            # combined GEMM + all-reduce window
-overlap_baseline_secs = 5    # isolated intra-node all-reduce baseline
+overlap_baseline_secs = 5    # isolated all-reduce baseline (intra-node and fleet steps)
 overlap_msg_mib = 64         # all-reduce message size
+overlap_fleet = true         # fleet-wide combined-load step (needs >= 2 GPU hosts)
 
 [thresholds]
 mad_k = 4.0

@@ -22,7 +22,11 @@ use thiserror::Error;
 // ids).
 // v5: barrier-skew microbenchmark — `NcclDirective` variants carry an
 // optional `barrier` spec and every rank reports `NcclBarrierTimings`.
-pub const PROTO_VERSION: u32 = 5;
+// v6: fleet overlap — the NCCL directives carry a `NcclWorkload` (the
+// message-size sweep or the combined GEMM + fleet all-reduce protocol,
+// mutually exclusive by construction), every rank reports
+// `OverlapFleetReport`, and the overlap_fleet test ids ride the wire.
+pub const PROTO_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -90,6 +94,15 @@ pub enum AgentEvent {
     NcclBarrierTimings {
         rank: u32,
         elapsed_us: Vec<f64>,
+    },
+    /// Fleet overlap step: one event per NCCL rank carrying that rank's
+    /// local results — isolated and overlapped all-reduce bus bandwidth
+    /// plus the overlapped GEMM throughput of every local GPU. Emitted by
+    /// *every* rank (the other place participants speak); the overlap
+    /// driver intercepts and merges them, so one reaching the collector is
+    /// a stray.
+    OverlapFleetReport {
+        report: Box<OverlapFleetReport>,
     },
     /// Error-counter snapshot taken before the load phases. Boxed for the
     /// same reason as `Inventory`. The orchestrator intercepts and holds it;
@@ -181,6 +194,11 @@ pub enum TestId {
     OverlapGemm,
     /// Intra-node all-reduce bandwidth: isolated baseline and under GEMM load.
     OverlapAllReduce,
+    /// GEMM throughput measured while the fleet-wide all-reduce runs.
+    OverlapFleetGemm,
+    /// Fleet all-reduce bus bandwidth, per rank: isolated baseline and under
+    /// fleet-wide GEMM load.
+    OverlapFleetAllReduce,
     /// Derived orchestrator-side (`report::build`): overlapped/isolated
     /// ratios. Agents never emit this test id.
     OverlapRetention,
@@ -426,7 +444,7 @@ pub struct AgentTaskSpec {
     pub mem: MemTaskSpec,
     pub disk: DiskTaskSpec,
     pub gpu: GpuTaskSpec,
-    pub overlap: OverlapTaskSpec,
+    pub overlap: OverlapSpec,
     /// Error-counter pass to run after the listed phases; the orchestrator
     /// sends this in dedicated invocations with an empty phase list.
     #[serde(default)]
@@ -477,18 +495,23 @@ pub struct GpuTaskSpec {
     pub sdc_check_secs: u64,
 }
 
-/// Phase "overlap": sustained GEMM on every GPU concurrently with an
-/// intra-node NCCL all-reduce across those same GPUs. An isolated all-reduce
-/// baseline (`baseline_secs`) precedes the combined window so the collective
-/// retention ratio compares like against like — same communicator, same
-/// topology, seconds apart. The GEMM retention baseline is the phase-2
-/// sustained number, joined orchestrator-side.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Parameters of an overlap step: sustained GEMM on every GPU concurrently
+/// with an NCCL all-reduce. One shared shape for both steps — the
+/// intra-node phase (`AgentTaskSpec.overlap`) and the fleet step
+/// (`NcclWorkload::Overlap`) measure the same contention, one topology
+/// level apart. An isolated all-reduce baseline (`baseline_secs`) precedes
+/// the combined window so the collective retention ratio compares like
+/// against like — same communicator, same topology, seconds apart. The
+/// GEMM retention baseline is the phase-2 sustained number, joined
+/// orchestrator-side.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OverlapTaskSpec {
-    /// Wall seconds of combined GEMM + all-reduce load.
+pub struct OverlapSpec {
+    /// Wall seconds of combined GEMM + all-reduce load. In the fleet step
+    /// this is rank 0's clock; the window consensus propagates the
+    /// boundary.
     pub duration_secs: u64,
-    /// Wall seconds of the isolated intra-node all-reduce baseline.
+    /// Wall seconds of the isolated all-reduce baseline.
     pub baseline_secs: u64,
     /// Square GEMM dimension for the compute leg (same as the phase-2 dim,
     /// so retention divides comparable numbers).
@@ -509,6 +532,67 @@ pub enum GemmDtype {
     F16,
 }
 
+impl GemmDtype {
+    /// Metric-name suffix ("gflops_<tag>", "residual_<tag>"), shared by the
+    /// agent emitters and the orchestrator/report side so both spell the
+    /// same group keys.
+    pub fn tag(self) -> &'static str {
+        match self {
+            GemmDtype::F32 => "f32",
+            GemmDtype::Tf32 => "tf32",
+            GemmDtype::Bf16 => "bf16",
+            GemmDtype::F16 => "f16",
+        }
+    }
+}
+
+/// Metric names shared between the overlap emitters (agent and
+/// orchestrator) and the report's retention derivation, so a renamed
+/// string cannot silently break the join.
+pub mod overlap_metric {
+    /// Actual all-reduce payload bytes per iteration.
+    pub const MSG_BYTES: &str = "msg_bytes";
+    /// Bus bandwidth of the isolated (quiet-GPU) baseline window.
+    pub const ISOLATED_BUS: &str = "isolated_bus_gib_per_sec";
+    /// Bus bandwidth of the combined-load window.
+    pub const OVERLAP_BUS: &str = "overlap_bus_gib_per_sec";
+}
+
+/// One rank's fleet-overlap results. Bus bandwidths are the rank's *local*
+/// timings (arrival skew makes them differ across ranks — that spread is
+/// part of the signal); `gemm` carries one entry per local GPU, ascending
+/// by index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapFleetReport {
+    pub rank: u32,
+    /// Actual payload bytes moved per all-reduce (the requested size
+    /// rounded to whole f32 elements, never zero).
+    pub msg_bytes: u64,
+    pub isolated_bus_gib_per_sec: f64,
+    pub overlap_bus_gib_per_sec: f64,
+    pub gemm: Vec<OverlapGpuGemm>,
+}
+
+/// Per-GPU outcome of the fleet-overlap compute leg. One GPU failing must
+/// not hide the others, so failure is a value here, not a dead rank.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OverlapGpuGemm {
+    Ok { gpu_index: u32, gflops: f64 },
+    Failed { gpu_index: u32, reason: String },
+}
+
+impl OverlapGpuGemm {
+    pub fn gpu_index(&self) -> u32 {
+        match self {
+            OverlapGpuGemm::Ok { gpu_index, .. } | OverlapGpuGemm::Failed { gpu_index, .. } => {
+                *gpu_index
+            }
+        }
+    }
+}
+
 /// Barrier-skew microbenchmark parameters, appended to the NCCL sweep when
 /// present: many iterations of a tiny all-reduce with per-iteration local
 /// timing on every rank.
@@ -520,34 +604,48 @@ pub struct BarrierSpec {
     pub bytes: u64,
 }
 
+/// What a fleet NCCL group runs once the communicator is up. One workload
+/// per invocation, mutually exclusive by construction — no sentinel values
+/// and no precedence rules between co-resident options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NcclWorkload {
+    /// Message-size sweep (rank 0 emits the measurements), optionally
+    /// followed by the barrier-skew microbenchmark.
+    Sweep {
+        /// Message sizes in bytes.
+        sizes: Vec<u64>,
+        iters_per_size: u32,
+        #[serde(default)]
+        barrier: Option<BarrierSpec>,
+    },
+    /// Fleet overlap protocol: isolated all-reduce baseline, then the same
+    /// all-reduce under GEMM load on every local GPU; every rank reports
+    /// an `OverlapFleetReport`.
+    Overlap(OverlapSpec),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "directive", rename_all = "snake_case")]
 pub enum NcclDirective {
     /// Rank 0: mint the rendezvous id, announce it as an `NcclId` event, and
-    /// stay alive through the whole sweep (the id's bootstrap listen socket
-    /// lives in this process).
+    /// stay alive through the whole workload (the id's bootstrap listen
+    /// socket lives in this process).
     Lead {
         world_size: u32,
-        /// Message sizes in bytes for the sweep.
-        sizes: Vec<u64>,
-        iters_per_size: u32,
         /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
         socket_ifname: Option<String>,
-        /// Run the barrier-skew microbenchmark after the sweep.
-        #[serde(default)]
-        barrier: Option<BarrierSpec>,
+        workload: NcclWorkload,
     },
-    /// Ranks 1..n: join the lead's communicator and run the sweep silently
-    /// (barrier timings are the one thing participants report).
+    /// Ranks 1..n: join the lead's communicator and run the workload
+    /// silently (barrier timings and fleet-overlap reports are the two
+    /// things participants report).
     Participate {
         unique_id_b64: String,
         rank: u32,
         world_size: u32,
-        sizes: Vec<u64>,
-        iters_per_size: u32,
         socket_ifname: Option<String>,
-        #[serde(default)]
-        barrier: Option<BarrierSpec>,
+        workload: NcclWorkload,
     },
 }
 
@@ -643,32 +741,91 @@ mod tests {
     }
 
     #[test]
-    fn directives_without_a_barrier_field_still_decode() {
-        // Wire output from a pre-v2 orchestrator build.
-        let old = r#"{"directive":"lead","world_size":4,"sizes":[1024],"iters_per_size":20,"socket_ifname":null}"#;
-        let directive: NcclDirective = serde_json::from_str(old).expect("decode old lead");
-        let NcclDirective::Lead { barrier, .. } = directive else {
-            panic!("expected a Lead directive");
+    fn sweep_workloads_default_the_barrier_absent() {
+        // A sweep directive written without the optional barrier probe.
+        let json = r#"{"directive":"lead","world_size":4,"socket_ifname":null,
+            "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+        let directive: NcclDirective = serde_json::from_str(json).expect("decode sweep lead");
+        let NcclDirective::Lead {
+            workload: NcclWorkload::Sweep { barrier, .. },
+            ..
+        } = directive
+        else {
+            panic!("expected a Lead sweep directive");
         };
         assert_eq!(barrier, None);
     }
 
     #[test]
-    fn barrier_specs_ride_the_directive() {
+    fn barrier_specs_ride_the_sweep_workload() {
         let directive = NcclDirective::Participate {
             unique_id_b64: "abc".into(),
             rank: 2,
             world_size: 4,
-            sizes: vec![1024],
-            iters_per_size: 20,
             socket_ifname: Some("bond0".into()),
-            barrier: Some(BarrierSpec {
-                iters: 2000,
-                bytes: 8,
-            }),
+            workload: NcclWorkload::Sweep {
+                sizes: vec![1024],
+                iters_per_size: 20,
+                barrier: Some(BarrierSpec {
+                    iters: 2000,
+                    bytes: 8,
+                }),
+            },
         };
         let json = serde_json::to_string(&directive).expect("serialize");
         let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, directive);
+    }
+
+    #[test]
+    fn overlap_workloads_ride_the_directive() {
+        let directive = NcclDirective::Lead {
+            world_size: 3,
+            socket_ifname: Some("bond0".into()),
+            workload: NcclWorkload::Overlap(OverlapSpec {
+                duration_secs: 30,
+                baseline_secs: 5,
+                gemm_dim: 8192,
+                gemm_dtype: GemmDtype::Bf16,
+                msg_bytes: 64 << 20,
+            }),
+        };
+        let json = serde_json::to_string(&directive).expect("serialize");
+        assert!(json.contains(r#""kind":"overlap""#), "{json}");
+        let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, directive);
+    }
+
+    #[test]
+    fn overlap_fleet_reports_round_trip() {
+        let event = AgentEvent::OverlapFleetReport {
+            report: Box::new(OverlapFleetReport {
+                rank: 2,
+                msg_bytes: 64 << 20,
+                isolated_bus_gib_per_sec: 42.5,
+                overlap_bus_gib_per_sec: 31.25,
+                gemm: vec![
+                    OverlapGpuGemm::Ok {
+                        gpu_index: 0,
+                        gflops: 91_000.0,
+                    },
+                    OverlapGpuGemm::Failed {
+                        gpu_index: 1,
+                        reason: "worker panicked".into(),
+                    },
+                ],
+            }),
+        };
+        let line = encode_event(&event);
+        assert!(line.contains("overlap_fleet_report"), "{line}");
+        assert_eq!(decode_event(&line).expect("decode"), event);
+    }
+
+    #[test]
+    fn dtype_tags_are_stable_metric_suffixes() {
+        assert_eq!(GemmDtype::F32.tag(), "f32");
+        assert_eq!(GemmDtype::Tf32.tag(), "tf32");
+        assert_eq!(GemmDtype::Bf16.tag(), "bf16");
+        assert_eq!(GemmDtype::F16.tag(), "f16");
     }
 }

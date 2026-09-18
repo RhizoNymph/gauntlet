@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapTaskSpec,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
     Phase,
 };
 
@@ -137,6 +137,10 @@ pub struct TestConfig {
     pub overlap_baseline_secs: u64,
     /// Overlap phase: all-reduce message size in MiB.
     pub overlap_msg_mib: u64,
+    /// Overlap phase: also run the fleet-wide combined-load step (GEMM on
+    /// every GPU under a cross-node all-reduce). Skipped quietly on fleets
+    /// with fewer than two GPU-bearing hosts.
+    pub overlap_fleet: bool,
 }
 
 impl Default for TestConfig {
@@ -167,6 +171,7 @@ impl Default for TestConfig {
             overlap_secs: 30,
             overlap_baseline_secs: 5,
             overlap_msg_mib: 64,
+            overlap_fleet: true,
         }
     }
 }
@@ -283,19 +288,27 @@ impl FleetConfig {
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
                 sdc_check_secs: tests.gemm_sdc_check_secs,
             },
-            overlap: OverlapTaskSpec {
-                duration_secs: tests.overlap_secs,
-                baseline_secs: tests.overlap_baseline_secs,
-                // Same dimension as phase 2 so the retention ratio divides
-                // comparable numbers; the compute leg runs the first
-                // configured dtype only.
-                gemm_dim: tests.gemm_dim,
-                gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
-                msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
-            },
+            overlap: self.overlap_spec(),
             // Counter passes are scheduled by the orchestrator as dedicated
             // invocations; a plain phase spec never carries one.
             counters: None,
+        }
+    }
+
+    /// The overlap-step parameters, shared verbatim by the node-local
+    /// phase (`AgentTaskSpec.overlap`) and the fleet step
+    /// (`NcclWorkload::Overlap`): both measure the same contention, one
+    /// topology level apart. The compute leg reuses the phase-2 dimension
+    /// (so retention divides comparable numbers) and the *first* configured
+    /// dtype only — it measures contention, not dtype coverage.
+    pub fn overlap_spec(&self) -> OverlapSpec {
+        let tests = &self.tests;
+        OverlapSpec {
+            duration_secs: tests.overlap_secs,
+            baseline_secs: tests.overlap_baseline_secs,
+            gemm_dim: tests.gemm_dim,
+            gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
+            msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
         }
     }
 

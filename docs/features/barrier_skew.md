@@ -133,8 +133,9 @@ straggler experiences.
   participants emit Hello + `NcclBarrierTimings`.
 - `src/proto.rs` — `BarrierSpec`, `NcclBarrierTimings`, new `TestId`s,
   `PROTO_VERSION` 5.
-- `src/orchestrator/mod.rs` — barrier spec in directives, timing
-  interception, `emit_barrier_metrics`, `tcp_barrier_sweep`.
+- `src/orchestrator/mod.rs` — `emit_barrier_metrics`, `tcp_barrier_sweep`.
+- `src/orchestrator/nccl.rs` — barrier spec on the sweep workload, timing
+  interception in the fleet NCCL driver.
 - `src/orchestrator/collect.rs` — stray `NcclBarrierTimings` ignored.
 - `src/report/mod.rs` — `barrier_stragglers` field + flagging rule +
   verdict + table section, `SCHEMA_VERSION` 6.

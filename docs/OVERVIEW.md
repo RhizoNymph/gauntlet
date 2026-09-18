@@ -110,7 +110,7 @@ Features Index:
       mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
       -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
       t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
+    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
   barrier_skew:
@@ -124,21 +124,27 @@ Features Index:
       margin gets its own flagging rule (fleet.barrier_stragglers, part of
       the verdict). Fleet-level per-iteration barrier-span distribution is
       recorded against the lead host.
-    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs]
+    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
     depends_on: [phase3_network]
     doc: docs/features/barrier_skew.md
   overlap_phase:
     description: >
-      Sustained GEMM concurrent with an intra-node NCCL all-reduce on the
-      same GPUs (single process, one rank per GPU, ncclCommInitAll; GEMM on
-      a second stream per device from one thread per GPU). Emits overlapped
-      GFLOPS per GPU and isolated + overlapped all-reduce bus bandwidth;
-      report::build derives retention ratios (overlapped/isolated) against
-      the phase-2 GEMM baselines and the phase-local collective baseline,
-      which feed the MAD outlier analysis as the primary combined-load
-      straggler signal. Runs last. Multi-node overlap is a documented
-      follow-up.
-    entry_points: [agent/gpu/overlap.rs, report/mod.rs]
+      Combined-load straggler tests, run last. Node-local step: sustained
+      GEMM concurrent with an intra-node NCCL all-reduce on the same GPUs
+      (single process, one rank per GPU, ncclCommInitAll; GEMM on a second
+      stream per device from one thread per GPU, gpu/worker.rs). Fleet
+      step (proto v6/schema v7, tests.overlap_fleet, >= 2 GPU hosts): the
+      same per-GPU GEMM load on every node while one rank per node drives
+      a cross-node all-reduce over the real fabric, window boundaries
+      agreed through a MIN-reduced control word (agent/window.rs) so no
+      cross-host clock comparison is needed; every rank reports its own
+      OverlapFleetReport (barrier-timings pattern). Both steps emit
+      overlapped GFLOPS per GPU and isolated + overlapped all-reduce bus
+      bandwidth; report::build derives retention ratios
+      (overlapped/isolated) against the phase-2 GEMM baselines and each
+      step's own collective baseline, which feed the MAD outlier analysis
+      as the primary combined-load straggler signal.
+    entry_points: [agent/gpu/overlap.rs, agent/nccl.rs, agent/window.rs, orchestrator/nccl.rs, report/mod.rs]
     depends_on: [phase2_gpu, phase3_network]
     doc: docs/features/overlap_phase.md
   counter_deltas:
