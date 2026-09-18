@@ -17,7 +17,9 @@ connect_timeout_secs = 10
 max_concurrent = 32
 
 [tests]
-phases = ["inventory", "cpu_mem", "gpu", "network"]
+# "overlap" (GEMM concurrent with intra-node all-reduce) runs last: its
+# retention ratios divide the isolated gpu-phase baselines from this run.
+phases = ["inventory", "cpu_mem", "gpu", "network", "overlap"]
 phase_timeout_secs = 900
 gemm_secs = 30
 gemm_dim = 8192
@@ -27,6 +29,9 @@ gemm_sdc_check_secs = 5      # loaded secs between bitwise checks in the sustain
 cpu_sdc_hot_secs = 10        # all-core correctness-under-power screen duration
 disk_paths = ["/tmp"]
 net_port_base = 29500
+overlap_secs = 30            # combined GEMM + all-reduce window
+overlap_baseline_secs = 5    # isolated intra-node all-reduce baseline
+overlap_msg_mib = 64         # all-reduce message size
 
 [thresholds]
 mad_k = 4.0

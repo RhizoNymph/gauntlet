@@ -28,10 +28,13 @@ Overview:
       beyond the driver stack). Emits JSON-lines events over stdout. Has peer
       (two-sided TCP tests) and nccl subcommand modes.
     scheduler: >
-      Phase DAG. Phases 0-2 are embarrassingly parallel across nodes. Phase 3
-      pairwise tests use round-robin tournament scheduling: n-1 rounds of n/2
-      disjoint pairs, wall time linear in n. Target scale 32-256 nodes; a
-      sampled mode exists for quick runs.
+      Phase DAG. Phases 0-2 and the overlap phase are embarrassingly
+      parallel across nodes. Phase 3 pairwise tests use round-robin
+      tournament scheduling: n-1 rounds of n/2 disjoint pairs, wall time
+      linear in n. The overlap phase (compute + comms under combined load)
+      runs last: its retention ratios divide the isolated phase-2 baselines
+      from the same run. Target scale 32-256 nodes; a sampled mode exists
+      for quick runs.
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
       MADs, applies optional absolute thresholds, renders table + JSON, sets
@@ -110,6 +113,20 @@ Features Index:
     entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
+  overlap_phase:
+    description: >
+      Sustained GEMM concurrent with an intra-node NCCL all-reduce on the
+      same GPUs (single process, one rank per GPU, ncclCommInitAll; GEMM on
+      a second stream per device from one thread per GPU). Emits overlapped
+      GFLOPS per GPU and isolated + overlapped all-reduce bus bandwidth;
+      report::build derives retention ratios (overlapped/isolated) against
+      the phase-2 GEMM baselines and the phase-local collective baseline,
+      which feed the MAD outlier analysis as the primary combined-load
+      straggler signal. Runs last. Multi-node overlap is a documented
+      follow-up.
+    entry_points: [agent/gpu/overlap.rs, report/mod.rs]
+    depends_on: [phase2_gpu, phase3_network]
+    doc: docs/features/overlap_phase.md
   counter_deltas:
     description: >
       Error-counter delta detection across the load phases: the agent
@@ -132,7 +149,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, counter_deltas]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas]
     doc: docs/features/reporting.md
   viewer:
     description: >

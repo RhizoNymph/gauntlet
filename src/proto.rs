@@ -18,7 +18,9 @@ use thiserror::Error;
 // reject a v2 spec; the version handshake forces a re-deploy instead).
 // v3: error-counter snapshot/delta events (`counter_baseline`,
 // `counter_deltas`) and the `counters` request on `AgentTaskSpec`.
-pub const PROTO_VERSION: u32 = 3;
+// v4: overlap phase (`Phase::Overlap`, `AgentTaskSpec.overlap`, overlap test
+// ids).
+pub const PROTO_VERSION: u32 = 4;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -101,10 +103,20 @@ pub enum Phase {
     CpuMem,
     Gpu,
     Network,
+    /// Sustained GEMM concurrent with an intra-node NCCL all-reduce. Runs
+    /// last: its straggler signal is *retention* against the isolated
+    /// phase-2 GEMM baselines from the same run.
+    Overlap,
 }
 
 impl Phase {
-    pub const ALL: [Phase; 4] = [Phase::Inventory, Phase::CpuMem, Phase::Gpu, Phase::Network];
+    pub const ALL: [Phase; 5] = [
+        Phase::Inventory,
+        Phase::CpuMem,
+        Phase::Gpu,
+        Phase::Network,
+        Phase::Overlap,
+    ];
 
     pub fn parse(s: &str) -> Option<Phase> {
         match s {
@@ -112,6 +124,7 @@ impl Phase {
             "cpu_mem" | "cpu" => Some(Phase::CpuMem),
             "gpu" => Some(Phase::Gpu),
             "network" | "net" => Some(Phase::Network),
+            "overlap" => Some(Phase::Overlap),
             _ => None,
         }
     }
@@ -148,6 +161,13 @@ pub enum TestId {
     NetBandwidth,
     NcclAllReduce,
     NcclAllGather,
+    /// GEMM throughput measured while the intra-node all-reduce runs.
+    OverlapGemm,
+    /// Intra-node all-reduce bandwidth: isolated baseline and under GEMM load.
+    OverlapAllReduce,
+    /// Derived orchestrator-side (`report::build`): overlapped/isolated
+    /// ratios. Agents never emit this test id.
+    OverlapRetention,
 }
 
 /// What a metric is *about*. Per-core / per-GPU granularity is the point:
@@ -390,6 +410,7 @@ pub struct AgentTaskSpec {
     pub mem: MemTaskSpec,
     pub disk: DiskTaskSpec,
     pub gpu: GpuTaskSpec,
+    pub overlap: OverlapTaskSpec,
     /// Error-counter pass to run after the listed phases; the orchestrator
     /// sends this in dedicated invocations with an empty phase list.
     #[serde(default)]
@@ -438,6 +459,29 @@ pub struct GpuTaskSpec {
     /// 0 disables (a Skipped outcome is emitted).
     #[serde(default)]
     pub sdc_check_secs: u64,
+}
+
+/// Phase "overlap": sustained GEMM on every GPU concurrently with an
+/// intra-node NCCL all-reduce across those same GPUs. An isolated all-reduce
+/// baseline (`baseline_secs`) precedes the combined window so the collective
+/// retention ratio compares like against like — same communicator, same
+/// topology, seconds apart. The GEMM retention baseline is the phase-2
+/// sustained number, joined orchestrator-side.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlapTaskSpec {
+    /// Wall seconds of combined GEMM + all-reduce load.
+    pub duration_secs: u64,
+    /// Wall seconds of the isolated intra-node all-reduce baseline.
+    pub baseline_secs: u64,
+    /// Square GEMM dimension for the compute leg (same as the phase-2 dim,
+    /// so retention divides comparable numbers).
+    pub gemm_dim: u32,
+    /// Single dtype for the compute leg: the phase measures contention,
+    /// not dtype coverage.
+    pub gemm_dtype: GemmDtype,
+    /// All-reduce message size in bytes.
+    pub msg_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

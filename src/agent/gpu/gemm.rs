@@ -61,7 +61,7 @@ pub fn residual_tolerance(dtype: GemmDtype) -> f64 {
 
 /// Fixed seed: every node in the fleet multiplies bit-identical matrices, so
 /// residuals are directly comparable across hosts.
-const GEMM_SEED: u64 = 0x243F_6A88_85A3_08D3;
+pub(crate) const GEMM_SEED: u64 = 0x243F_6A88_85A3_08D3;
 /// Independent fixed seed for choosing which elements of C to verify.
 const SAMPLE_SEED: u64 = 0x1319_8A2E_0370_7344;
 /// Elements of C recomputed in f64 on the host.
@@ -109,7 +109,7 @@ impl Xorshift64 {
     }
 }
 
-fn fill_matrix(rng: &mut Xorshift64, len: usize) -> Vec<f32> {
+pub(crate) fn fill_matrix(rng: &mut Xorshift64, len: usize) -> Vec<f32> {
     (0..len).map(|_| rng.next_centered_unit()).collect()
 }
 
@@ -206,7 +206,7 @@ fn round_to_dtype(value: f32, dtype: GemmDtype) -> f32 {
 /// Device-side A and B. 16-bit operands live in `u16` buffers holding the raw
 /// bit patterns; cuBLAS is told the element type through `cudaDataType_t`, so
 /// there is no need for cudarc's optional `f16` feature.
-enum Operands {
+pub(crate) enum Operands {
     Wide {
         a: CudaSlice<f32>,
         b: CudaSlice<f32>,
@@ -218,7 +218,7 @@ enum Operands {
 }
 
 impl Operands {
-    fn device_ptrs(
+    pub(crate) fn device_ptrs(
         &self,
         stream: &CudaStream,
     ) -> (driver_sys::CUdeviceptr, driver_sys::CUdeviceptr) {
@@ -240,12 +240,15 @@ fn read_ptr<T>(slice: &CudaSlice<T>, stream: &CudaStream) -> driver_sys::CUdevic
     ptr
 }
 
-fn write_ptr<T>(slice: &mut CudaSlice<T>, stream: &CudaStream) -> driver_sys::CUdeviceptr {
+pub(crate) fn write_ptr<T>(
+    slice: &mut CudaSlice<T>,
+    stream: &CudaStream,
+) -> driver_sys::CUdeviceptr {
     let (ptr, _sync) = slice.device_ptr_mut(stream);
     ptr
 }
 
-fn upload_operands(
+pub(crate) fn upload_operands(
     stream: &Arc<CudaStream>,
     host_a: &[f32],
     host_b: &[f32],
@@ -327,7 +330,7 @@ fn gemm_types(dtype: GemmDtype) -> (cublas_sys::cudaDataType_t, cublas_sys::cubl
 /// `a_ptr` and `b_ptr` must each address at least `n*n` elements of the
 /// operand type selected by `dtype`, and `c_ptr` at least `n*n` `f32`, all
 /// allocated in the context bound to `blas`.
-unsafe fn launch_gemm(
+pub(crate) unsafe fn launch_gemm(
     blas: &CudaBlas,
     dtype: GemmDtype,
     n: i32,
@@ -741,7 +744,7 @@ fn sustained_gflops(
 }
 
 /// 2·n³ flops per GEMM (one multiply and one add per inner-product term).
-fn sustained_gflops_value(n: usize, iters: u64, elapsed_secs: f64) -> f64 {
+pub(crate) fn sustained_gflops_value(n: usize, iters: u64, elapsed_secs: f64) -> f64 {
     2.0 * (n as f64).powi(3) * iters as f64 / elapsed_secs / 1e9
 }
 

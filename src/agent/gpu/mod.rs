@@ -9,6 +9,7 @@
 
 pub mod bandwidth;
 pub mod gemm;
+pub mod overlap;
 pub mod p2p;
 pub mod sdc;
 
