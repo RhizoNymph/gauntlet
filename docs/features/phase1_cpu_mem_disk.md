@@ -8,6 +8,11 @@ sequential disk throughput. Non-scope: GPU anything, network anything.
 `agent run` phase `cpu_mem` → `cpu::run` → `mem::run` → `disk::run`, all
 emitting through `EventSink`.
 
+Within `cpu::run`: isolated correctness screen → throughput → hot SDC
+screen (`run_hot_correctness`, see docs/features/hot_sdc.md) — last on
+purpose so the all-core throughput run has already pushed the package to
+thermal steady state.
+
 ### cpu.rs
 - Correctness: golden values for `checksum_round` / `float_checksum_round`
   computed once on the main thread, before any worker starts — a worker that
@@ -39,6 +44,14 @@ emitting through `EventSink`.
   and the accumulator lanes stay independent, so there is no reassociation.
 - `std::hint::black_box` guards the buffer and the accumulators so the
   optimizer cannot delete the loop.
+- Hot SDC screen (`cpu_sdc_hot`, additional to the isolated screen): for
+  `sdc_hot_secs` wall seconds every core simultaneously alternates a ~5 ms
+  FMA burn with one integer + one float checksum round, so correctness is
+  exercised at max package power/temperature. Mismatches are counted (the
+  worker keeps going) and emitted as `cpu_sdc_hot.mismatches` /
+  `cpu_sdc_hot.rounds` per Core; any nonzero count ⇒ Failed (hard,
+  exit-code relevant). `sdc_hot_secs = 0` ⇒ Skipped under Node scope.
+  Details: docs/features/hot_sdc.md.
 
 ### mem.rs
 - Triad `a[i] = b[i] + s*c[i]` with buffers ≥ `buffer_bytes_per_numa`

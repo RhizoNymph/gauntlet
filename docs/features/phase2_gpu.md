@@ -19,9 +19,18 @@ inventory saw GPUs is reported as Failed (broken driver is a finding).
   cuBLAS GEMM; compare a deterministic ~4096-element subsample against f64
   CPU recomputation; max relative error → `gpu_gemm_correctness.residual`
   metric + Passed/Failed vs `residual_tolerance(dtype)`. Sustained loop for
-  `gemm_secs`; sustained GFLOPS → `gpu_gemm_perf.gflops_<dtype>`. Sample
-  clocks/temp (nvidia-smi poll thread) → `clock_mhz_start`, `clock_mhz_end`,
-  `temp_c_max` per GPU (throttle detection = clock_end ≪ clock_start).
+  `gemm_secs` of *busy* time; sustained GFLOPS →
+  `gpu_gemm_perf.gflops_<dtype>`. Sample clocks/temp (nvidia-smi poll
+  thread) → `clock_mhz_start`, `clock_mhz_end`, `temp_c_max` per GPU
+  (throttle detection = clock_end ≪ clock_start).
+- Hot SDC (`gpu_gemm_sdc`, docs/features/hot_sdc.md): every
+  `sdc_check_secs` of busy time during the sustained loop, C is downloaded
+  and compared **bitwise** against a baseline captured after the warm-up
+  GEMM (cuBLAS is bit-reproducible for identical calls on the same GPU).
+  Checks run between timed windows so the reported GFLOPS is unpolluted.
+  Metrics `checks_/mismatches_/max_abs_dev_<dtype>` per GPU; any mismatch
+  ⇒ Failed outcome carrying the clock/temp at each failure (hard,
+  exit-code relevant); zero completed checks ⇒ Skipped, never Passed.
 - bandwidth.rs: best-of-N `bandwidth_bytes` copies: D2D, H2D pinned, D2H
   pinned → `gpu_mem_bandwidth.{d2d,h2d_pinned,d2h_pinned}` GiB/s.
 - p2p.rs: for each ordered pair with p2p capability: enable access, large
