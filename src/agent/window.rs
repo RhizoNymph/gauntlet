@@ -55,6 +55,38 @@ pub fn window_closed(reduced_min: f32) -> bool {
     reduced_min < (CONTROL_OPEN + CONTROL_CLOSE) / 2.0
 }
 
+/// Minimum tallied payload iterations before a close signal is honored.
+///
+/// On a degraded link a short window (baseline default 5s) could otherwise
+/// close after a single cold batch, making the retention denominator
+/// noise. Every rank applies the floor to its own tally, and every rank
+/// runs exactly the same batches (windows close in the same control step),
+/// so the counts — and therefore the decision — are identical fleet-wide:
+/// the floor can never split the group.
+pub const MIN_WINDOW_ITERS: u64 = 16;
+
+/// Whether to actually leave the window: the lead has signalled closure
+/// *and* enough payload iterations are in the tally for the window's
+/// figure to mean something.
+pub fn should_close(reduced_min: f32, tallied_iters: u64) -> bool {
+    window_closed(reduced_min) && tallied_iters >= MIN_WINDOW_ITERS
+}
+
+/// Floor of the follower failsafe, so a tiny configured window still
+/// leaves room for warm-up and the iteration floor.
+pub const FAILSAFE_FLOOR_SECS: u64 = 10;
+
+/// Follower failsafe budget for one window, in seconds: if the lead has
+/// not closed the window within twice its configured duration (with a
+/// floor), the lead is presumed dead and the follower must end the
+/// protocol with a structured error instead of hammering the fabric until
+/// an external kill. Only helps while collectives still complete — a rank
+/// blocked *inside* a collective can only be reaped by the orchestrator's
+/// phase timeout.
+pub fn failsafe_secs(budget_secs: u64) -> u64 {
+    budget_secs.saturating_mul(2).max(FAILSAFE_FLOOR_SECS)
+}
+
 /// Payload-iteration accounting for one consensus window. Only payload
 /// batches are recorded (the control reduce and its synchronizations stay
 /// outside), so the per-iteration figure measures the collective, not the
@@ -130,6 +162,28 @@ mod tests {
         assert!(window_closed(-1e-7));
         assert!(!window_closed(1.0));
         assert!(!window_closed(1.0 - 1e-6));
+    }
+
+    #[test]
+    fn close_signals_are_ignored_until_the_iteration_floor() {
+        let closed = CONTROL_CLOSE;
+        assert!(!should_close(closed, 0));
+        assert!(!should_close(closed, MIN_WINDOW_ITERS - 1));
+        assert!(should_close(closed, MIN_WINDOW_ITERS));
+        assert!(should_close(closed, MIN_WINDOW_ITERS + 100));
+        // No amount of iterations closes a window the lead holds open.
+        assert!(!should_close(CONTROL_OPEN, u64::MAX));
+    }
+
+    #[test]
+    fn the_failsafe_is_twice_the_budget_with_a_floor() {
+        assert_eq!(failsafe_secs(30), 60);
+        assert_eq!(failsafe_secs(5), 10);
+        // Tiny and zero budgets keep a workable floor.
+        assert_eq!(failsafe_secs(1), FAILSAFE_FLOOR_SECS);
+        assert_eq!(failsafe_secs(0), FAILSAFE_FLOOR_SECS);
+        // Absurd budgets must not overflow.
+        assert_eq!(failsafe_secs(u64::MAX), u64::MAX);
     }
 
     #[test]

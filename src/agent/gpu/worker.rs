@@ -4,15 +4,22 @@
 //! (`agent::nccl`), which differ only in what the collective leg is.
 //!
 //! Lifecycle contract:
-//! - `GemmLoad::spawn` starts the workers; each sets up (fill, upload, warm
-//!   launch) off the timed path and then blocks on a start barrier.
+//! - `GemmLoad::spawn` starts the workers; each sets up (upload, warm
+//!   launch, synchronize) and then parks at a ready barrier.
+//! - `wait_ready` returns once every worker has finished (or failed) setup
+//!   and gone quiet — from here until `start`, the GPUs do no work, so a
+//!   caller can measure an isolated baseline in between.
 //! - `start` releases every worker at once; the combined window begins.
 //! - `finish` sets the stop flag and joins every worker, returning one
-//!   result per GPU in device order.
+//!   result per context in spawn order. It also releases workers still
+//!   parked at the start barrier (error paths where the combined window
+//!   never began), so it is safe to call on every path.
 //!
-//! Workers reach the start barrier on *every* path, including failed setup,
-//! so the driver can never deadlock; `finish` consumes the load, so workers
-//! can never leak past the window that spawned them.
+//! Workers reach both barriers on *every* path, including failed setup, so
+//! the driver can never deadlock; `finish` consumes the load, so workers
+//! can never leak past the window that spawned them. Operand matrices are
+//! filled once and shared across workers (`Arc`) — per-worker fills would
+//! burn hundreds of MB of redundant host memory per GPU at real dims.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -40,47 +47,77 @@ pub(crate) struct GemmThroughput {
     pub elapsed_secs: f64,
 }
 
-/// One GEMM worker thread per GPU, plus the shared start/stop plumbing.
+/// One GEMM worker thread per GPU, plus the shared ready/start/stop
+/// plumbing.
 pub(crate) struct GemmLoad {
     stop: Arc<AtomicBool>,
+    ready: Arc<Barrier>,
     start: Arc<Barrier>,
+    started: bool,
     workers: Vec<JoinHandle<Result<GemmThroughput, String>>>,
 }
 
 impl GemmLoad {
-    /// Spawn one worker per context. Workers set up immediately but do not
+    /// Spawn one worker per context. The operand matrices are filled once
+    /// here and shared; workers upload and warm up immediately but do not
     /// start the timed loop until [`GemmLoad::start`].
     pub(crate) fn spawn(contexts: &[Arc<CudaContext>], dim: u32, dtype: GemmDtype) -> Self {
+        let n = dim.max(1) as usize;
+        let mut rng = Xorshift64::new(GEMM_SEED);
+        let host_a: Arc<Vec<f32>> = Arc::new(fill_matrix(&mut rng, n * n));
+        let host_b: Arc<Vec<f32>> = Arc::new(fill_matrix(&mut rng, n * n));
         let stop = Arc::new(AtomicBool::new(false));
-        // +1: the driver thread joins the barrier through `start`.
+        // +1 on both barriers: the driver thread joins them through
+        // `wait_ready` and `start`.
+        let ready = Arc::new(Barrier::new(contexts.len() + 1));
         let start = Arc::new(Barrier::new(contexts.len() + 1));
         let workers = contexts
             .iter()
             .map(|ctx| {
                 let ctx = Arc::clone(ctx);
+                let host_a = Arc::clone(&host_a);
+                let host_b = Arc::clone(&host_b);
                 let stop = Arc::clone(&stop);
+                let ready = Arc::clone(&ready);
                 let start = Arc::clone(&start);
-                std::thread::spawn(move || gemm_worker(ctx, dim, dtype, &stop, &start))
+                std::thread::spawn(move || {
+                    gemm_worker(ctx, dim, dtype, &host_a, &host_b, &stop, &ready, &start)
+                })
             })
             .collect();
         Self {
             stop,
+            ready,
             start,
+            started: false,
             workers,
         }
     }
 
-    /// Meet the workers at the start barrier: returns once every worker has
-    /// finished setup and the combined window can begin.
-    pub(crate) fn start(&self) {
+    /// Block until every worker has finished setup (successfully or not)
+    /// and gone quiet. After this returns, no worker touches its GPU until
+    /// [`GemmLoad::start`].
+    pub(crate) fn wait_ready(&self) {
+        self.ready.wait();
+    }
+
+    /// Release the workers into the timed loop: the combined window begins.
+    pub(crate) fn start(&mut self) {
+        self.started = true;
         self.start.wait();
     }
 
-    /// Stop and join every worker. Always called before the caller
-    /// propagates any collective error, so a failed collective never leaks
-    /// GEMM threads.
-    pub(crate) fn finish(self) -> Vec<Result<GemmThroughput, String>> {
+    /// Stop and join every worker. Safe on every path: workers still parked
+    /// at the start barrier (the combined window never began) are released
+    /// with the stop flag already set, so they exit without doing work.
+    /// Always called before the caller propagates any collective error, so
+    /// a failed collective never leaks GEMM threads.
+    pub(crate) fn finish(mut self) -> Vec<Result<GemmThroughput, String>> {
         self.stop.store(true, Ordering::Relaxed);
+        if !self.started {
+            self.started = true;
+            self.start.wait();
+        }
         self.workers
             .into_iter()
             .map(|worker| {
@@ -104,34 +141,45 @@ struct GemmState {
     dtype: GemmDtype,
 }
 
-/// Set up, meet the barrier, then hammer GEMMs until told to stop.
+/// Set up, park at the ready barrier, wait for the start barrier, then
+/// hammer GEMMs until told to stop.
 ///
-/// The barrier is reached on *every* path — including a failed setup — so
-/// the driver thread can never deadlock waiting for a worker.
+/// Both barriers are reached on *every* path — including a failed setup —
+/// so the driver thread can never deadlock waiting for a worker.
+#[allow(clippy::too_many_arguments)]
 fn gemm_worker(
     ctx: Arc<CudaContext>,
     dim: u32,
     dtype: GemmDtype,
+    host_a: &[f32],
+    host_b: &[f32],
     stop: &AtomicBool,
+    ready: &Barrier,
     start: &Barrier,
 ) -> Result<GemmThroughput, String> {
-    let prepared = guard("overlap gemm setup", || prepare(&ctx, dim, dtype));
+    let prepared = guard("overlap gemm setup", || {
+        prepare(&ctx, dim, dtype, host_a, host_b)
+    });
+    ready.wait();
     start.wait();
     let mut state = prepared?;
     guard("overlap gemm loop", || gemm_loop(&mut state, stop))
 }
 
-fn prepare(ctx: &Arc<CudaContext>, dim: u32, dtype: GemmDtype) -> Result<GemmState> {
+fn prepare(
+    ctx: &Arc<CudaContext>,
+    dim: u32,
+    dtype: GemmDtype,
+    host_a: &[f32],
+    host_b: &[f32],
+) -> Result<GemmState> {
     ctx.bind_to_thread()?;
     // The collective owns the default stream; the GEMM gets its own so the
     // two workloads genuinely run concurrently on the device.
     let stream = ctx.new_stream()?;
     let blas = CudaBlas::new(Arc::clone(&stream)).context("creating cublas handle")?;
     let n = dim.max(1) as usize;
-    let mut rng = Xorshift64::new(GEMM_SEED);
-    let host_a = fill_matrix(&mut rng, n * n);
-    let host_b = fill_matrix(&mut rng, n * n);
-    let operands = upload_operands(&stream, &host_a, &host_b, dtype)?;
+    let operands = upload_operands(&stream, host_a, host_b, dtype)?;
     let mut c = stream.alloc_zeros::<f32>(n * n)?;
     // One warm launch so cuBLAS heuristics run outside the timed window.
     let (a_ptr, b_ptr) = operands.device_ptrs(&stream);

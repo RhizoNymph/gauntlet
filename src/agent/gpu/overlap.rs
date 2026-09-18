@@ -35,22 +35,17 @@ use super::gemm::{dtype_tag, sustained_gflops_value};
 use super::guard;
 use super::worker::GemmLoad;
 use crate::agent::EventSink;
-use crate::agent::nccl::all_reduce_bus_gib_per_sec;
-use crate::proto::{LogLevel, MetricRecord, OverlapTaskSpec, Scope, TestId, TestOutcome, Unit};
+use crate::agent::nccl::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
+use crate::proto::{
+    LogLevel, MetricRecord, OverlapSpec, Scope, TestId, TestOutcome, Unit, overlap_metric,
+};
 
-const F32_BYTES: usize = std::mem::size_of::<f32>();
 /// Untimed all-reduce rounds before any timed window, so channel setup and
 /// algorithm selection stay out of the isolated baseline.
 const WARMUP_ROUNDS: u32 = 5;
 /// All-reduce rounds queued between stream synchronizations in a timed
 /// window.
 const ROUND_ITERS: u32 = 4;
-
-/// All-reduce payload element count for a requested message size; never
-/// zero, so a degenerate spec still exercises the collective.
-fn message_elements(msg_bytes: u64) -> usize {
-    (msg_bytes as usize / F32_BYTES).max(1)
-}
 
 /// Mean seconds per iteration over a timed window.
 fn per_iter_secs(elapsed_secs: f64, iters: u64) -> f64 {
@@ -70,7 +65,7 @@ fn nccl_error(what: &str, error: NcclError) -> anyhow::Error {
 /// Run the overlap test. Node-level failures (driver init, communicator
 /// init) become Failed outcomes; fewer than two GPUs is a Skipped outcome
 /// (a world of one moves nothing, so there is no contention to measure).
-pub fn run(sink: &EventSink, spec: &OverlapTaskSpec) -> Result<()> {
+pub fn run(sink: &EventSink, spec: &OverlapSpec) -> Result<()> {
     let device_count = match guard("cuda driver init", || Ok(CudaContext::device_count()?)) {
         Ok(count) => count.max(0) as u32,
         Err(reason) => {
@@ -106,7 +101,7 @@ fn node_outcomes(sink: &EventSink, outcome: impl Fn(String) -> TestOutcome, reas
 // Combined-load driver
 // ---------------------------------------------------------------------------
 
-fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Result<()> {
+fn execute(sink: &EventSink, spec: &OverlapSpec, device_count: u32) -> Result<()> {
     let elements = message_elements(spec.msg_bytes);
     let message_bytes = (elements * F32_BYTES) as f64;
 
@@ -143,10 +138,11 @@ fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Resul
         spec.baseline_secs,
     )?;
 
-    // One GEMM worker per GPU (`gpu::worker`). Workers set up (fill,
-    // upload, warm launch) off the timed path, then everyone meets at the
-    // barrier and the combined window begins.
-    let load = GemmLoad::spawn(&contexts, spec.gemm_dim, spec.gemm_dtype);
+    // One GEMM worker per GPU (`gpu::worker`). Workers set up (upload,
+    // warm launch) off the timed path; `wait_ready` + `start` releases
+    // them together and the combined window begins.
+    let mut load = GemmLoad::spawn(&contexts, spec.gemm_dim, spec.gemm_dtype);
+    load.wait_ready();
     load.start();
 
     let overlapped = timed_rounds(
@@ -163,14 +159,14 @@ fn execute(sink: &EventSink, spec: &OverlapTaskSpec, device_count: u32) -> Resul
 
     // Collective results, node scope.
     for (name, value, unit) in [
-        ("msg_bytes", message_bytes, Unit::Bytes),
+        (overlap_metric::MSG_BYTES, message_bytes, Unit::Bytes),
         (
-            "isolated_bus_gib_per_sec",
+            overlap_metric::ISOLATED_BUS,
             all_reduce_bus_gib_per_sec(message_bytes, isolated_per_iter, device_count),
             Unit::GibPerSec,
         ),
         (
-            "overlap_bus_gib_per_sec",
+            overlap_metric::OVERLAP_BUS,
             all_reduce_bus_gib_per_sec(message_bytes, overlapped_per_iter, device_count),
             Unit::GibPerSec,
         ),
@@ -263,14 +259,6 @@ fn sync_all(streams: &[Arc<CudaStream>]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn message_elements_are_f32_sized_and_never_zero() {
-        assert_eq!(message_elements(64 << 20), (64 << 20) / 4);
-        assert_eq!(message_elements(4), 1);
-        assert_eq!(message_elements(0), 1);
-        assert_eq!(message_elements(3), 1);
-    }
 
     #[test]
     fn per_iter_secs_divides_and_survives_zero_iters() {

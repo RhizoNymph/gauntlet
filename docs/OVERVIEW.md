@@ -110,7 +110,7 @@ Features Index:
       mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
       -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
       t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
+    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
   barrier_skew:
@@ -124,7 +124,7 @@ Features Index:
       margin gets its own flagging rule (fleet.barrier_stragglers, part of
       the verdict). Fleet-level per-iteration barrier-span distribution is
       recorded against the lead host.
-    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs]
+    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
     depends_on: [phase3_network]
     doc: docs/features/barrier_skew.md
   overlap_phase:
@@ -144,7 +144,7 @@ Features Index:
       (overlapped/isolated) against the phase-2 GEMM baselines and each
       step's own collective baseline, which feed the MAD outlier analysis
       as the primary combined-load straggler signal.
-    entry_points: [agent/gpu/overlap.rs, agent/nccl.rs, agent/window.rs, orchestrator/mod.rs, report/mod.rs]
+    entry_points: [agent/gpu/overlap.rs, agent/nccl.rs, agent/window.rs, orchestrator/nccl.rs, report/mod.rs]
     depends_on: [phase2_gpu, phase3_network]
     doc: docs/features/overlap_phase.md
   counter_deltas:

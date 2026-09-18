@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapNcclSpec,
-    OverlapTaskSpec, Phase,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
+    Phase,
 };
 
 #[derive(Debug, Error)]
@@ -288,28 +288,22 @@ impl FleetConfig {
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
                 sdc_check_secs: tests.gemm_sdc_check_secs,
             },
-            overlap: OverlapTaskSpec {
-                duration_secs: tests.overlap_secs,
-                baseline_secs: tests.overlap_baseline_secs,
-                // Same dimension as phase 2 so the retention ratio divides
-                // comparable numbers; the compute leg runs the first
-                // configured dtype only.
-                gemm_dim: tests.gemm_dim,
-                gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
-                msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
-            },
+            overlap: self.overlap_spec(),
             // Counter passes are scheduled by the orchestrator as dedicated
             // invocations; a plain phase spec never carries one.
             counters: None,
         }
     }
 
-    /// The fleet-overlap payload sent on the NCCL directives. Same knobs as
-    /// the node-local overlap spec (`task_spec().overlap`): the fleet step
-    /// measures the same contention, one topology level up.
-    pub fn overlap_nccl_spec(&self) -> OverlapNcclSpec {
+    /// The overlap-step parameters, shared verbatim by the node-local
+    /// phase (`AgentTaskSpec.overlap`) and the fleet step
+    /// (`NcclWorkload::Overlap`): both measure the same contention, one
+    /// topology level apart. The compute leg reuses the phase-2 dimension
+    /// (so retention divides comparable numbers) and the *first* configured
+    /// dtype only — it measures contention, not dtype coverage.
+    pub fn overlap_spec(&self) -> OverlapSpec {
         let tests = &self.tests;
-        OverlapNcclSpec {
+        OverlapSpec {
             duration_secs: tests.overlap_secs,
             baseline_secs: tests.overlap_baseline_secs,
             gemm_dim: tests.gemm_dim,

@@ -110,34 +110,61 @@ rank 0 contributes 0.0 once its local clock says the window is over, 1.0
 before that; every other rank always contributes 1.0. The MIN is 0 exactly
 when the lead closed the window, and a collective returns the same value
 everywhere, so all ranks leave in the same control step. Only rank 0's
-clock ever matters. The pure logic (`contribution`, `window_closed`,
-`WindowTally`) lives in `src/agent/window.rs`, unit-tested without a GPU;
-control steps stay outside the bandwidth tally, so per-iteration timings
-measure the payload collective only.
+clock ever matters.
+
+Refinements, all in the pure module (`src/agent/window.rs`, unit-tested
+without a GPU):
+- **Alignment round**: each window opens with one untallied payload batch,
+  so whatever skew the previous boundary (or the worker start release)
+  left behind is absorbed before the first tallied batch — the figure
+  starts from a synchronized point on every rank.
+- **Iteration floor** (`MIN_WINDOW_ITERS`, 16): a close signal is honored
+  only once that many payload iterations are tallied, so a degraded link
+  cannot reduce the baseline denominator to a single cold batch. Every
+  rank runs identical batches, so the floor decides identically everywhere
+  and can never split the group.
+- **Follower failsafe** (`failsafe_secs`: 2× the window budget, floor
+  10s): a follower whose lead never closes the window ends the protocol
+  with a structured error instead of hammering the fabric until an
+  external kill. It only helps while collectives still complete; a rank
+  blocked *inside* a collective is reaped by the orchestrator's phase
+  timeout, as before.
+- Control steps and the alignment round stay outside the bandwidth tally
+  (`WindowTally`), so per-iteration timings measure the payload collective
+  only.
 
 ### Flow
-1. Orchestrator (`overlap_fleet_sweep`, inside the Overlap phase arm after
-   the node-local fan-out, gated on `tests.overlap_fleet` and ≥ 2 hosts
-   from `nccl_world`): builds `NcclJob { overlap: Some(spec), sizes: [] }`
-   and runs it through `drive_fleet_nccl` — the rendezvous-relay +
-   participant-supervision driver shared with the phase-3 sweep
-   (`NcclFailureMode::WarnOnly`: a failed group warns and yields absent
-   results, never a failed-host verdict).
-2. Agent (`agent/nccl.rs::overlap_fleet`, gpu feature): when the directive
-   carries `OverlapNcclSpec`, the rank skips the sweep entirely. Warmup,
-   isolated baseline window (GEMM workers not yet spawned), then
-   `GemmLoad::spawn` on every local GPU, the overlapped window on the same
-   communicator, `finish` (stop + join) before any error propagates.
+1. Orchestrator (`orchestrator/nccl.rs::overlap_fleet_sweep`, inside the
+   Overlap phase arm after the node-local fan-out, gated on
+   `tests.overlap_fleet` and ≥ 2 hosts from `nccl_world`): builds an
+   `NcclJob` with `NcclWorkload::Overlap(spec)` and runs it through
+   `drive_fleet_nccl` — the rendezvous-relay + participant-supervision
+   driver shared with the phase-3 sweep — in `WarnOnly` failure mode.
+2. Agent (`agent/nccl.rs::overlap_fleet`, gpu feature): the workload enum
+   replaces the sweep wholesale. All fallible GEMM setup happens *before*
+   the communicator enters the first window: `local_contexts` (a bad GPU
+   degrades to a Failed report entry) then `GemmLoad::spawn` +
+   `wait_ready` (workers upload, warm up, and park quiet at the start
+   barrier). Then warmup collectives, the isolated baseline window (quiet
+   GPUs), `start()` — the only between-window action — the overlapped
+   window on the same communicator, and `finish` (stop + join) on every
+   path before any error propagates. A rank can no longer abort *between*
+   the windows and strand the fleet mid-collective.
 3. Every rank emits `AgentEvent::OverlapFleetReport` (barrier-timings
    pattern: participants emit Hello, then the typed event; the driver
    intercepts and merges; a stray at the collector is debug-ignored).
 4. Orchestrator (`fleet_overlap_records`) turns each report into metrics
    attributed to that rank's host — `overlap_fleet_all_reduce.{msg_bytes,
    isolated_bus_gib_per_sec, overlap_bus_gib_per_sec}` under `Scope::Node`,
-   `overlap_fleet_gemm.gflops_<dtype>` per `Scope::Gpu` — plus Passed
-   outcomes, and per-GPU Failed outcomes for failed workers (a real
-   finding, unlike a failed group).
-5. Report: `derive_overlap_retention` also derives
+   `overlap_fleet_gemm.gflops_<dtype>` per `Scope::Gpu` (names via
+   `proto::overlap_metric`) — plus Passed outcomes, and per-GPU Failed
+   outcomes for failed workers.
+5. Everything short of running lands in the results document: the gated
+   skip (< 2 NCCL-capable hosts) records Skipped outcomes for both fleet
+   tests on each eligible host; a rank that fails, times out, or never
+   reports records Failed outcomes with the reason — but never a
+   failed-*host* verdict. Only `overlap_fleet = false` leaves no trace.
+6. Report: `derive_overlap_retention` also derives
    `overlap_retention.fleet_gemm_<dtype>` (per GPU, vs the phase-2
    baseline, same GPU/repeat) and `overlap_retention.fleet_all_reduce`
    (per node, overlapped/isolated from this step's own baseline window).
@@ -154,24 +181,30 @@ self-contained).
 ## Files
 - `src/agent/gpu/overlap.rs` — node-local agent-side driver, timed rounds.
 - `src/agent/gpu/worker.rs` — shared GEMM-load machinery (`GemmLoad`:
-  spawn / start-barrier / finish), used by both steps.
+  spawn / wait_ready / start / finish; operands filled once and `Arc`d
+  across workers), used by both steps.
 - `src/agent/window.rs` — pure window-consensus logic (control word,
-  closure predicate, payload tally); no GPU dependency.
-- `src/agent/nccl.rs` — `all_reduce_bus_gib_per_sec` (shared formula);
-  `overlap_fleet` + `consensus_window` (gpu feature).
+  closure predicate + iteration floor, follower failsafe, payload tally);
+  no GPU dependency.
+- `src/agent/nccl.rs` — `all_reduce_bus_gib_per_sec`, `message_elements`
+  (shared); `overlap_fleet` + `consensus_window` (gpu feature).
 - `src/agent/gpu/gemm.rs` — shared kernels/helpers (`launch_gemm`,
   `upload_operands`, `fill_matrix`, `sustained_gflops_value` — pub(crate)).
-- `src/proto.rs` — `Phase::Overlap`, `OverlapTaskSpec`, `OverlapNcclSpec`,
-  `OverlapFleetReport`/`OverlapGpuGemm`, `TestId::{OverlapGemm,
-  OverlapAllReduce, OverlapFleetGemm, OverlapFleetAllReduce,
-  OverlapRetention}`; PROTO_VERSION 6 (serde-defaulted directive field, so
-  old *documents* decode; the version handshake still re-deploys agents).
-- `src/config.rs` — `overlap_*` keys, `task_spec` mapping,
-  `overlap_nccl_spec`.
+- `src/proto.rs` — `Phase::Overlap`, the shared `OverlapSpec` (embedded in
+  both `AgentTaskSpec.overlap` and `NcclWorkload::Overlap`),
+  `NcclWorkload` (sweep and overlap mutually exclusive by construction),
+  `OverlapFleetReport`/`OverlapGpuGemm`, `overlap_metric` name consts,
+  `TestId::{OverlapGemm, OverlapAllReduce, OverlapFleetGemm,
+  OverlapFleetAllReduce, OverlapRetention}`; PROTO_VERSION 6.
+- `src/config.rs` — `overlap_*` keys, the single `overlap_spec` mapper
+  (feeds both steps).
 - `src/agent/mod.rs` — phase dispatch (`overlap_phase`, gpu/non-gpu).
 - `src/orchestrator/mod.rs` — Overlap phase arm (node-local fan-out then
-  `overlap_fleet_sweep`), `nccl_world` / `NcclJob` / `drive_fleet_nccl`
-  shared with the phase-3 sweep, `fleet_overlap_records`.
+  the fleet step).
+- `src/orchestrator/nccl.rs` — `nccl_world` / `NcclJob` /
+  `drive_fleet_nccl` (returns the per-host failure map) shared with the
+  phase-3 sweep; `overlap_fleet_sweep`, `fleet_overlap_records`,
+  `step_outcomes`.
 - `src/orchestrator/collect.rs` — stray `OverlapFleetReport` ignored.
 - `src/report/mod.rs` — `derive_overlap_retention` (both steps), display
   names, `min_overlap_retention` table column; SCHEMA_VERSION 7.
@@ -184,20 +217,30 @@ self-contained).
 - Agents never emit `TestId::OverlapRetention`; it is derived
   orchestrator-side and only from finite values over positive baselines.
   Fleet and intra-node all-reduce retentions never share a baseline.
-- Each isolated all-reduce baseline is measured with quiet SMs (workers
-  not yet spawned) on the same communicator as its overlapped window.
+- Each isolated all-reduce baseline is measured with quiet SMs on the same
+  communicator as its overlapped window: intra-node, the workers are not
+  yet spawned; in the fleet step they are already set up but parked at the
+  start barrier (`wait_ready`), so a rank never performs fallible GEMM
+  setup between the windows.
 - The GEMM leg and the collective run on different streams of the same
   device; neither is ever serialized behind the other by construction.
-- Worker threads always reach the start barrier and are always joined —
-  no deadlock, no leaked threads, regardless of error path (`GemmLoad`
-  contract, both steps).
+- Worker threads always reach both barriers and are always joined — no
+  deadlock, no leaked threads, regardless of error path; `finish` releases
+  workers still parked at the start barrier (`GemmLoad` contract, both
+  steps).
 - Fleet windows close for every rank in the same control step, driven
-  solely by rank 0's clock through the MIN-reduced control word; followers
-  never consult their own clocks.
-- A failed fleet-overlap NCCL group warns and produces absent results —
-  never a failed-host verdict on its own. A failed GEMM worker inside a
-  successful group is a per-GPU Failed outcome (mirrors the node-local
-  step).
+  solely by rank 0's clock through the MIN-reduced control word (subject
+  to the deterministic iteration floor); followers never consult their own
+  clocks except for the dead-lead failsafe, which ends the protocol with
+  an error rather than closing a window.
+- Every tallied window figure rests on at least `MIN_WINDOW_ITERS` payload
+  iterations, measured from an aligned start (untallied alignment round).
+- A failed fleet-overlap NCCL group, rank, or gate is visible in the
+  results document as Skipped/Failed outcomes on the fleet overlap tests —
+  never as a failed-host verdict on its own. A failed GEMM worker (or
+  unusable GPU context) inside a successful group is a per-GPU Failed
+  outcome (mirrors the node-local step). Only `overlap_fleet = false`
+  leaves no trace.
 - Everything compiles and unit-tests without a GPU: cudarc is
   dynamic-loading, all entry points are guarded, and the consensus/ratio/
   serde/wiring logic is pure and tested with synthetic data.

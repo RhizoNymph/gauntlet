@@ -132,8 +132,7 @@ fn overlap_phase_exists_and_runs_last() {
 #[test]
 fn overlap_task_spec_round_trips() {
     use gauntlet::proto::{
-        AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec,
-        OverlapTaskSpec,
+        AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
     };
     let spec = AgentTaskSpec {
         phases: vec![Phase::Gpu, Phase::Overlap],
@@ -157,7 +156,7 @@ fn overlap_task_spec_round_trips() {
             bandwidth_bytes: 1 << 20,
             sdc_check_secs: 0,
         },
-        overlap: OverlapTaskSpec {
+        overlap: OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,
             gemm_dim: 2048,
@@ -246,25 +245,27 @@ fn fleet_overlap_events_round_trip() {
 }
 
 #[test]
-fn nccl_directives_default_the_overlap_spec_absent() {
-    use gauntlet::proto::{NcclDirective, OverlapNcclSpec};
-    // Wire output from a pre-v6 orchestrator build: no overlap field.
-    let old = r#"{"directive":"lead","world_size":3,"sizes":[1024],"iters_per_size":20,"socket_ifname":null,"barrier":null}"#;
-    let directive: NcclDirective = serde_json::from_str(old).expect("decode old lead");
-    let NcclDirective::Lead { overlap, .. } = directive else {
-        panic!("expected a Lead directive");
+fn nccl_workloads_are_mutually_exclusive_by_construction() {
+    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec};
+    // A sweep workload written without the optional barrier probe.
+    let sweep = r#"{"directive":"lead","world_size":3,"socket_ifname":null,
+        "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+    let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
+    let NcclDirective::Lead {
+        workload: NcclWorkload::Sweep { barrier, .. },
+        ..
+    } = directive
+    else {
+        panic!("expected a Lead sweep directive");
     };
-    assert_eq!(overlap, None);
+    assert_eq!(barrier, None);
 
     let with_overlap = NcclDirective::Participate {
         unique_id_b64: "abc".into(),
         rank: 2,
         world_size: 3,
-        sizes: Vec::new(),
-        iters_per_size: 0,
         socket_ifname: Some("bond0".into()),
-        barrier: None,
-        overlap: Some(OverlapNcclSpec {
+        workload: NcclWorkload::Overlap(OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,
             gemm_dim: 8192,

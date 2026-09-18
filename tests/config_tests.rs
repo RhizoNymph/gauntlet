@@ -154,18 +154,14 @@ fn overlap_defaults_and_task_spec_mapping() {
 }
 
 #[test]
-fn fleet_overlap_defaults_on_and_maps_to_the_nccl_spec() {
+fn fleet_overlap_toggle_defaults_on() {
     let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
     assert!(config.tests.overlap_fleet);
-
-    // The fleet step reuses the node-local overlap knobs verbatim.
-    let task = config.task_spec(&[Phase::Overlap]).overlap;
-    let spec = config.overlap_nccl_spec();
-    assert_eq!(spec.duration_secs, task.duration_secs);
-    assert_eq!(spec.baseline_secs, task.baseline_secs);
-    assert_eq!(spec.gemm_dim, task.gemm_dim);
-    assert_eq!(spec.gemm_dtype, task.gemm_dtype);
-    assert_eq!(spec.msg_bytes, task.msg_bytes);
+    // Both steps are handed the same spec value — one mapper, no drift.
+    assert_eq!(
+        config.task_spec(&[Phase::Overlap]).overlap,
+        config.overlap_spec()
+    );
 
     let off = parse(
         r#"
