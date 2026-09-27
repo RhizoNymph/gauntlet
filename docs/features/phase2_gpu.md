@@ -38,6 +38,8 @@ inventory saw GPUs is reported as Failed (broken driver is a finding).
   GpuPair scope; no-p2p pairs ⇒ Skipped outcome.
 
 ## NCCL (phase 3 component, same owner)
+Both sweep levels (fleet `agent nccl`, intra-node `agent run` network arm)
+share `agent::sweep::run_plan`; see docs/features/phase3_network.md.
 `agent nccl` reads `NcclDirective` from stdin. GenerateId (rank 0) prints
 `NcclUniqueId` JSON on stdout. Participate: set NCCL_SOCKET_IFNAME if
 given, init communicator (one process/node, one GPU/rank v1), warmup, then
@@ -46,8 +48,8 @@ emits `nccl_all_reduce.elapsed_us` + `msg_bytes` + `bus_gib_per_sec`
 metrics per size. Bus bandwidth formula: allreduce factor 2(n-1)/n.
 
 ## Files
-`src/agent/gpu/{mod,gemm,bandwidth,p2p}.rs`, `src/agent/nccl.rs`;
-specs/types in `src/proto.rs` (`GpuTaskSpec`, `GemmDtype`, `NcclDirective`).
+`src/agent/gpu/{mod,gemm,bandwidth,p2p}.rs`, `src/agent/nccl/`;
+specs/types in `src/proto/mod.rs` (`GpuTaskSpec`, `GemmDtype`, `NcclDirective`).
 
 ## Implementation notes
 

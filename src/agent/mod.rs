@@ -14,10 +14,12 @@ pub mod channel;
 pub mod counters;
 pub mod cpu;
 pub mod disk;
+pub mod intranode;
 pub mod inventory;
 pub mod mem;
 pub mod nccl;
 pub mod net;
+pub mod sweep;
 pub mod window;
 
 #[cfg(feature = "gpu")]
@@ -117,9 +119,10 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             Phase::Inventory => inventory::run(&sink),
             Phase::CpuMem => cpu_mem_phase(&sink, &spec),
             Phase::Gpu => gpu_phase(&sink, &spec),
-            // Network tests are driven pairwise by the orchestrator through
-            // `agent peer` / `agent nccl`, not from the phase loop.
-            Phase::Network => Ok(()),
+            // Pairwise and fleet network tests are driven by the orchestrator
+            // through `agent peer` / `agent nccl`; the phase loop only runs
+            // the node-local level of the hierarchy, the intra-node sweep.
+            Phase::Network => network_phase(&sink, &spec),
             Phase::Overlap => overlap_phase(&sink, &spec),
         };
         if let Err(error) = result {
@@ -176,6 +179,26 @@ fn overlap_phase(sink: &EventSink, _spec: &AgentTaskSpec) -> Result<()> {
             reason: "agent built without gpu feature".into(),
         },
     );
+    Ok(())
+}
+
+/// Node-local part of the network phase: the intra-node NCCL sweep, when
+/// the spec asks for it.
+fn network_phase(sink: &EventSink, spec: &AgentTaskSpec) -> Result<()> {
+    match &spec.nccl_intranode {
+        Some(sweep) => intranode_sweep(sink, sweep),
+        None => Ok(()),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn intranode_sweep(sink: &EventSink, sweep: &crate::proto::NcclSweepSpec) -> Result<()> {
+    gpu::intranode::run(sink, sweep)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn intranode_sweep(sink: &EventSink, _sweep: &crate::proto::NcclSweepSpec) -> Result<()> {
+    intranode::skip_without_gpu(sink);
     Ok(())
 }
 

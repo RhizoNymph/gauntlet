@@ -50,7 +50,7 @@ impl NcclEnvChange {
 
 /// Every key that differs between `baseline` and `current`, in key order.
 /// `Some(empty)` means the two runs used identical NCCL tuning. `None` when
-/// either run did not record its env (pre-v8 documents): comparing against
+/// either run did not record its env (pre-v10 documents): comparing against
 /// an unknown would invent drift, so there is nothing to say.
 pub fn nccl_env_drift(
     baseline: Option<&BTreeMap<String, String>>,
@@ -165,7 +165,7 @@ mod tests {
 
     #[test]
     fn unrecorded_envs_report_no_drift_at_all() {
-        // A pre-v8 baseline says nothing about its tuning: no invented
+        // A pre-v10 baseline says nothing about its tuning: no invented
         // "+NCCL_SOCKET_IFNAME" against it, in either direction.
         let tuned = env(&[("NCCL_SOCKET_IFNAME", "bond0")]);
         assert_eq!(nccl_env_drift(None, Some(&tuned)), None);

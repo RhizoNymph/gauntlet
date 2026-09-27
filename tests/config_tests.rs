@@ -468,3 +468,57 @@ fn an_unvalidated_config_still_never_yields_an_invalid_env() {
         })
     ));
 }
+
+#[test]
+fn intranode_sweep_defaults_on_and_reuses_the_fleet_sweep_knobs() {
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert!(config.tests.nccl_intranode);
+    let spec = config.intranode_sweep_spec().expect("enabled by default");
+    // Same sizes and iteration count as the fleet sweep: one set of knobs
+    // for every level of the hierarchy.
+    assert_eq!(spec.sizes, config.tests.nccl_sizes);
+    assert_eq!(spec.iters_per_size, config.tests.nccl_iters_per_size);
+    // The network-phase task spec carries it; one mapper, no drift.
+    assert_eq!(
+        config.task_spec(&[Phase::Network]).nccl_intranode,
+        Some(spec)
+    );
+
+    let custom = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        nccl_sizes = [4096, 1048576]
+        nccl_iters_per_size = 7
+        "#,
+    )
+    .expect("custom sweep config");
+    let spec = custom.intranode_sweep_spec().expect("enabled");
+    assert_eq!(spec.sizes, vec![4096, 1_048_576]);
+    assert_eq!(spec.iters_per_size, 7);
+}
+
+#[test]
+fn intranode_sweep_toggle_disables_the_spec() {
+    let off = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        nccl_intranode = false
+        "#,
+    )
+    .expect("nccl_intranode override");
+    assert!(!off.tests.nccl_intranode);
+    assert_eq!(off.intranode_sweep_spec(), None);
+    assert_eq!(off.task_spec(&[Phase::Network]).nccl_intranode, None);
+}
+
+#[test]
+fn the_example_config_enables_the_intranode_sweep() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("gauntlet.example.toml");
+    let text = std::fs::read_to_string(&path).expect("example config");
+    // The key must be spelled out in the example, not just defaulted.
+    assert!(text.contains("nccl_intranode = true"), "{text}");
+    let config = FleetConfig::load(&path).expect("example config must stay valid");
+    assert!(config.tests.nccl_intranode);
+}

@@ -29,6 +29,13 @@ gemm_sdc_check_secs = 5      # loaded secs between bitwise checks in the sustain
 cpu_sdc_hot_secs = 10        # all-core correctness-under-power screen duration
 disk_paths = ["/tmp"]
 net_port_base = 29500
+# NCCL message-size sweeps (network phase). Default sizes: 1 KiB .. 1 GiB.
+# nccl_sizes = [1024, 1048576, 1073741824]
+nccl_iters_per_size = 20
+# Intra-node level of the hierarchy: all-reduce + all-gather across every
+# local GPU (single process, NVLink/PCIe), run before the pairwise and fleet
+# levels. Same sizes/iterations as the fleet sweep. Nodes with < 2 GPUs skip.
+nccl_intranode = true
 # Barrier-skew microbenchmark: iterations of a tiny collective, timed
 # per rank to find hosts that consistently arrive late. 0 disables.
 barrier_iters = 2000

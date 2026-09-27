@@ -148,6 +148,12 @@ impl HostSession {
         &self.agent_path
     }
 
+    /// The remote words after the `env` program for an `agent <args>` spawn
+    /// (`agent_spawn_args`), shared by every spawn path.
+    fn spawn_args(&self, args: &[&str]) -> Vec<String> {
+        agent_spawn_args(&self.env_words, &self.agent_path, args)
+    }
+
     /// Run a short remote command, capturing stdout (used by deploy for
     /// hash checks and by bootstrap tuning). Non-zero exit is an error.
     pub async fn exec(&self, command: &str) -> Result<String> {
@@ -255,12 +261,7 @@ impl HostSession {
     ) -> Result<ExitStatus> {
         let mut command = self.session.command("env");
         command
-            .raw_args(self.env_words.iter())
-            .arg(self.agent_path.clone())
-            // The deployed binary is the full multi-command CLI; node-side
-            // modes all live under its `agent` subcommand.
-            .arg("agent")
-            .args(args.iter().copied())
+            .raw_args(self.spawn_args(args))
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
             } else {
@@ -344,12 +345,7 @@ impl HostSession {
     ) -> Result<RemoteOutput> {
         let mut command = self.session.command("env");
         command
-            .raw_args(self.env_words.iter())
-            .arg(self.agent_path.clone())
-            // The deployed binary is the full multi-command CLI; node-side
-            // modes all live under its `agent` subcommand.
-            .arg("agent")
-            .args(args.iter().copied())
+            .raw_args(self.spawn_args(args))
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
             } else {
@@ -393,10 +389,7 @@ impl HostSession {
     pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
         let mut command = Arc::clone(&self.session).arc_command("env");
         command
-            .raw_args(self.env_words.iter())
-            .arg(self.agent_path.clone())
-            .arg("agent")
-            .args(args.iter().copied())
+            .raw_args(self.spawn_args(args))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -508,6 +501,29 @@ pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<Strin
     ))
     .chain(nccl_env_words(nccl_env))
     .collect()
+}
+
+/// Every remote word after the `env` program of an agent spawn, each already
+/// a quoted POSIX-sh word (passed through `raw_args`): the env assignments,
+/// the agent binary, then `agent <args>`. The deployed binary is the full
+/// multi-command CLI; node-side modes all live under its `agent`
+/// subcommand.
+///
+/// `env` execs the binary, so the agent process's own argv is exactly
+/// `<agent_path> agent <args>` — the assignments never appear in it, and
+/// `agent_kill_pattern` (`[g]auntlet-agent agent <args>`) keeps matching
+/// with any NCCL env.
+pub(crate) fn agent_spawn_args(
+    env_words: &[String],
+    agent_path: &str,
+    args: &[&str],
+) -> Vec<String> {
+    env_words
+        .iter()
+        .cloned()
+        .chain([single_quote(agent_path), "agent".to_string()])
+        .chain(args.iter().map(|arg| single_quote(arg)))
+        .collect()
 }
 
 /// `KEY='value'` words for the NCCL env, in key order; empty for an empty

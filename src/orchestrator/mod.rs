@@ -5,18 +5,21 @@
 //!   ensure agent deployed (hash check) -> per-phase:
 //!     phases 0-2: spawn `agent run` on every host simultaneously, decode
 //!       event streams into the collector;
-//!     phase 3: tournament rounds of `agent peer` pairs, then the
-//!       hierarchical NCCL sweeps (per-node, pairs, full fleet) with the
-//!       uniqueId relayed from rank 0 by this process;
+//!     phase 3: the intra-node NCCL sweep (node-local fan-out, one rank per
+//!       local GPU), tournament rounds of `agent peer` pairs, then the
+//!       fleet NCCL sweep with the uniqueId relayed from rank 0 by this
+//!       process;
 //!   -> collector -> analysis -> report to disk + terminal, exit code.
 //!
 //! Per-host failures (unreachable, agent Fatal, phase timeout from
 //! `tests.phase_timeout_secs`) mark that host failed and the run continues;
 //! the failure lands in the report instead of aborting the fleet.
 
+mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+mod intranode;
 mod nccl;
 pub mod session;
 
@@ -32,12 +35,12 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
 use self::session::{HostSession, single_quote};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
-use crate::analysis::skew::BarrierSkew;
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::nccl_env::NcclEnv;
@@ -641,6 +644,11 @@ async fn network_phase(
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
+    // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
+    // node pairs (TCP), then the full fleet (NCCL over the fabric).
+    if config.tests.nccl_intranode {
+        intranode::intranode_sweep(config, sessions, inventories, sink).await;
+    }
     pairwise_sweep(config, sessions, sample_pairs, sink).await;
     nccl::nccl_sweep(config, sessions, inventories, sink).await;
     tcp_barrier_sweep(config, sessions, sink).await;
@@ -803,6 +811,30 @@ async fn probe_pair(
     Ok((latency, bandwidth))
 }
 
+/// `pkill -f` pattern for a deployed agent running `agent <args>`. The
+/// remote command line is `<remote_dir>/bin/gauntlet-agent agent <args>`
+/// (`HostSession::run_agent`); the bracket keeps the pattern from matching
+/// the `pkill` invocation itself.
+fn agent_kill_pattern(args: &str) -> String {
+    format!("[g]auntlet-agent agent {args}")
+}
+
+/// Kill a remote agent process by its command line. Dropping the ssh
+/// future on a timeout does not stop the remote process — it can sit
+/// blocked (a collective, a socket) and never write to stdout again, so it
+/// never even dies of SIGPIPE — so every timeout that abandons an agent
+/// ends here. Best effort: a failed cleanup command is logged, not raised.
+async fn kill_remote_agent(session: &HostSession, args: &str) {
+    let pattern = agent_kill_pattern(args);
+    match session
+        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
+        .await
+    {
+        Ok(_) => debug!(host = %session.addr(), pattern, "remote agent cleanup sent"),
+        Err(error) => warn!(host = %session.addr(), %error, "remote agent cleanup failed"),
+    }
+}
+
 /// Graceful shutdown frame first; a remote `pkill` as the backstop for
 /// fleets where the operator cannot reach the peer port directly.
 async fn stop_peer(
@@ -821,14 +853,7 @@ async fn stop_peer(
         Ok(Err(error)) => debug!(target, %error, "graceful peer shutdown failed"),
         Err(_) => debug!(target, "graceful peer shutdown timed out"),
     }
-    // The bracket keeps the pattern from matching the pkill invocation itself.
-    let pattern = format!("[g]auntlet-agent peer serve --port {port}");
-    if let Err(error) = server
-        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-        .await
-    {
-        debug!(host = %server.addr(), %error, "peer cleanup command failed");
-    }
+    kill_remote_agent(server, &format!("peer serve --port {port}")).await;
     if tokio::time::timeout(PEER_SHUTDOWN_TIMEOUT, child.wait())
         .await
         .is_err()
@@ -897,79 +922,6 @@ fn peer_endpoint(ssh_addr: &str) -> &str {
         }
     }
     host
-}
-
-/// Turn a barrier-skew analysis into metric records: per-rank distribution
-/// and tally metrics against each rank's host, fleet-level barrier-time
-/// distribution against the coordinator/lead host (index 0), mirroring how
-/// the NCCL sweeps attribute fleet-wide numbers to rank 0.
-///
-/// Metric semantics differ by polarity — under `NcclBarrier` the per-rank
-/// values are local waits (a straggler is a *low* outlier), under
-/// `TcpBarrier` they are release-to-response times (a straggler is a *high*
-/// outlier) — but `slowest_frac` always means "fraction of considered
-/// iterations this host was the late arriver", which is what the report's
-/// flagging rule consumes.
-fn emit_barrier_metrics(
-    sink: &ObservationSink,
-    test: TestId,
-    rank_hosts: &[String],
-    skew: &BarrierSkew,
-) {
-    for rank in &skew.per_rank {
-        let Some(host) = rank_hosts.get(rank.rank as usize) else {
-            warn!(
-                rank = rank.rank,
-                hosts = rank_hosts.len(),
-                "barrier rank has no host"
-            );
-            continue;
-        };
-        for (name, value, unit) in [
-            ("p50_us", rank.p50_us, Unit::Micros),
-            ("p90_us", rank.p90_us, Unit::Micros),
-            ("p99_us", rank.p99_us, Unit::Micros),
-            ("max_us", rank.max_us, Unit::Micros),
-            ("slowest_frac", rank.slowest_frac, Unit::Ratio),
-            (
-                "slowest_considered",
-                skew.considered_iters as f64,
-                Unit::Count,
-            ),
-        ] {
-            sink.metric(
-                host,
-                MetricRecord {
-                    test,
-                    scope: Scope::Node,
-                    name: name.to_string(),
-                    value,
-                    unit,
-                    repeat: 0,
-                },
-            );
-        }
-    }
-    if let Some(host) = rank_hosts.first() {
-        for (name, value) in [
-            ("fleet_span_p50_us", skew.fleet.p50_us),
-            ("fleet_span_p90_us", skew.fleet.p90_us),
-            ("fleet_span_p99_us", skew.fleet.p99_us),
-            ("fleet_span_max_us", skew.fleet.max_us),
-        ] {
-            sink.metric(
-                host,
-                MetricRecord {
-                    test,
-                    scope: Scope::Node,
-                    name: name.to_string(),
-                    value,
-                    unit: Unit::Micros,
-                    repeat: 0,
-                },
-            );
-        }
-    }
 }
 
 /// TCP star-barrier sweep: the CPU-only barrier-skew probe, run across the
@@ -1090,13 +1042,7 @@ async fn tcp_barrier_sweep(
         Ok(Err(error)) => Err(anyhow::anyhow!("barrier serve task panicked: {error}")),
         Err(_) => {
             // The coordinator is wedged; kill it so the phase can move on.
-            let pattern = format!("[g]auntlet-agent barrier serve --port {port}");
-            if let Err(error) = server
-                .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-                .await
-            {
-                debug!(host = %server_addr, %error, "barrier cleanup command failed");
-            }
+            kill_remote_agent(&server, &format!("barrier serve --port {port}")).await;
             Err(anyhow::anyhow!(
                 "barrier serve timed out after {}s",
                 timeout.as_secs()
@@ -1105,11 +1051,20 @@ async fn tcp_barrier_sweep(
     };
     match report {
         Ok(report) => {
-            let rank_hosts: Vec<String> = sessions
-                .iter()
-                .map(|session| session.addr().to_string())
-                .collect();
-            emit_barrier_metrics(sink, TestId::TcpBarrier, &rank_hosts, &report.skew);
+            // One TCP rank per host (its fleet index): node-scope subjects.
+            let locate = |rank: u32| {
+                sessions.get(rank as usize).map(|session| RankSubject {
+                    host: session.addr().to_string(),
+                    scope: Scope::Node,
+                })
+            };
+            emit_barrier_metrics(
+                sink,
+                TestId::TcpBarrier,
+                &report.skew,
+                locate,
+                Some(&server_addr),
+            );
         }
         Err(error) => sink.error(&server_addr, format!("TCP barrier failed: {error:#}")),
     }
@@ -1206,6 +1161,99 @@ mod tests {
         // Bare IPv6 literals keep every colon they came with.
         assert_eq!(peer_endpoint("fd00::1"), "fd00::1");
         assert_eq!(peer_endpoint("user@fd00::1"), "fd00::1");
+    }
+
+    #[test]
+    fn kill_patterns_match_the_remote_agent_command_line_but_not_pkill() {
+        let agent = format!("/scratch/gauntlet/{}", deploy::AGENT_RELPATH);
+        for args in [
+            "nccl",
+            "peer serve --port 29500",
+            "barrier serve --port 29500",
+        ] {
+            let pattern = agent_kill_pattern(args);
+            // `[g]` matches a literal `g` in the regex: the effective
+            // pattern is the plain text below.
+            let effective = pattern.replacen("[g]", "g", 1);
+            let cmdline = format!("{agent} agent {args}");
+            assert!(cmdline.contains(&effective), "{pattern} vs {cmdline}");
+            // The pkill command line carries the bracketed text, which the
+            // regex does not match.
+            let pkill = format!("pkill -f '{pattern}'");
+            assert!(!pkill.contains(&effective), "{pkill}");
+        }
+    }
+
+    /// The NCCL env words sit before the binary on the remote command line.
+    /// `env` execs the binary, so the agent's own argv (what `pkill -f`
+    /// matches against) is still `<path> agent <args>`; and while the shell
+    /// or `env` itself is alive, its command line contains the same
+    /// contiguous text. Either way the kill pattern matches.
+    #[test]
+    fn kill_patterns_match_spawns_that_carry_an_nccl_env() {
+        use crate::nccl_env::NcclEnv;
+        use crate::orchestrator::session::{agent_env_words, agent_spawn_args};
+
+        let raw = [
+            ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+            ("NCCL_DEBUG", "INFO"),
+            ("NCCL_ALGO", "Ring tree $HOME 'q'"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env = NcclEnv::resolve(Some("bond0"), &raw).expect("valid env");
+        let remote_dir = "/scratch/gauntlet";
+        let agent = format!("{remote_dir}/{}", deploy::AGENT_RELPATH);
+        let words = agent_env_words(remote_dir, &env);
+
+        for args in [
+            vec!["nccl"],
+            vec!["run"],
+            vec!["peer", "serve", "--port", "29500"],
+            vec!["barrier", "serve", "--port", "29500"],
+        ] {
+            let joined = args.join(" ");
+            let effective = agent_kill_pattern(&joined).replacen("[g]", "g", 1);
+            let spawn = agent_spawn_args(&words, &agent, &args);
+            let remote = format!("env {}", spawn.join(" "));
+
+            // The remote shell parses the words; drop the leading
+            // assignments exactly as `env` does before exec.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {}", spawn.join(" ")))
+                .output()
+                .expect("run sh");
+            assert!(output.status.success(), "{remote}");
+            let argv: Vec<String> = String::from_utf8(output.stdout)
+                .expect("utf8")
+                .lines()
+                .map(str::to_string)
+                .skip_while(|word| word.contains('=') && !word.starts_with('/'))
+                .collect();
+            assert_eq!(argv[0], agent, "{remote}");
+            let agent_cmdline = argv.join(" ");
+            assert!(!agent_cmdline.contains("NCCL_"), "{agent_cmdline}");
+            assert!(
+                agent_cmdline.contains(&effective),
+                "{effective:?} vs agent argv {agent_cmdline:?}"
+            );
+            // The pre-exec `env` / shell command line matches too.
+            let shell_cmdline = String::from_utf8(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("printf '%s ' {}", spawn.join(" ")))
+                    .output()
+                    .expect("run sh")
+                    .stdout,
+            )
+            .expect("utf8");
+            assert!(
+                shell_cmdline.contains(&effective),
+                "{effective:?} vs {shell_cmdline:?}"
+            );
+        }
     }
 
     #[test]

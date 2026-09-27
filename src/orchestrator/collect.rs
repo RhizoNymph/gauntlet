@@ -161,6 +161,7 @@ mod tests {
             ib_ports: Vec::new(),
             xid_errors: Vec::new(),
             gpu_libs: Default::default(),
+            cuda_visible_gpus: None,
         }
     }
 

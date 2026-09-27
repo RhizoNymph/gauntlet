@@ -9,8 +9,8 @@ use thiserror::Error;
 
 use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
-    Phase,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
+    OverlapSpec, Phase,
 };
 
 #[derive(Debug, Error)]
@@ -138,6 +138,10 @@ pub struct TestConfig {
     /// NCCL sweep message sizes in bytes.
     pub nccl_sizes: Vec<u64>,
     pub nccl_iters_per_size: u32,
+    /// Network phase: run the intra-node NCCL sweep (all local GPUs of each
+    /// node, NVLink/PCIe) before the pairwise and fleet levels. Reuses
+    /// `nccl_sizes` / `nccl_iters_per_size`.
+    pub nccl_intranode: bool,
     /// Barrier-skew microbenchmark iterations (0 disables it).
     pub barrier_iters: u32,
     /// Payload of the tiny barrier all-reduce, in bytes.
@@ -177,6 +181,7 @@ impl Default for TestConfig {
             // 1 KiB .. 1 GiB, powers of 4.
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
+            nccl_intranode: true,
             barrier_iters: 2000,
             barrier_bytes: 8,
             overlap_secs: 30,
@@ -322,6 +327,7 @@ impl FleetConfig {
             // Counter passes are scheduled by the orchestrator as dedicated
             // invocations; a plain phase spec never carries one.
             counters: None,
+            nccl_intranode: self.intranode_sweep_spec(),
         }
     }
 
@@ -342,6 +348,17 @@ impl FleetConfig {
             .resolve()
             .map_err(|source| ConfigError::Nccl { source })?;
         Ok(self.resolved_nccl_env.get_or_init(|| env))
+    }
+
+    /// The intra-node sweep parameters, or `None` when the sweep is
+    /// disabled. Same sizes and iteration count as the fleet sweep, so the
+    /// hierarchy levels are directly comparable.
+    pub fn intranode_sweep_spec(&self) -> Option<NcclSweepSpec> {
+        let tests = &self.tests;
+        tests.nccl_intranode.then(|| NcclSweepSpec {
+            sizes: tests.nccl_sizes.clone(),
+            iters_per_size: tests.nccl_iters_per_size,
+        })
     }
 
     /// The overlap-step parameters, shared verbatim by the node-local

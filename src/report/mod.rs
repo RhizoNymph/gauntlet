@@ -6,6 +6,7 @@
 //! second source of truth.
 
 pub mod history;
+pub mod intranode;
 pub mod nccl_env;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,7 +25,7 @@ use crate::nccl_env::NcclEnv;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
-    consistency_fields, overlap_metric,
+    consistency_fields, nccl_metric, overlap_metric,
 };
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
@@ -42,10 +43,26 @@ use crate::proto::{
 // groups and derived overlap_retention.fleet_gemm_<dtype> /
 // overlap_retention.fleet_all_reduce records. No field changed shape, so
 // pre-v7 documents decode unchanged (they simply lack the new groups).
-// v8: run-level `nccl_env` — the resolved NCCL environment every NCCL
-// communicator in the run was created under. Optional: pre-v8 documents
-// decode with it absent ("not recorded"), which suppresses drift display.
-pub const SCHEMA_VERSION: u32 = 8;
+// v8: rank-per-GPU fleet NCCL world. Granularity: nccl_barrier p50/p90/
+// p99/max_us and overlap_fleet_all_reduce.* / overlap_retention.
+// fleet_all_reduce move from `host` to `host:gpuN` (the barrier tally
+// slowest_frac/slowest_considered and fleet_span_* stay per host).
+// Meaning: the nccl_all_reduce/nccl_all_gather sweep series keep their
+// names and node scope but now measure a world of n = total GPUs whose
+// ring mixes NVLink with the fabric — not comparable with v7 numbers; the
+// fits were renamed nccl_{allreduce,allgather}_fleet ->
+// nccl_{allreduce,allgather}_rank_per_gpu so v7-vs-v8 baselines cannot
+// line up under one key. Inventory snapshots gain cuda_visible_gpus. No
+// field changed shape.
+// v9: intra-node NCCL sweep — nccl_intra_all_reduce / nccl_intra_all_gather
+// metric groups (per-size series plus the fleet-comparable
+// bus_gib_per_sec_peak_<n>gpu headline) and calibration.links classes
+// nccl_{allreduce,allgather}_intranode_<n>gpu. No field changed shape.
+// v10: run-level `nccl_env` — the resolved NCCL environment every agent
+// process (and so every NCCL communicator) in the run was started with.
+// Optional: pre-v10 documents decode with it absent ("not recorded"),
+// which suppresses drift display.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -84,7 +101,7 @@ pub struct RunResults {
     /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
     /// because it is fleet-uniform by construction; baseline comparisons
     /// diff it (`nccl_env::nccl_env_drift`) since tuning drift makes NCCL
-    /// numbers incomparable. `None` = not recorded (pre-v8 documents, via
+    /// numbers incomparable. `None` = not recorded (pre-v10 documents, via
     /// the serde default, so old history keeps loading); `Some(empty)` =
     /// an untuned run. A plain string map so a document always decodes,
     /// even under a future, different key policy.
@@ -135,9 +152,12 @@ pub struct FleetAnalysis {
     pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
 }
 
-/// One flagged host from the barrier-skew slowest-rank tally.
+/// One flagged subject from the barrier-skew slowest-rank tally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarrierStraggler {
+    /// Sample key of the flagged *host* (both benchmarks): the tally is
+    /// per arrival group, and a host's NCCL ranks (one per GPU) form one
+    /// group, so the tally metrics are emitted once per host at node scope.
     pub key: String,
     /// Fraction of considered iterations in which this host arrived last.
     pub slowest_frac: f64,
@@ -168,8 +188,9 @@ pub struct ConsistencyFinding {
 pub struct Calibration {
     /// Per-host sustained capability numbers.
     pub rooflines: BTreeMap<String, NodeRoofline>,
-    /// Alpha-beta fits keyed by link class ("tcp_pairwise",
-    /// "nccl_allreduce_fleet", "nccl_allreduce_pair", ...).
+    /// Alpha-beta fits keyed by link class (
+    /// "nccl_allreduce_rank_per_gpu", "nccl_allreduce_intranode_8gpu",
+    /// "tcp_pairwise", ...).
     pub links: BTreeMap<String, AlphaBetaFit>,
 }
 
@@ -229,6 +250,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NetBandwidth => "net_bandwidth",
         TestId::NcclAllReduce => "nccl_all_reduce",
         TestId::NcclAllGather => "nccl_all_gather",
+        TestId::NcclIntraAllReduce => "nccl_intra_all_reduce",
+        TestId::NcclIntraAllGather => "nccl_intra_all_gather",
         TestId::NcclBarrier => "nccl_barrier",
         TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
@@ -492,11 +515,14 @@ fn barrier_straggler_flags(
 ///   repeat (same communicator, measured seconds apart — the phase-3 NCCL
 ///   sweep is a different topology and only exists on rank 0, so it cannot
 ///   serve as the denominator).
-/// - `fleet_gemm_<dtype>` per GPU and `fleet_all_reduce` per node: the same
-///   two ratios for the fleet overlap step — GEMM against the same phase-2
-///   baseline, all-reduce against the step's own isolated window
-///   (`overlap_fleet_all_reduce.isolated_bus_gib_per_sec`, same fleet
-///   communicator).
+/// - `fleet_gemm_<dtype>` and `fleet_all_reduce` per GPU: the same two
+///   ratios for the fleet overlap step (one rank per GPU) — GEMM against
+///   the same phase-2 baseline, all-reduce against *that GPU's* isolated
+///   window (`overlap_fleet_all_reduce.isolated_bus_gib_per_sec`, same
+///   rank, same fleet communicator).
+///
+/// Bus baselines are joined on (step, repeat, scope), so each subject
+/// divides its own isolated window whatever the scope granularity.
 ///
 /// A ratio is only formed from finite numbers over a positive baseline; a
 /// missing or degenerate baseline yields no record rather than a lie.
@@ -512,11 +538,12 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
     }
 
     // GEMM baselines keyed by (repeat, scope label, metric name); bus
-    // baselines keyed by (step, repeat) — the two overlap steps run on
-    // different communicators, so keying by the emitting test id keeps
-    // their baselines from ever crossing.
+    // baselines keyed by (step, repeat, scope label) — the two overlap
+    // steps run on different communicators, so keying by the emitting test
+    // id keeps their baselines from ever crossing, and the scope keeps one
+    // fleet rank (GPU) from dividing by a sibling's window.
     let mut gemm_baselines: BTreeMap<(u32, String, &str), f64> = BTreeMap::new();
-    let mut bus_baselines: BTreeMap<(TestId, u32), f64> = BTreeMap::new();
+    let mut bus_baselines: BTreeMap<(TestId, u32, String), f64> = BTreeMap::new();
     for record in &obs.metrics {
         if !(record.value.is_finite() && record.value > 0.0) {
             continue;
@@ -535,7 +562,14 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
             TestId::OverlapAllReduce | TestId::OverlapFleetAllReduce
                 if record.name == overlap_metric::ISOLATED_BUS =>
             {
-                bus_baselines.insert((record.test, record.repeat), record.value);
+                bus_baselines.insert(
+                    (
+                        record.test,
+                        record.repeat,
+                        scope_label(&record.scope).unwrap_or_default(),
+                    ),
+                    record.value,
+                );
             }
             _ => {}
         }
@@ -578,11 +612,12 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
                     record.name.as_str(),
                 ))
                 .copied(),
-            TestId::OverlapAllReduce => bus_baselines
-                .get(&(TestId::OverlapAllReduce, record.repeat))
-                .copied(),
             _ => bus_baselines
-                .get(&(TestId::OverlapFleetAllReduce, record.repeat))
+                .get(&(
+                    record.test,
+                    record.repeat,
+                    scope_label(&record.scope).unwrap_or_default(),
+                ))
                 .copied(),
         };
         if let Some(baseline) = baseline {
@@ -869,8 +904,12 @@ fn reduce(obs: &HostObservations, test: TestId, name: &str, how: Reduce) -> Opti
 fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<String, AlphaBetaFit> {
     let mut links = BTreeMap::new();
     for (test, key) in [
-        (TestId::NcclAllReduce, "nccl_allreduce_fleet"),
-        (TestId::NcclAllGather, "nccl_allgather_fleet"),
+        // "rank_per_gpu": the fleet world became one rank per GPU in
+        // schema v8 — n is total GPUs and the ring mixes NVLink with the
+        // fabric — so these fits are not the v7 per-node `*_fleet` fits
+        // and must not be compared against them under the same name.
+        (TestId::NcclAllReduce, "nccl_allreduce_rank_per_gpu"),
+        (TestId::NcclAllGather, "nccl_allgather_rank_per_gpu"),
     ] {
         let points = sweep_points(observations, test);
         if let Ok(fit) = fit_alpha_beta(&points) {
@@ -880,6 +919,7 @@ fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<Stri
     if let Some(fit) = tcp_pairwise_fit(observations) {
         links.insert("tcp_pairwise".to_string(), fit);
     }
+    links.extend(intranode::link_fits(observations));
     links
 }
 
@@ -899,8 +939,8 @@ fn sweep_points(
                 continue;
             }
             match record.name.as_str() {
-                "msg_bytes" => sizes.push(record.value),
-                "elapsed_us" => timings.push(record.value),
+                nccl_metric::MSG_BYTES => sizes.push(record.value),
+                nccl_metric::ELAPSED_US => timings.push(record.value),
                 _ => {}
             }
         }
@@ -1500,7 +1540,7 @@ mod tests {
             vec![(1024, 30.0), (4096, 45.0)]
         );
         let links = link_fits(&observations);
-        assert!(links.contains_key("nccl_allreduce_fleet"));
+        assert!(links.contains_key("nccl_allreduce_rank_per_gpu"));
         assert!(!links.contains_key("tcp_pairwise"));
     }
 
@@ -1530,7 +1570,7 @@ mod tests {
             results
                 .calibration
                 .links
-                .contains_key("nccl_allreduce_fleet")
+                .contains_key("nccl_allreduce_rank_per_gpu")
         );
     }
 

@@ -41,6 +41,15 @@ never an error; only unreadable /proc fails)
   stacks misbehave under dlclose; the agent is short-lived). Feeds the
   bootstrap `gpu_libs` readiness check, the orchestrator's NCCL-sweep
   gating, and (on GPU-bearing hosts) consistency fields `lib:<name>`.
+- CUDA-visible GPUs: `cuda_visible_gpus` = `cuDeviceGetCount` via cudarc
+  (gpu feature; guarded, so a missing libcuda yields `None`, never a
+  crash; `None` without the gpu feature). This — not the nvidia-smi
+  `gpus` list — sizes each host's fleet NCCL rank block. When the two
+  disagree (a GPU fell off the bus, MIG enabled, CUDA_VISIBLE_DEVICES set
+  in the agent's environment, or no CUDA count on a host that lists
+  GPUs), `proto::gpu_visibility_mismatch` produces a per-host finding:
+  the inventory phase emits a Failed `inventory` outcome (Node scope)
+  with the reason, making the verdict at least Stragglers.
 
 ## Probe execution model
 Every external command runs through one bounded helper: stdin `/dev/null`,
@@ -63,11 +72,12 @@ site: they yield `None`.
   `nvidia-smi nvlink -s` call, and phase 2 measures the links directly.
 
 ## Files
-- `src/agent/inventory.rs` — `collect`, `run`.
-- `src/proto.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
-  `IbPortInventory`, `consistency_fields`.
+- `src/agent/inventory.rs` — `collect`, `run`, `probe_cuda_visible_gpus`.
+- `src/proto/mod.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
+  `IbPortInventory`, `consistency_fields`, `gpu_visibility_mismatch`.
 
 ## Invariants
 - `collect()` must complete in < 5s on a healthy node.
-- Emits exactly one `Inventory` event per run.
+- Emits exactly one `Inventory` event per run, plus one Failed
+  `inventory` outcome when the GPU-visibility counts disagree.
 - No stdout writes outside `EventSink`.

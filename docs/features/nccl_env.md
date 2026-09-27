@@ -37,8 +37,8 @@ NCCL reads its knobs with `getenv` at communicator init, so they must be
 in the agent's environment by then. The agent cannot safely put them
 there itself: `main` builds a multi-threaded tokio runtime before
 dispatching any subcommand (its worker threads start at build time), and
-`agent run` — which hosts the intra-node overlap phase's
-`ncclCommInitAll` — executes on that runtime. `std::env::set_var` while
+`agent run`, which hosts the `ncclCommInitAll` of both the intra-node
+overlap phase and the intra-node NCCL sweep, executes on that runtime. `std::env::set_var` while
 other threads exist is unsound (it is `unsafe` in edition 2024 for
 exactly this reason). The pre-existing `set_socket_ifname` path in
 `agent nccl` had the same flaw — the runtime already existed when it ran.
@@ -134,24 +134,29 @@ plane story (docs/features/phase3_network.md) is documented around it.
    and `spawn_agent` — the only three ways an agent is started — put those
    words between `env` and the agent binary via `raw_args` (already
    quoted; openssh does not re-escape raw args). That covers every
-   communicator-creating invocation: `agent run` (intra-node overlap and
-   any future node-local NCCL), `agent nccl` Lead/Participate (phase-3
-   sweep, the NCCL barrier-skew probe on the same communicator, fleet
-   overlap), and the TCP barrier / peer / probe modes (harmless there —
+   communicator-creating invocation. That is `agent run`, which runs the
+   intra-node NCCL sweep, the intra-node overlap and any future node-local
+   NCCL. It is also `agent nccl` Lead/Participate, which runs the
+   rank-per-GPU phase-3 sweep, the NCCL barrier-skew probe on the same
+   communicator, and the fleet overlap. Finally it covers the TCP barrier / peer / probe modes (harmless there —
    NCCL_* only affects NCCL — and uniform, so no spawn path can be
    forgotten).
 4. **Agent**. Does nothing: the variables are simply in its environment
-   when NCCL initializes. `agent/nccl.rs` no longer touches the env.
-5. **Wire** (`proto.rs`, PROTO_VERSION 7). `socket_ifname` is removed
+   when NCCL initializes. `agent/nccl/` no longer touches the env.
+   `agent_kill_pattern` (`[g]auntlet-agent agent <args>`, used by `pkill
+   -f`) still matches, because `env` execs the binary and the `KEY=value`
+   words never appear in the agent's own argv. A test builds the full
+   spawn command with a non-empty env and checks this.
+5. **Wire** (`proto/mod.rs`, PROTO_VERSION 9). `socket_ifname` is removed
    from `NcclDirective::{Lead, Participate}`, and nothing related to the
    NCCL env is on the wire. `NcclDirective` is now
    `deny_unknown_fields`, so a stale `socket_ifname` fails loudly instead
    of being ignored.
-6. **Reporting** (`report/mod.rs`, `report/nccl_env.rs`, SCHEMA_VERSION 8).
+6. **Reporting** (`report/mod.rs`, `report/nccl_env.rs`, SCHEMA_VERSION 10).
    `report::build` sets the run-level field `RunResults.nccl_env:
    Option<BTreeMap<String, String>>` from `config.nccl_env()`. It is
    recorded orchestrator-side because the orchestrator knows exactly what
-   it put on every command line. `None` means not recorded: pre-v8
+   it put on every command line. `None` means not recorded: pre-v10
    documents get this through the serde default, so old history still
    loads. `Some(empty)` means an untuned run. The terminal table prints
    `nccl env: K=V ...`, `(none)` or `(not recorded)` under the header
@@ -160,7 +165,7 @@ plane story (docs/features/phase3_network.md) is documented around it.
    `ViewModel.nccl_env` mirrors the document. `DiffView.nccl_env_drift =
    report::nccl_env::nccl_env_drift(baseline, current)` lists
    added/removed/changed keys. It is `None`, and nothing is shown, when
-   either run did not record its env, so a pre-v8 baseline never produces
+   either run did not record its env, so a pre-v10 baseline never produces
    invented `+NCCL_SOCKET_IFNAME` drift. Diff mode shows an "nccl env drift" chip
    plus one line per change; the overview shows the run's env. Drift is
    context, never a per-node regression.
@@ -190,13 +195,14 @@ baseline diff compares it.
   nccl_env)`, `agent_env_words`, `nccl_env_words`, the three spawn paths.
 - `src/orchestrator/mod.rs`, `src/orchestrator/bootstrap.rs` — pass
   `config.nccl_env()` into every session.
-- `src/proto.rs` — `socket_ifname` removed from the directives;
-  PROTO_VERSION 7.
-- `src/agent/nccl.rs`, `src/orchestrator/nccl.rs` — `set_socket_ifname`
-  and `NcclJob.socket_ifname` removed.
+- `src/proto/mod.rs` — `socket_ifname` removed from the directives
+  (which now carry only `RankAssignment` plus the workload, and the
+  rendezvous id for participants); PROTO_VERSION 9.
+- `src/agent/nccl/mod.rs`, `src/orchestrator/nccl/mod.rs` —
+  `set_socket_ifname` and `NcclJob.socket_ifname` removed.
 - `src/report/nccl_env.rs` — `NcclEnvChange`, `nccl_env_drift`,
   `format_nccl_env`.
-- `src/report/mod.rs` — `RunResults.nccl_env`, table line; SCHEMA_VERSION 8.
+- `src/report/mod.rs` — `RunResults.nccl_env`, table line; SCHEMA_VERSION 10.
 - `viewer/src/{model,diff}.rs`, `viewer/src/ui/table.rs` — display + drift.
 
 ## Invariants
@@ -219,5 +225,5 @@ baseline diff compares it.
   `$`, `$(…)`, backticks, globs, newlines, `;|&<>`).
 - Keys absent from the map are never unset; inherited values survive.
 - `RunResults.nccl_env` is `Some` of the map placed on the command
-  lines. Pre-v8 documents decode with `None` ("not recorded"), and drift
+  lines. Pre-v10 documents decode with `None` ("not recorded"), and drift
   against them is never shown.

@@ -22,6 +22,7 @@ fn sample_inventory() -> InventorySnapshot {
         ib_ports: vec![],
         xid_errors: vec![79],
         gpu_libs: std::collections::BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 
@@ -164,6 +165,7 @@ fn overlap_task_spec_round_trips() {
             msg_bytes: 64 << 20,
         },
         counters: None,
+        nccl_intranode: None,
     };
     let json = serde_json::to_string(&spec).expect("serialize");
     let back: AgentTaskSpec = serde_json::from_str(&json).expect("deserialize");
@@ -198,27 +200,29 @@ fn overlap_metric_events_round_trip() {
 
 #[test]
 fn fleet_overlap_events_round_trip() {
-    use gauntlet::proto::{OverlapFleetReport, OverlapGpuGemm};
-    let event = AgentEvent::OverlapFleetReport {
-        report: Box::new(OverlapFleetReport {
-            rank: 1,
-            msg_bytes: 64 << 20,
-            isolated_bus_gib_per_sec: 44.0,
-            overlap_bus_gib_per_sec: 33.0,
-            gemm: vec![
-                OverlapGpuGemm::Ok {
-                    gpu_index: 0,
-                    gflops: 88_000.0,
-                },
-                OverlapGpuGemm::Failed {
-                    gpu_index: 1,
-                    reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
-                },
-            ],
-        }),
-    };
-    let back = decode_event(&encode_event(&event)).expect("round trip");
-    assert_eq!(back, event);
+    use gauntlet::proto::{OverlapFleetReport, OverlapGemmLeg};
+    // One report per rank (= one GPU) since proto v7.
+    for (rank, gemm) in [
+        (1, OverlapGemmLeg::Ok { gflops: 88_000.0 }),
+        (
+            2,
+            OverlapGemmLeg::Failed {
+                reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
+            },
+        ),
+    ] {
+        let event = AgentEvent::OverlapFleetReport {
+            report: Box::new(OverlapFleetReport {
+                rank,
+                msg_bytes: 64 << 20,
+                isolated_bus_gib_per_sec: 44.0,
+                overlap_bus_gib_per_sec: 33.0,
+                gemm,
+            }),
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
 
     // Metric events under the new test ids round-trip like any other.
     for (test, name, unit) in [
@@ -246,9 +250,10 @@ fn fleet_overlap_events_round_trip() {
 
 #[test]
 fn nccl_workloads_are_mutually_exclusive_by_construction() {
-    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec};
+    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec, RankAssignment, RankBlock};
     // A sweep workload written without the optional barrier probe.
-    let sweep = r#"{"directive":"lead","world_size":3,
+    let sweep = r#"{"directive":"lead",
+        "assignment":{"block":{"base":0,"count":1},"world_size":3},
         "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
     let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
     let NcclDirective::Lead {
@@ -262,8 +267,8 @@ fn nccl_workloads_are_mutually_exclusive_by_construction() {
 
     let with_overlap = NcclDirective::Participate {
         unique_id_b64: "abc".into(),
-        rank: 2,
-        world_size: 3,
+        assignment: RankAssignment::new(RankBlock::new(2, 1).expect("block"), 3)
+            .expect("assignment"),
         workload: NcclWorkload::Overlap(OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,
@@ -444,4 +449,82 @@ fn consistency_includes_gpu_libs_only_on_gpu_hosts() {
     let fields = consistency_fields(&inv);
     assert_eq!(fields.get("lib:nccl").map(String::as_str), Some("absent"));
     assert_eq!(fields.get("lib:cuda").map(String::as_str), Some("present"));
+}
+
+#[test]
+fn intranode_sweep_spec_rides_the_task_spec() {
+    use gauntlet::proto::{AgentTaskSpec, NcclSweepSpec};
+    let config: gauntlet::config::FleetConfig =
+        toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+    let mut spec = config.task_spec(&[Phase::Network]);
+    spec.nccl_intranode = Some(NcclSweepSpec {
+        sizes: vec![1024, 1 << 20, 1 << 30],
+        iters_per_size: 20,
+    });
+    let json = serde_json::to_string(&spec).expect("serialize");
+    assert!(
+        json.contains(
+            r#""nccl_intranode":{"sizes":[1024,1048576,1073741824],"iters_per_size":20}"#
+        ),
+        "{json}"
+    );
+    let back: AgentTaskSpec = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back, spec);
+
+    // Absent means disabled, never a default sweep.
+    let mut value = serde_json::to_value(&spec).expect("to value");
+    value
+        .as_object_mut()
+        .expect("spec object")
+        .remove("nccl_intranode");
+    let back: AgentTaskSpec = serde_json::from_value(value).expect("decode without the field");
+    assert_eq!(back.nccl_intranode, None);
+
+    // The sweep spec rejects unknown fields like every other task spec.
+    let bad = r#"{"sizes":[1],"iters_per_size":1,"extra":true}"#;
+    assert!(serde_json::from_str::<NcclSweepSpec>(bad).is_err());
+}
+
+#[test]
+fn intranode_headline_names_carry_the_topology() {
+    use gauntlet::proto::nccl_metric;
+    assert_eq!(nccl_metric::bus_peak(8), "bus_gib_per_sec_peak_8gpu");
+    assert_eq!(nccl_metric::bus_peak(4), "bus_gib_per_sec_peak_4gpu");
+    assert_ne!(nccl_metric::bus_peak(8), nccl_metric::bus_peak(4));
+    assert!(nccl_metric::bus_peak(2).starts_with(nccl_metric::BUS_PEAK_PREFIX));
+    assert_eq!(nccl_metric::gpu_class_suffix(8), "8gpu");
+}
+
+#[test]
+fn intranode_test_ids_and_metrics_round_trip() {
+    for (test, wire) in [
+        (TestId::NcclIntraAllReduce, "nccl_intra_all_reduce"),
+        (TestId::NcclIntraAllGather, "nccl_intra_all_gather"),
+    ] {
+        assert_eq!(
+            serde_json::to_string(&test).expect("serialize"),
+            format!("\"{wire}\"")
+        );
+        assert_eq!(gauntlet::report::test_display_name(test), wire);
+        for (name, unit) in [
+            ("elapsed_us", Unit::Micros),
+            ("msg_bytes", Unit::Bytes),
+            ("bus_gib_per_sec", Unit::GibPerSec),
+            ("bus_gib_per_sec_peak_8gpu", Unit::GibPerSec),
+            ("ranks", Unit::Count),
+        ] {
+            let event = AgentEvent::Metric {
+                record: MetricRecord {
+                    test,
+                    scope: Scope::Node,
+                    name: name.into(),
+                    value: 8.0,
+                    unit,
+                    repeat: 0,
+                },
+            };
+            let back = decode_event(&encode_event(&event)).expect("round trip");
+            assert_eq!(back, event);
+        }
+    }
 }
