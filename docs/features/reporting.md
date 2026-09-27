@@ -223,3 +223,24 @@ and `overlap_retention.fleet_all_reduce` (per node, over the fleet step's
 own isolated window — the two steps' communicators are not comparable, so
 their baselines never cross). No field changed shape; pre-v7 documents
 decode unchanged.
+
+## Rank-per-GPU granularity (schema v8)
+
+The fleet NCCL world became one rank per GPU (proto v7; see
+docs/features/phase3_network.md), which changes the granularity of three
+metric families without changing any field's shape:
+- `nccl_barrier.{p50_us,p90_us,p99_us,max_us,slowest_frac,
+  slowest_considered}`: `host` → `host:gpuN` subjects, so
+  `fleet.barrier_stragglers.nccl_barrier` keys are `host:gpuN` (a late
+  host flags every GPU of its rank block — ranks of one host share an
+  arrival, docs/features/barrier_skew.md). `fleet_span_*` stays one
+  node-scope series on the lead host. `tcp_barrier.*` is unchanged.
+- `overlap_fleet_all_reduce.*`: per GPU (each GPU is a rank with its own
+  isolated and overlapped windows).
+- `overlap_retention.fleet_all_reduce`: per GPU, each dividing that GPU's
+  own isolated window. `derive_overlap_retention` joins bus baselines on
+  (step, repeat, scope label), so node-scope inputs (the node-local
+  step, older documents) still derive node-scope ratios.
+The phase-3 sweep series (`nccl_all_reduce.*`, `nccl_all_gather.*`) and
+the `nccl_allreduce_fleet` fit are unchanged: still node-scope on the
+lead host, timed on global rank 0.

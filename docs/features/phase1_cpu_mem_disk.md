@@ -98,7 +98,7 @@ thermal steady state.
   emits Skipped under Node scope.
 
 ## Files
-`src/agent/{cpu,mem,disk}.rs`; shared types in `src/proto.rs`
+`src/agent/{cpu,mem,disk}.rs`; shared types in `src/proto/mod.rs`
 (`CpuTaskSpec`, `MemTaskSpec`, `DiskTaskSpec`).
 
 ## Invariants

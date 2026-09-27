@@ -64,7 +64,7 @@ site: they yield `None`.
 
 ## Files
 - `src/agent/inventory.rs` — `collect`, `run`.
-- `src/proto.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
+- `src/proto/mod.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
   `IbPortInventory`, `consistency_fields`.
 
 ## Invariants

@@ -40,7 +40,12 @@ use crate::proto::{
 // groups and derived overlap_retention.fleet_gemm_<dtype> /
 // overlap_retention.fleet_all_reduce records. No field changed shape, so
 // pre-v7 documents decode unchanged (they simply lack the new groups).
-pub const SCHEMA_VERSION: u32 = 7;
+// v8: rank-per-GPU fleet NCCL world — nccl_barrier.* per-rank metrics and
+// overlap_fleet_all_reduce.* / overlap_retention.fleet_all_reduce move from
+// node granularity (`host`) to GPU granularity (`host:gpuN`); the barrier
+// fleet_span_* series and the sweep's node-scope metrics are unchanged. No
+// field changed shape.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -120,9 +125,12 @@ pub struct FleetAnalysis {
     pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
 }
 
-/// One flagged host from the barrier-skew slowest-rank tally.
+/// One flagged subject from the barrier-skew slowest-rank tally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarrierStraggler {
+    /// Sample key: `host` for the TCP barrier (one rank per host),
+    /// `host:gpuN` for the NCCL barrier (one rank per GPU; the ranks of a
+    /// host share its arrival tally, so a late host flags all its GPUs).
     pub key: String,
     /// Fraction of considered iterations in which this host arrived last.
     pub slowest_frac: f64,
@@ -473,11 +481,14 @@ fn barrier_straggler_flags(
 ///   repeat (same communicator, measured seconds apart — the phase-3 NCCL
 ///   sweep is a different topology and only exists on rank 0, so it cannot
 ///   serve as the denominator).
-/// - `fleet_gemm_<dtype>` per GPU and `fleet_all_reduce` per node: the same
-///   two ratios for the fleet overlap step — GEMM against the same phase-2
-///   baseline, all-reduce against the step's own isolated window
-///   (`overlap_fleet_all_reduce.isolated_bus_gib_per_sec`, same fleet
-///   communicator).
+/// - `fleet_gemm_<dtype>` and `fleet_all_reduce` per GPU: the same two
+///   ratios for the fleet overlap step (one rank per GPU) — GEMM against
+///   the same phase-2 baseline, all-reduce against *that GPU's* isolated
+///   window (`overlap_fleet_all_reduce.isolated_bus_gib_per_sec`, same
+///   rank, same fleet communicator).
+///
+/// Bus baselines are joined on (step, repeat, scope), so each subject
+/// divides its own isolated window whatever the scope granularity.
 ///
 /// A ratio is only formed from finite numbers over a positive baseline; a
 /// missing or degenerate baseline yields no record rather than a lie.
@@ -493,11 +504,12 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
     }
 
     // GEMM baselines keyed by (repeat, scope label, metric name); bus
-    // baselines keyed by (step, repeat) — the two overlap steps run on
-    // different communicators, so keying by the emitting test id keeps
-    // their baselines from ever crossing.
+    // baselines keyed by (step, repeat, scope label) — the two overlap
+    // steps run on different communicators, so keying by the emitting test
+    // id keeps their baselines from ever crossing, and the scope keeps one
+    // fleet rank (GPU) from dividing by a sibling's window.
     let mut gemm_baselines: BTreeMap<(u32, String, &str), f64> = BTreeMap::new();
-    let mut bus_baselines: BTreeMap<(TestId, u32), f64> = BTreeMap::new();
+    let mut bus_baselines: BTreeMap<(TestId, u32, String), f64> = BTreeMap::new();
     for record in &obs.metrics {
         if !(record.value.is_finite() && record.value > 0.0) {
             continue;
@@ -516,7 +528,14 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
             TestId::OverlapAllReduce | TestId::OverlapFleetAllReduce
                 if record.name == overlap_metric::ISOLATED_BUS =>
             {
-                bus_baselines.insert((record.test, record.repeat), record.value);
+                bus_baselines.insert(
+                    (
+                        record.test,
+                        record.repeat,
+                        scope_label(&record.scope).unwrap_or_default(),
+                    ),
+                    record.value,
+                );
             }
             _ => {}
         }
@@ -559,11 +578,12 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
                     record.name.as_str(),
                 ))
                 .copied(),
-            TestId::OverlapAllReduce => bus_baselines
-                .get(&(TestId::OverlapAllReduce, record.repeat))
-                .copied(),
             _ => bus_baselines
-                .get(&(TestId::OverlapFleetAllReduce, record.repeat))
+                .get(&(
+                    record.test,
+                    record.repeat,
+                    scope_label(&record.scope).unwrap_or_default(),
+                ))
                 .copied(),
         };
         if let Some(baseline) = baseline {

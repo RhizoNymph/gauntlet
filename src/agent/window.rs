@@ -37,6 +37,19 @@ pub enum WindowRole {
     Follower,
 }
 
+/// Role of a global rank. The fleet world runs one rank per GPU and one
+/// process drives a host's whole rank block, so the lead's *host* also
+/// drives follower ranks: global rank 0 leads, and every other rank —
+/// rank 0's local siblings included — follows. The MIN reduction then
+/// works unchanged: the lead contributes the only close word.
+pub fn role_for_rank(global_rank: u32) -> WindowRole {
+    if global_rank == 0 {
+        WindowRole::Lead
+    } else {
+        WindowRole::Follower
+    }
+}
+
 /// The control word this rank contributes for the current control step.
 /// Followers ignore their own clocks entirely — a follower that closed
 /// windows on its own clock would recreate exactly the cross-host clock
@@ -166,6 +179,41 @@ mod tests {
             contribution(WindowRole::Follower, false),
         ];
         assert!(window_closed(reduce(&closed)));
+    }
+
+    #[test]
+    fn exactly_one_lead_across_multi_rank_blocks() {
+        // Three hosts x four GPUs: ranks 0..12, blocks 0..4, 4..8, 8..12.
+        let world = 12u32;
+        let leads: Vec<u32> = (0..world)
+            .filter(|rank| role_for_rank(*rank) == WindowRole::Lead)
+            .collect();
+        assert_eq!(leads, [0], "only global rank 0 leads");
+        // Rank 0's local siblings are followers.
+        for sibling in 1..4 {
+            assert_eq!(role_for_rank(sibling), WindowRole::Follower);
+        }
+    }
+
+    #[test]
+    fn min_consensus_with_multiple_local_ranks_per_host() {
+        let reduce = |words: &[f32]| words.iter().copied().fold(f32::INFINITY, f32::min);
+        let world = 12u32;
+        // Every host's clock except the lead's says time is up: the window
+        // must stay open — rank 0's siblings share its host clock but are
+        // followers, so they cannot close it either.
+        let open: Vec<f32> = (0..world)
+            .map(|rank| contribution(role_for_rank(rank), rank != 0))
+            .collect();
+        assert!(!window_closed(reduce(&open)));
+        // Only the lead's deadline closes it, regardless of every other
+        // rank's clock.
+        for others_expired in [false, true] {
+            let closed: Vec<f32> = (0..world)
+                .map(|rank| contribution(role_for_rank(rank), rank == 0 || others_expired))
+                .collect();
+            assert!(window_closed(reduce(&closed)));
+        }
     }
 
     #[test]

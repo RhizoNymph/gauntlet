@@ -2,10 +2,19 @@
 //! the two workloads that ride it — the phase-3 collective sweep and the
 //! overlap phase's fleet step.
 //!
-//! Rank 0 mints the rendezvous id in-process (the id's bootstrap listen
-//! socket must live in the process that serves as rank 0) and announces it
-//! as an `NcclId` event; the driver intercepts and relays it to every other
-//! rank, then supervises all rank tasks to completion.
+//! World: one NCCL rank per GPU (`layout::RankLayout`). Each NCCL-capable
+//! host contributes a contiguous rank block ordered by local GPU index;
+//! one `agent nccl` process — one ssh session, one supervised task — per
+//! host drives its whole block.
+//!
+//! The host holding global rank 0 mints the rendezvous id in-process (the
+//! id's bootstrap listen socket must live in the process that serves as
+//! rank 0) and announces it as an `NcclId` event; the driver intercepts
+//! and relays it to every other host, then supervises all host tasks to
+//! completion.
+
+mod layout;
+mod records;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,21 +23,28 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+use self::layout::RankLayout;
+use self::records::{host_overlap_records, outcomes_with};
+use super::barrier::{RankSubject, emit_barrier_metrics};
 use super::session::HostSession;
-use super::{ObservationSink, emit_barrier_metrics, gpu_bearing_hosts};
+use super::{ObservationSink, gpu_bearing_hosts};
 use crate::analysis::skew::{self, Margin, RankSeries, SkewPolarity};
 use crate::config::FleetConfig;
 use crate::proto::{
-    AgentEvent, BarrierSpec, GemmDtype, InventorySnapshot, MetricRecord, NcclDirective,
-    NcclWorkload, OverlapFleetReport, OverlapGpuGemm, Scope, TestId, TestOutcome, Unit,
-    overlap_metric,
+    AgentEvent, BarrierSpec, InventorySnapshot, NcclDirective, NcclWorkload, OverlapFleetReport,
+    RankAssignment, Scope, TestId, TestOutcome,
 };
 
 /// How long the orchestrator waits for the lead rank's NcclId event.
 const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
 
-/// Hosts eligible for a fleet-wide NCCL world, in fleet order: GPU-bearing
-/// (probing hosts whose inventory is missing) with a loadable libnccl.
+/// The fleet world: NCCL-capable hosts in fleet order, each with its rank
+/// block.
+type FleetWorld = RankLayout<Arc<HostSession>>;
+
+/// Hosts eligible for a fleet-wide NCCL world, laid out one rank per GPU:
+/// GPU-bearing (probing hosts whose inventory is missing) with a loadable
+/// libnccl, each contributing its phase-0 GPU count.
 ///
 /// The inventory dlopen probe knows whether libnccl actually loads. A fleet
 /// without the NCCL stack skips fleet NCCL work as a structural finding
@@ -38,28 +54,27 @@ const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
 async fn nccl_world(
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
-) -> Vec<Arc<HostSession>> {
+) -> FleetWorld {
     let gpu_hosts = gpu_bearing_hosts(sessions, inventories).await;
     if gpu_hosts.is_empty() {
         info!("no GPU-bearing hosts; skipping fleet NCCL work");
-        return Vec::new();
+        return RankLayout::empty();
     }
-    let nccl_hosts: Vec<_> = gpu_hosts
+    let nccl_hosts: Vec<(Arc<HostSession>, u32)> = gpu_hosts
         .iter()
-        .filter(|session| {
-            inventories
-                .get(session.addr())
-                .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
-                .unwrap_or(true)
+        .filter_map(|session| {
+            let inventory = inventories.get(session.addr())?;
+            let nccl_loads = inventory.gpu_libs.get("nccl").copied().unwrap_or(true);
+            let gpus = u32::try_from(inventory.gpus.len()).unwrap_or(u32::MAX);
+            nccl_loads.then(|| (Arc::clone(session), gpus))
         })
-        .cloned()
         .collect();
     if nccl_hosts.is_empty() {
         warn!(
             gpu_hosts = gpu_hosts.len(),
             "libnccl is not loadable on any GPU-bearing host; skipping fleet NCCL work"
         );
-        return Vec::new();
+        return RankLayout::empty();
     }
     if nccl_hosts.len() < gpu_hosts.len() {
         warn!(
@@ -68,7 +83,13 @@ async fn nccl_world(
             "some GPU-bearing hosts lack a loadable libnccl and are excluded from fleet NCCL work"
         );
     }
-    nccl_hosts
+    match RankLayout::new(nccl_hosts) {
+        Ok(layout) => layout,
+        Err(error) => {
+            warn!(%error, "cannot lay out the fleet NCCL world; skipping fleet NCCL work");
+            RankLayout::empty()
+        }
+    }
 }
 
 /// What one fleet-wide `agent nccl` job runs, beyond the world itself. The
@@ -80,26 +101,25 @@ struct NcclJob {
 }
 
 impl NcclJob {
-    fn lead(&self, world_size: u32) -> NcclDirective {
+    fn lead(&self, assignment: RankAssignment) -> NcclDirective {
         NcclDirective::Lead {
-            world_size,
+            assignment,
             socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
 
-    fn participate(&self, unique_id_b64: &str, rank: u32, world_size: u32) -> NcclDirective {
+    fn participate(&self, unique_id_b64: &str, assignment: RankAssignment) -> NcclDirective {
         NcclDirective::Participate {
             unique_id_b64: unique_id_b64.to_string(),
-            rank,
-            world_size,
+            assignment,
             socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
 }
 
-/// How a rank-level failure is reported. The sweep marks the host failed
+/// How a host-level failure is reported. The sweep marks the host failed
 /// (its numbers feed calibration and their absence is a real gap); the
 /// fleet overlap step only warns here — the caller records step-level
 /// Failed outcomes from the returned failure map, so the results document
@@ -110,37 +130,37 @@ enum NcclFailureMode {
     WarnOnly,
 }
 
-/// Per-rank event filter for a fleet NCCL job: returns `None` to consume an
+/// Per-host event filter for a fleet NCCL job: returns `None` to consume an
 /// event (merged into job-local state), or the event back to forward it to
 /// the collector. `NcclId` relay is handled by the driver itself.
 type EventIntercept = Arc<dyn Fn(AgentEvent) -> Option<AgentEvent> + Send + Sync>;
 
-/// Drive one fleet-wide `agent nccl` job over an established world. Returns
-/// the failure map: host address -> why that rank did not complete (rank
-/// error, timeout, or never being started because the rendezvous id never
-/// arrived). An empty map means every rank exited cleanly.
+/// Drive one fleet-wide `agent nccl` job over an established world: one
+/// process per host, each driving its rank block. Returns the failure map:
+/// host address -> why that host's ranks did not complete (process error,
+/// timeout, or never being started because the rendezvous id never
+/// arrived). An empty map means every host exited cleanly.
 async fn drive_fleet_nccl(
     config: &FleetConfig,
-    world: &[Arc<HostSession>],
+    world: &FleetWorld,
     sink: &ObservationSink,
     job: &NcclJob,
     failure: NcclFailureMode,
     intercept: EventIntercept,
 ) -> BTreeMap<String, String> {
     let mut failures = BTreeMap::new();
-    let Some(rank0) = world.first() else {
+    let Some((lead, lead_assignment)) = world.members().first() else {
         return failures;
     };
-    let world_size = world.len() as u32;
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let mut tasks = JoinSet::new();
 
-    let document = match serde_json::to_string(&job.lead(world_size)) {
+    let document = match serde_json::to_string(&job.lead(*lead_assignment)) {
         Ok(document) => document,
         Err(error) => {
             warn!(%error, "cannot serialize the NCCL lead directive");
             let reason = format!("cannot serialize the NCCL lead directive: {error}");
-            for session in world {
+            for (session, _) in world.members() {
                 failures.insert(session.addr().to_string(), reason.clone());
             }
             return failures;
@@ -149,7 +169,8 @@ async fn drive_fleet_nccl(
     let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
     let id_slot = Arc::new(std::sync::Mutex::new(Some(id_tx)));
     {
-        let session = Arc::clone(rank0);
+        let session = Arc::clone(lead);
+        let assignment = *lead_assignment;
         let sink = sink.clone();
         let id_slot = Arc::clone(&id_slot);
         let intercept = Arc::clone(&intercept);
@@ -171,7 +192,7 @@ async fn drive_fleet_nccl(
                 }),
             )
             .await;
-            let failure = rank_failure(0, timeout, outcome);
+            let failure = block_failure(assignment, timeout, outcome);
             (addr, failure)
         });
     }
@@ -181,15 +202,15 @@ async fn drive_fleet_nccl(
         Ok(Err(_)) | Err(_) => {
             // The lead task reports its own failure; just stop recruiting.
             warn!(
-                rank0 = %rank0.addr(),
+                lead = %lead.addr(),
                 "NCCL lead produced no rendezvous id; aborting the job"
             );
-            // The other ranks never start: record why, so the caller can
+            // The other hosts never start: record why, so the caller can
             // put something truthful in the results document.
-            for session in world.iter().skip(1) {
+            for (session, _) in world.members().iter().skip(1) {
                 failures.insert(
                     session.addr().to_string(),
-                    "nccl rank never started: the lead produced no rendezvous id".to_string(),
+                    "nccl ranks never started: the lead produced no rendezvous id".to_string(),
                 );
             }
             None
@@ -197,12 +218,12 @@ async fn drive_fleet_nccl(
     };
 
     if let Some(unique_id_b64) = &unique_id_b64 {
-        for (rank, session) in world.iter().enumerate().skip(1) {
-            let directive = job.participate(unique_id_b64, rank as u32, world_size);
+        for (session, assignment) in world.members().iter().skip(1) {
+            let directive = job.participate(unique_id_b64, *assignment);
             let document = match serde_json::to_string(&directive) {
                 Ok(document) => document,
                 Err(error) => {
-                    warn!(%error, rank, "cannot serialize the NCCL directive");
+                    warn!(%error, host = %session.addr(), "cannot serialize the NCCL directive");
                     failures.insert(
                         session.addr().to_string(),
                         format!("cannot serialize the NCCL directive: {error}"),
@@ -211,6 +232,7 @@ async fn drive_fleet_nccl(
                 }
             };
             let session = Arc::clone(session);
+            let assignment = *assignment;
             let sink = sink.clone();
             let intercept = Arc::clone(&intercept);
             tasks.spawn(async move {
@@ -224,7 +246,7 @@ async fn drive_fleet_nccl(
                     }),
                 )
                 .await;
-                let failure = rank_failure(rank, timeout, outcome);
+                let failure = block_failure(assignment, timeout, outcome);
                 (addr, failure)
             });
         }
@@ -235,7 +257,7 @@ async fn drive_fleet_nccl(
                 match failure {
                     NcclFailureMode::HostError => sink.error(&addr, message.clone()),
                     NcclFailureMode::WarnOnly => {
-                        warn!(host = %addr, message, "fleet nccl rank failed")
+                        warn!(host = %addr, message, "fleet nccl host failed")
                     }
                 }
                 failures.insert(addr, message);
@@ -247,26 +269,25 @@ async fn drive_fleet_nccl(
     failures
 }
 
-/// Why a rank task did not complete cleanly, if it didn't.
-fn rank_failure(
-    rank: usize,
+/// Why a host's rank block did not complete cleanly, if it didn't.
+fn block_failure(
+    assignment: RankAssignment,
     timeout: Duration,
     outcome: Result<anyhow::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
 ) -> Option<String> {
+    let block = assignment.block();
+    let ranks = format!("nccl ranks {}..{}", block.base(), block.end());
     match outcome {
         Ok(Ok(status)) if status.success() => None,
-        Ok(Ok(status)) => Some(format!("nccl rank {rank} exited with {status}")),
-        Ok(Err(error)) => Some(format!("nccl rank {rank} failed: {error:#}")),
-        Err(_) => Some(format!(
-            "nccl rank {rank} timed out after {}s",
-            timeout.as_secs()
-        )),
+        Ok(Ok(status)) => Some(format!("{ranks} exited with {status}")),
+        Ok(Err(error)) => Some(format!("{ranks} failed: {error:#}")),
+        Err(_) => Some(format!("{ranks} timed out after {}s", timeout.as_secs())),
     }
 }
 
-/// Fleet-wide NCCL sweep: rank 0's event stream carries the measurements;
-/// every rank contributes barrier timings when the barrier-skew benchmark
-/// rides along.
+/// Fleet-wide NCCL sweep: the lead host's event stream carries the
+/// measurements (timed on global rank 0); every rank contributes barrier
+/// timings when the barrier-skew benchmark rides along.
 pub(super) async fn nccl_sweep(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
@@ -274,21 +295,28 @@ pub(super) async fn nccl_sweep(
     sink: &ObservationSink,
 ) {
     let world = nccl_world(sessions, inventories).await;
-    let Some(rank0) = world.first() else {
+    let Some((lead, _)) = world.members().first() else {
         return;
     };
-    let world_size = world.len() as u32;
-    info!(world_size, rank0 = %rank0.addr(), "NCCL sweep");
+    let world_size = world.world_size();
+    info!(
+        world_size,
+        hosts = world.member_count(),
+        lead = %lead.addr(),
+        "NCCL sweep"
+    );
 
-    // Barrier-skew microbenchmark rides the same communicator; a world of
-    // one has no skew to measure.
-    let barrier_spec = (config.tests.barrier_iters > 0 && world_size >= 2).then_some(BarrierSpec {
-        iters: config.tests.barrier_iters,
-        bytes: config.tests.barrier_bytes,
-    });
+    // Barrier-skew microbenchmark rides the same communicator. Skew needs
+    // at least two independent arrivals, and the ranks of one host share
+    // its launching thread's arrival, so a one-host world has none.
+    let barrier_spec =
+        (config.tests.barrier_iters > 0 && world.member_count() >= 2).then_some(BarrierSpec {
+            iters: config.tests.barrier_iters,
+            bytes: config.tests.barrier_bytes,
+        });
     // Every rank reports its per-iteration barrier timings; the intercept
     // merges them here so the fleet-wide skew analysis can run once all
-    // ranks are in.
+    // hosts are in.
     let barrier_timings: Arc<std::sync::Mutex<Vec<RankSeries>>> = Arc::default();
     let intercept: EventIntercept = {
         let barrier_timings = Arc::clone(&barrier_timings);
@@ -324,12 +352,19 @@ pub(super) async fn nccl_sweep(
     if barrier_spec.is_some() {
         let series =
             std::mem::take(&mut *barrier_timings.lock().expect("barrier timings poisoned"));
-        let rank_hosts: Vec<String> = world
-            .iter()
-            .map(|session| session.addr().to_string())
-            .collect();
-        match skew::analyze(&series, SkewPolarity::LateIsMin, Margin::default()) {
-            Some(skew) => emit_barrier_metrics(sink, TestId::NcclBarrier, &rank_hosts, &skew),
+        match skew::analyze_grouped(
+            &series,
+            SkewPolarity::LateIsMin,
+            Margin::default(),
+            |rank| world.arrival_group(rank),
+        ) {
+            Some(skew) => emit_barrier_metrics(
+                sink,
+                TestId::NcclBarrier,
+                &skew,
+                |rank| gpu_subject(&world, rank),
+                Some(lead.addr()),
+            ),
             None => warn!(
                 ranks_reporting = series.len(),
                 world_size, "NCCL barrier produced no analyzable timings"
@@ -338,19 +373,32 @@ pub(super) async fn nccl_sweep(
     }
 }
 
+/// A global rank's results-document subject: its host, `Scope::Gpu` with
+/// the local GPU index.
+fn gpu_subject(world: &FleetWorld, rank: u32) -> Option<RankSubject> {
+    world.locate(rank).map(|location| RankSubject {
+        host: location.member.addr().to_string(),
+        scope: Scope::Gpu {
+            index: location.gpu,
+        },
+    })
+}
+
 /// Fleet-wide overlap step: every local GPU on every NCCL-capable host runs
-/// the sustained GEMM while one rank per node drives a cross-node
-/// all-reduce over the real fabric — the straggler signal the intra-node
-/// overlap structurally cannot see (GPU<->NIC PCIe contention, GPUDirect
-/// degradation under compute load, hot-host network behavior). Every rank
-/// reports its own results (`OverlapFleetReport`, barrier-timings pattern);
-/// this driver merges them into per-host metrics.
+/// the sustained GEMM *and* a rank of the cross-node all-reduce over the
+/// real fabric — the straggler signal the intra-node overlap structurally
+/// cannot see (GPU<->NIC PCIe contention, GPUDirect degradation under
+/// compute load, hot-host network behavior), now on every GPU's path
+/// rather than GPU 0's alone. Every rank reports its own results
+/// (`OverlapFleetReport`, barrier-timings pattern); this driver merges
+/// them into per-GPU metrics.
 ///
 /// Failure semantics: everything short of running lands in the results
 /// document as explicit outcomes — the gated skip (< 2 NCCL-capable hosts)
-/// records Skipped, a rank that fails, times out, or never reports records
-/// Failed against that host — but never a failed-*host* verdict. Only
-/// `overlap_fleet = false` leaves no trace at all.
+/// records Skipped, a host whose ranks fail, time out, or never report
+/// records Failed (per GPU for a silent rank inside a reporting block) —
+/// but never a failed-*host* verdict. Only `overlap_fleet = false` leaves
+/// no trace at all.
 pub(super) async fn overlap_fleet_sweep(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
@@ -358,28 +406,30 @@ pub(super) async fn overlap_fleet_sweep(
     sink: &ObservationSink,
 ) {
     let world = nccl_world(sessions, inventories).await;
-    if world.len() < 2 {
+    if world.member_count() < 2 {
         info!(
-            nccl_hosts = world.len(),
+            nccl_hosts = world.member_count(),
             "fewer than two NCCL-capable hosts; skipping the fleet overlap step"
         );
         let reason = format!(
             "fleet overlap needs at least 2 NCCL-capable hosts, found {}",
-            world.len()
+            world.member_count()
         );
-        for session in &world {
-            step_outcomes(
-                sink,
-                session.addr(),
-                |r| TestOutcome::Skipped { reason: r },
-                &reason,
-            );
+        for (session, _) in world.members() {
+            let skipped =
+                outcomes_with(Scope::Node, |r| TestOutcome::Skipped { reason: r }, &reason);
+            emit_outcomes(sink, session.addr(), skipped);
         }
         return;
     }
     let spec = config.overlap_spec();
-    let world_size = world.len() as u32;
-    info!(world_size, rank0 = %world[0].addr(), "fleet overlap step");
+    let world_size = world.world_size();
+    info!(
+        world_size,
+        hosts = world.member_count(),
+        lead = %world.members()[0].0.addr(),
+        "fleet overlap step"
+    );
 
     let reports: Arc<std::sync::Mutex<Vec<OverlapFleetReport>>> = Arc::default();
     let intercept: EventIntercept = {
@@ -415,205 +465,113 @@ pub(super) async fn overlap_fleet_sweep(
     }
     let mut by_rank: BTreeMap<u32, OverlapFleetReport> = BTreeMap::new();
     for report in reports {
+        if report.rank >= world_size {
+            warn!(
+                rank = report.rank,
+                world_size, "fleet overlap report outside the world"
+            );
+            continue;
+        }
         if by_rank.insert(report.rank, report).is_some() {
             warn!("duplicate fleet overlap report for a rank; keeping the last");
         }
     }
-    // Every host in the world ends up with something in the document: the
-    // rank's merged report, or a Failed outcome saying why there is none.
-    for (rank, session) in world.iter().enumerate() {
+    // Every host in the world ends up with something in the document: its
+    // GPUs' merged reports, or Failed outcomes saying why there are none.
+    for (session, assignment) in world.members() {
         let host = session.addr();
-        match by_rank.remove(&(rank as u32)) {
-            Some(report) => {
-                let (metrics, outcomes) = fleet_overlap_records(&report, spec.gemm_dtype);
-                for record in metrics {
-                    sink.metric(host, record);
-                }
-                for (test, scope, outcome) in outcomes {
-                    sink.event(
-                        host,
-                        AgentEvent::Outcome {
-                            test,
-                            scope,
-                            outcome,
-                        },
-                    );
-                }
-            }
-            None => {
-                let reason = failures
-                    .get(host)
-                    .cloned()
-                    .unwrap_or_else(|| "rank produced no fleet overlap report".to_string());
-                step_outcomes(sink, host, |r| TestOutcome::Failed { reason: r }, &reason);
-            }
+        let (metrics, outcomes) = host_overlap_records(
+            assignment.block(),
+            &by_rank,
+            spec.gemm_dtype,
+            failures.get(host).map(String::as_str),
+        );
+        for record in metrics {
+            sink.metric(host, record);
         }
+        emit_outcomes(sink, host, outcomes);
     }
 }
 
-/// Node-scope outcomes for the fleet overlap step against one host,
-/// mirroring the intra-node phase's `node_outcomes`: used for the gated
-/// skip and for ranks that failed or never reported.
-fn step_outcomes(
-    sink: &ObservationSink,
-    host: &str,
-    outcome: impl Fn(String) -> TestOutcome,
-    reason: &str,
-) {
-    for test in [TestId::OverlapFleetGemm, TestId::OverlapFleetAllReduce] {
+fn emit_outcomes(sink: &ObservationSink, host: &str, outcomes: Vec<records::OutcomeRecord>) {
+    for (test, scope, outcome) in outcomes {
         sink.event(
             host,
             AgentEvent::Outcome {
                 test,
-                scope: Scope::Node,
-                outcome: outcome(reason.to_string()),
+                scope,
+                outcome,
             },
         );
     }
 }
 
-/// Metric and outcome records for one rank's fleet-overlap report,
-/// mirroring the intra-node overlap phase: bus numbers under `Scope::Node`,
-/// per-GPU GEMM under `Scope::Gpu`, one GPU's failure hiding nothing else.
-fn fleet_overlap_records(
-    report: &OverlapFleetReport,
-    dtype: GemmDtype,
-) -> (Vec<MetricRecord>, Vec<(TestId, Scope, TestOutcome)>) {
-    let mut metrics: Vec<MetricRecord> = [
-        (
-            overlap_metric::MSG_BYTES,
-            report.msg_bytes as f64,
-            Unit::Bytes,
-        ),
-        (
-            overlap_metric::ISOLATED_BUS,
-            report.isolated_bus_gib_per_sec,
-            Unit::GibPerSec,
-        ),
-        (
-            overlap_metric::OVERLAP_BUS,
-            report.overlap_bus_gib_per_sec,
-            Unit::GibPerSec,
-        ),
-    ]
-    .into_iter()
-    .map(|(name, value, unit)| MetricRecord {
-        test: TestId::OverlapFleetAllReduce,
-        scope: Scope::Node,
-        name: name.to_string(),
-        value,
-        unit,
-        repeat: 0,
-    })
-    .collect();
-    let mut outcomes = vec![(
-        TestId::OverlapFleetAllReduce,
-        Scope::Node,
-        TestOutcome::Passed,
-    )];
-
-    let tag = dtype.tag();
-    for gemm in &report.gemm {
-        match gemm {
-            OverlapGpuGemm::Ok { gpu_index, gflops } => {
-                metrics.push(MetricRecord {
-                    test: TestId::OverlapFleetGemm,
-                    scope: Scope::Gpu { index: *gpu_index },
-                    name: format!("gflops_{tag}"),
-                    value: *gflops,
-                    unit: Unit::Gflops,
-                    repeat: 0,
-                });
-                outcomes.push((
-                    TestId::OverlapFleetGemm,
-                    Scope::Gpu { index: *gpu_index },
-                    TestOutcome::Passed,
-                ));
-            }
-            OverlapGpuGemm::Failed { gpu_index, reason } => {
-                outcomes.push((
-                    TestId::OverlapFleetGemm,
-                    Scope::Gpu { index: *gpu_index },
-                    TestOutcome::Failed {
-                        reason: reason.clone(),
-                    },
-                ));
-            }
-        }
-    }
-    (metrics, outcomes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{GemmDtype, OverlapSpec};
+
+    fn job() -> NcclJob {
+        NcclJob {
+            socket_ifname: Some("bond0".into()),
+            workload: NcclWorkload::Overlap(OverlapSpec {
+                duration_secs: 30,
+                baseline_secs: 5,
+                gemm_dim: 4096,
+                gemm_dtype: GemmDtype::Bf16,
+                msg_bytes: 64 << 20,
+            }),
+        }
+    }
 
     #[test]
-    fn fleet_overlap_records_cover_bus_and_per_gpu_gemm() {
-        let report = OverlapFleetReport {
-            rank: 1,
-            msg_bytes: 64 << 20,
-            isolated_bus_gib_per_sec: 40.0,
-            overlap_bus_gib_per_sec: 30.0,
-            gemm: vec![
-                OverlapGpuGemm::Ok {
-                    gpu_index: 0,
-                    gflops: 88_000.0,
-                },
-                OverlapGpuGemm::Failed {
-                    gpu_index: 1,
-                    reason: "worker panicked".into(),
-                },
-            ],
+    fn directives_carry_each_hosts_block_and_the_world_size() {
+        let layout = RankLayout::new([("n1", 8), ("n2", 0), ("n3", 4)]).expect("layout");
+        let job = job();
+        let members = layout.members();
+        let lead = job.lead(members[0].1);
+        let participant = job.participate("id", members[1].1);
+
+        let NcclDirective::Lead { assignment, .. } = &lead else {
+            panic!("lead directive");
         };
-        let (metrics, outcomes) = fleet_overlap_records(&report, GemmDtype::Bf16);
+        assert!(assignment.block().holds_lead());
+        assert_eq!(assignment.block().count(), 8);
+        assert_eq!(assignment.world_size(), 12);
 
-        let names: Vec<&str> = metrics.iter().map(|record| record.name.as_str()).collect();
-        assert_eq!(
-            names,
-            [
-                "msg_bytes",
-                "isolated_bus_gib_per_sec",
-                "overlap_bus_gib_per_sec",
-                "gflops_bf16",
-            ]
-        );
-        for record in &metrics[..3] {
-            assert_eq!(record.test, TestId::OverlapFleetAllReduce);
-            assert_eq!(record.scope, Scope::Node);
+        let NcclDirective::Participate {
+            assignment,
+            unique_id_b64,
+            ..
+        } = &participant
+        else {
+            panic!("participate directive");
+        };
+        assert_eq!(unique_id_b64, "id");
+        assert_eq!(assignment.block().ranks(), 8..12);
+        assert_eq!(assignment.world_size(), 12);
+
+        // Both survive the wire.
+        for directive in [lead, participant] {
+            let json = serde_json::to_string(&directive).expect("serialize");
+            let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, directive);
         }
-        assert_eq!(metrics[3].test, TestId::OverlapFleetGemm);
-        assert_eq!(metrics[3].scope, Scope::Gpu { index: 0 });
-        assert_eq!(metrics[3].value, 88_000.0);
+    }
 
-        // One outcome for the collective, one per GPU; the failed GPU is a
-        // Failed outcome (a finding), never a missing entry.
-        assert_eq!(outcomes.len(), 3);
-        assert_eq!(
-            outcomes[0],
-            (
-                TestId::OverlapFleetAllReduce,
-                Scope::Node,
-                TestOutcome::Passed
-            )
-        );
-        assert_eq!(
-            outcomes[1],
-            (
-                TestId::OverlapFleetGemm,
-                Scope::Gpu { index: 0 },
-                TestOutcome::Passed
-            )
-        );
-        assert_eq!(
-            outcomes[2],
-            (
-                TestId::OverlapFleetGemm,
-                Scope::Gpu { index: 1 },
-                TestOutcome::Failed {
-                    reason: "worker panicked".into()
-                }
-            )
-        );
+    #[test]
+    fn block_failures_name_the_rank_range() {
+        let layout = RankLayout::new([("n1", 4), ("n2", 4)]).expect("layout");
+        let assignment = layout.members()[1].1;
+        let timeout = Duration::from_secs(600);
+        assert_eq!(block_failure(assignment, timeout, Ok(Ok(success()))), None);
+        let failed = block_failure(assignment, timeout, Ok(Err(anyhow::anyhow!("boom"))))
+            .expect("a failure");
+        assert!(failed.starts_with("nccl ranks 4..8 failed"), "{failed}");
+    }
+
+    fn success() -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
     }
 }

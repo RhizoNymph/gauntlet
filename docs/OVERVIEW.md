@@ -109,22 +109,31 @@ Features Index:
       Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
       mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
       -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
-      t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
+      t = alpha + beta*size per link class for simulator calibration. The
+      fleet NCCL world is one rank per GPU (proto v7): each NCCL-capable host
+      owns a contiguous, validated rank block (RankBlock/RankAssignment,
+      laid out by RankLayout from the phase-0 GPU counts) ordered by local
+      GPU index, and one agent nccl process per host drives its whole block
+      (grouped ncclCommInitRank + grouped collectives from one thread), so
+      every GPU's PCIe/NIC path is exercised, not just GPU 0's.
+    entry_points: [agent/net.rs, agent/nccl/, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl/, proto/ranks.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
   barrier_skew:
     description: >
       Straggler microbenchmark: ~2000 iterations of a tiny collective with
       per-rank timing. NCCL path (tiny all-reduce on the sweep's fleet
-      communicator; straggler = min local elapsed, the wait-time inversion)
-      plus a pure-TCP star-barrier fallback for CPU-only fleets (straggler
-      = max release-to-response on the coordinator's clock). Per-rank
-      p50/p90/p99/max feed MAD analysis; a slowest-rank tally with a noise
-      margin gets its own flagging rule (fleet.barrier_stragglers, part of
-      the verdict). Fleet-level per-iteration barrier-span distribution is
-      recorded against the lead host.
-    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
+      communicator, one rank per GPU; straggler = min local elapsed, the
+      wait-time inversion; a host's ranks share one arrival and are
+      tallied as one arrival group, results keyed host:gpuN) plus a
+      pure-TCP star-barrier fallback for CPU-only fleets (straggler = max
+      release-to-response on the coordinator's clock, keyed per host).
+      Per-rank p50/p90/p99/max feed MAD analysis; a slowest-rank tally
+      with a noise margin gets its own flagging rule
+      (fleet.barrier_stragglers, part of the verdict). Fleet-level
+      per-iteration barrier-span distribution is recorded against the
+      lead host.
+    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl/sweep.rs, orchestrator/barrier.rs, orchestrator/mod.rs, orchestrator/nccl/]
     depends_on: [phase3_network]
     doc: docs/features/barrier_skew.md
   overlap_phase:
@@ -133,18 +142,20 @@ Features Index:
       GEMM concurrent with an intra-node NCCL all-reduce on the same GPUs
       (single process, one rank per GPU, ncclCommInitAll; GEMM on a second
       stream per device from one thread per GPU, gpu/worker.rs). Fleet
-      step (proto v6/schema v7, tests.overlap_fleet, >= 2 GPU hosts): the
-      same per-GPU GEMM load on every node while one rank per node drives
-      a cross-node all-reduce over the real fabric, window boundaries
-      agreed through a MIN-reduced control word (agent/window.rs) so no
-      cross-host clock comparison is needed; every rank reports its own
-      OverlapFleetReport (barrier-timings pattern). Both steps emit
-      overlapped GFLOPS per GPU and isolated + overlapped all-reduce bus
-      bandwidth; report::build derives retention ratios
-      (overlapped/isolated) against the phase-2 GEMM baselines and each
-      step's own collective baseline, which feed the MAD outlier analysis
-      as the primary combined-load straggler signal.
-    entry_points: [agent/gpu/overlap.rs, agent/nccl.rs, agent/window.rs, orchestrator/nccl.rs, report/mod.rs]
+      step (tests.overlap_fleet, >= 2 GPU hosts): the same per-GPU GEMM
+      load on every node while every GPU is also a rank of a cross-node
+      all-reduce over the real fabric (one rank per GPU since proto
+      v7/schema v8), window boundaries agreed through a MIN-reduced
+      control word (agent/window.rs, exactly one lead: global rank 0) so
+      no cross-host clock comparison is needed; every rank (= GPU)
+      reports its own OverlapFleetReport (barrier-timings pattern). Both
+      steps emit overlapped GFLOPS per GPU and isolated + overlapped
+      all-reduce bus bandwidth (node-local: per node; fleet: per GPU);
+      report::build derives retention ratios (overlapped/isolated)
+      against the phase-2 GEMM baselines and each subject's own
+      collective baseline, which feed the MAD outlier analysis as the
+      primary combined-load straggler signal.
+    entry_points: [agent/gpu/overlap.rs, agent/nccl/fleet_overlap.rs, agent/window.rs, orchestrator/nccl/, report/mod.rs]
     depends_on: [phase2_gpu, phase3_network]
     doc: docs/features/overlap_phase.md
   counter_deltas:
