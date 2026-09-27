@@ -46,12 +46,7 @@ async fn nccl_world(
     }
     let nccl_hosts: Vec<_> = gpu_hosts
         .iter()
-        .filter(|session| {
-            inventories
-                .get(session.addr())
-                .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
-                .unwrap_or(true)
-        })
+        .filter(|session| nccl_loadable(inventories.get(session.addr())))
         .cloned()
         .collect();
     if nccl_hosts.is_empty() {
@@ -69,6 +64,16 @@ async fn nccl_world(
         );
     }
     nccl_hosts
+}
+
+/// Whether a host's libnccl is loadable per its inventory dlopen probe.
+/// Hosts predating the probe (empty map) or without an inventory at all
+/// are given the benefit of the doubt. Shared by the fleet world selection
+/// and the intra-node sweep.
+pub(super) fn nccl_loadable(inventory: Option<&InventorySnapshot>) -> bool {
+    inventory
+        .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
+        .unwrap_or(true)
 }
 
 /// What one fleet-wide `agent nccl` job runs, beyond the world itself. The
@@ -547,6 +552,40 @@ fn fleet_overlap_records(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inventory_with_libs(libs: &[(&str, bool)]) -> InventorySnapshot {
+        InventorySnapshot {
+            hostname: "n1".into(),
+            kernel: "6.8.0".into(),
+            cpu_model: "cpu".into(),
+            logical_cores: 8,
+            numa_nodes: 1,
+            mem_total_bytes: 1 << 34,
+            cpu_governor: None,
+            clock_offset_ms: None,
+            nvidia_driver: None,
+            cuda_version: None,
+            gpus: vec![],
+            nics: vec![],
+            ib_ports: vec![],
+            xid_errors: vec![],
+            gpu_libs: libs
+                .iter()
+                .map(|(lib, ok)| (lib.to_string(), *ok))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn nccl_loadability_trusts_the_probe_and_defaults_to_yes() {
+        assert!(nccl_loadable(None));
+        assert!(nccl_loadable(Some(&inventory_with_libs(&[]))));
+        assert!(nccl_loadable(Some(&inventory_with_libs(&[("nccl", true)]))));
+        assert!(!nccl_loadable(Some(&inventory_with_libs(&[
+            ("cuda", true),
+            ("nccl", false)
+        ]))));
+    }
 
     #[test]
     fn fleet_overlap_records_cover_bus_and_per_gpu_gemm() {

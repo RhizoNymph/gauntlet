@@ -50,9 +50,10 @@ rounds × window cost for little extra attribution.
    - `< 2` GPUs → Skipped outcomes (a world of one moves nothing);
      driver-init failure → Failed outcomes; all cudarc entry goes through
      `gpu::guard` (dlopen panics become findings, per the phase-2 pattern).
-   - `execute`: one `CudaContext` per GPU; NCCL communicator via
-     `Comm::from_devices` (`ncclCommInitAll`, single process, one rank per
-     GPU, each rank on its device's default stream). Warmup rounds, then
+   - `execute`: `NodeComm::init` (`gpu/node_comm.rs`, shared with the
+     intra-node NCCL sweep): one `CudaContext` per GPU; NCCL communicator
+     via `Comm::from_devices` (`ncclCommInitAll`, single process, one rank
+     per GPU, each rank on its device's default stream). Warmup rounds, then
      the **isolated baseline**: `timed_rounds` drives grouped all-reduces
      (`ncclGroupStart`/`End`, `ROUND_ITERS` per sync) for `baseline_secs`.
    - **Combined window**: one plain thread per GPU
@@ -186,6 +187,9 @@ self-contained).
 
 ## Files
 - `src/agent/gpu/overlap.rs` — node-local agent-side driver, timed rounds.
+- `src/agent/gpu/node_comm.rs` — node-local communicator setup
+  (`NodeComm`: contexts, default streams, `ncclCommInitAll`, grouped
+  launches, `sync_all`), shared with the intra-node NCCL sweep.
 - `src/agent/gpu/worker.rs` — shared GEMM-load machinery (`GemmLoad`:
   spawn / wait_ready / start / finish; operands filled once and `Arc`d
   across workers), used by both steps.

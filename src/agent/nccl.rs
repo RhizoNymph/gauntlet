@@ -11,11 +11,13 @@
 //! companion `msg_bytes` metric under the same scope, plus computed bus
 //! bandwidth `bus_gib_per_sec` (the alpha-beta fit itself happens
 //! orchestrator-side in `analysis::fit`). Rank 0 emits the events; other
-//! ranks emit only Fatal on error.
+//! ranks emit only Fatal on error. The per-size loop is shared with the
+//! intra-node sweep (`agent::sweep`).
 //!
 //! One process per node, one GPU per rank for v1 (world_size == node count;
-//! intra-node NVLink is covered by the p2p test). `socket_ifname`, when
-//! set, is exported as NCCL_SOCKET_IFNAME before init.
+//! the intra-node level of the hierarchy is the separate node-local sweep,
+//! `agent::intranode`). `socket_ifname`, when set, is exported as
+//! NCCL_SOCKET_IFNAME before init.
 //!
 //! Fleet overlap: the directive's `NcclWorkload::Overlap` runs the
 //! combined-load protocol instead of the sweep — an isolated fleet
@@ -135,38 +137,37 @@ pub fn all_gather_bus_gib_per_sec(message_bytes: f64, elapsed_secs: f64, world_s
 #[cfg(feature = "gpu")]
 pub mod imp {
     use std::ffi::c_char;
+    use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use anyhow::{Context, Result, anyhow, bail};
+    use anyhow::{Context, Result, bail};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-    use cudarc::nccl::result::NcclError;
     use cudarc::nccl::{Comm, Id, ReduceOp};
 
     use crate::agent::EventSink;
     use crate::agent::gpu::gemm::sustained_gflops_value;
+    use crate::agent::gpu::node_comm::nccl_error;
     use crate::agent::gpu::worker::GemmLoad;
+    use crate::agent::sweep::{
+        Collective, SweepCollectives, SweepLevel, SweepPlan, SweepStep, point_records, run_plan,
+    };
     use crate::agent::window::{self, WindowRole, WindowTally};
     use crate::proto::{
-        AgentEvent, BarrierSpec, MetricRecord, NcclDirective, NcclWorkload, OverlapFleetReport,
-        OverlapGpuGemm, OverlapSpec, PROTO_VERSION, Scope, TestId, Unit,
+        AgentEvent, BarrierSpec, NcclDirective, NcclWorkload, OverlapFleetReport, OverlapGpuGemm,
+        OverlapSpec, PROTO_VERSION,
     };
 
     use super::{F32_BYTES, message_elements};
 
     /// NCCL's opaque rendezvous token is exactly 128 bytes.
     const UNIQUE_ID_BYTES: usize = 128;
-    /// Untimed iterations before the sweep, so channel setup and algorithm
-    /// selection do not land in the first measured size.
+    /// Untimed iterations before the barrier probe and the overlap
+    /// windows, so channel setup and algorithm selection stay out of the
+    /// measurement (the sweep's own warmup is `agent::sweep::WARMUP_ITERS`).
     const WARMUP_ITERS: usize = 5;
-
-    /// `NcclError` implements neither `Display` nor `std::error::Error`, so it
-    /// cannot ride `?` into anyhow; the raw `ncclResult_t` is the useful part.
-    fn nccl_error(what: &str, error: NcclError) -> anyhow::Error {
-        anyhow!("{what}: {:?}", error.0)
-    }
 
     /// The raw 128 bytes of an `ncclUniqueId`, base64'd so it survives a JSON
     /// round trip through the orchestrator.
@@ -272,8 +273,8 @@ pub mod imp {
         }
 
         // v1: one process per node, one rank, driving device 0. Intra-node
-        // GPU<->GPU is covered by the p2p test, so nothing is lost by not
-        // fanning out across the local GPUs here.
+        // GPU<->GPU is the node-local sweep's level (and the p2p test's),
+        // so nothing is lost by not fanning out across the local GPUs here.
         let ctx = CudaContext::new(0).context("creating cuda context for nccl rank")?;
         let stream = ctx.default_stream();
         let comm = Comm::from_rank(Arc::clone(&stream), rank as usize, world_size as usize, id)
@@ -301,7 +302,10 @@ pub mod imp {
         }
     }
 
-    /// The message-size sweep (plus the optional barrier-skew probe).
+    /// The message-size sweep (plus the optional barrier-skew probe). The
+    /// per-size timing loop is `agent::sweep::run_plan`, shared with the
+    /// intra-node sweep; this rank's single communicator on device 0 is the
+    /// only fleet-specific part (`RankCollectives`).
     #[allow(clippy::too_many_arguments)]
     fn run_sweep(
         sink: &EventSink,
@@ -314,70 +318,26 @@ pub mod imp {
         iters_per_size: u32,
         barrier: Option<BarrierSpec>,
     ) -> Result<()> {
-        let max_elements = sizes
-            .iter()
-            .map(|size| *size as usize / F32_BYTES)
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        let world = NonZeroU32::new(world_size).context("world_size must be at least 1")?;
+        let plan = SweepPlan::new(sizes, world);
+        let max_elements = plan.max_elements();
         let send = stream.alloc_zeros::<f32>(max_elements)?;
         let mut recv = stream.alloc_zeros::<f32>(max_elements)?;
 
-        for _ in 0..WARMUP_ITERS {
-            comm.all_reduce(&send, &mut recv, &ReduceOp::Sum)
-                .map_err(|error| nccl_error("warmup all_reduce", error))?;
-        }
-        stream.synchronize()?;
-
-        let iters = iters_per_size.max(1);
-        let world = world_size as usize;
-
-        for &size in sizes {
-            let elements = (size as usize / F32_BYTES).clamp(1, max_elements);
-
-            let elapsed = timed(stream, iters, || {
-                comm.all_reduce(
-                    &send.slice(0..elements),
-                    &mut recv.slice_mut(0..elements),
-                    &ReduceOp::Sum,
-                )
-                .map_err(|error| nccl_error("all_reduce", error))?;
-                Ok(())
-            })?;
+        let mut collectives = RankCollectives {
+            stream,
+            comm,
+            send: &send,
+            recv: &mut recv,
+        };
+        // Rank 0 emits the measurements; the other ranks run silently.
+        run_plan(&mut collectives, &plan, iters_per_size, |point| {
             if emit_sweep {
-                emit_collective(
-                    sink,
-                    TestId::NcclAllReduce,
-                    (elements * F32_BYTES) as f64,
-                    elapsed / f64::from(iters),
-                    world_size,
-                );
+                for record in point_records(SweepLevel::Fleet, point, world_size) {
+                    sink.metric(record);
+                }
             }
-
-            // All-gather: every rank contributes one shard and receives the
-            // whole thing, so the *gathered* result is the message size the
-            // bus-bandwidth formula wants. Sizes too small to split across the
-            // world have no meaningful all-gather and are skipped.
-            let shard = elements / world;
-            if shard == 0 {
-                continue;
-            }
-            let gathered = shard * world;
-            let elapsed = timed(stream, iters, || {
-                comm.all_gather(&send.slice(0..shard), &mut recv.slice_mut(0..gathered))
-                    .map_err(|error| nccl_error("all_gather", error))?;
-                Ok(())
-            })?;
-            if emit_sweep {
-                emit_collective(
-                    sink,
-                    TestId::NcclAllGather,
-                    (gathered * F32_BYTES) as f64,
-                    elapsed / f64::from(iters),
-                    world_size,
-                );
-            }
-        }
+        })?;
 
         // Barrier-skew microbenchmark: many iterations of a tiny
         // all-reduce, each timed locally with the stream synchronized on
@@ -693,50 +653,38 @@ pub mod imp {
         (gpus, failures)
     }
 
-    /// Total wall seconds for `iters` collectives. The stream is synchronized
-    /// on both sides of the timed region, so the interval covers exactly the
-    /// device work — collectives are enqueued asynchronously and would
-    /// otherwise be timed at launch cost.
-    fn timed(
-        stream: &Arc<CudaStream>,
-        iters: u32,
-        mut op: impl FnMut() -> Result<()>,
-    ) -> Result<f64> {
-        stream.synchronize()?;
-        let start = Instant::now();
-        for _ in 0..iters {
-            op()?;
-        }
-        stream.synchronize()?;
-        Ok(start.elapsed().as_secs_f64())
+    /// This rank's single communicator on its device-0 stream.
+    struct RankCollectives<'a> {
+        stream: &'a Arc<CudaStream>,
+        comm: &'a Comm,
+        send: &'a CudaSlice<f32>,
+        recv: &'a mut CudaSlice<f32>,
     }
 
-    fn emit_collective(
-        sink: &EventSink,
-        test: TestId,
-        message_bytes: f64,
-        per_iter_secs: f64,
-        world_size: u32,
-    ) {
-        let bus = match test {
-            TestId::NcclAllGather => {
-                super::all_gather_bus_gib_per_sec(message_bytes, per_iter_secs, world_size)
-            }
-            _ => super::all_reduce_bus_gib_per_sec(message_bytes, per_iter_secs, world_size),
-        };
-        for (name, value, unit) in [
-            ("elapsed_us", per_iter_secs * 1e6, Unit::Micros),
-            ("msg_bytes", message_bytes, Unit::Bytes),
-            ("bus_gib_per_sec", bus, Unit::GibPerSec),
-        ] {
-            sink.metric(MetricRecord {
-                test,
-                scope: Scope::Node,
-                name: name.to_string(),
-                value,
-                unit,
-                repeat: 0,
-            });
+    impl SweepCollectives for RankCollectives<'_> {
+        type Error = anyhow::Error;
+
+        fn launch(&mut self, step: &SweepStep) -> Result<()> {
+            let send = self.send.slice(0..step.send_elements);
+            let mut recv = self.recv.slice_mut(0..step.message_elements);
+            match step.collective {
+                Collective::AllReduce => self
+                    .comm
+                    .all_reduce(&send, &mut recv, &ReduceOp::Sum)
+                    .map_err(|error| nccl_error("all_reduce", error))?,
+                // Every rank contributes one shard and receives the whole
+                // gathered message (the size the bus formula wants).
+                Collective::AllGather => self
+                    .comm
+                    .all_gather(&send, &mut recv)
+                    .map_err(|error| nccl_error("all_gather", error))?,
+            };
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            self.stream.synchronize()?;
+            Ok(())
         }
     }
 }

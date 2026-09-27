@@ -1052,3 +1052,129 @@ fn rooflines_reduce_over_per_subject_medians() {
         Some(3000.0)
     );
 }
+
+/// One node's completed intra-node sweep, as the agent emits it: per size
+/// elapsed/msg/bus for both collectives, then the per-collective headline
+/// and communicator size.
+fn intranode_sweep(obs: &mut HostObservations, gpus: u32, peak: f64) {
+    for test in [TestId::NcclIntraAllReduce, TestId::NcclIntraAllGather] {
+        for (bytes, us) in [
+            (1024.0, 12.0),
+            (1_048_576.0, 40.0),
+            (1_073_741_824.0, 9_000.0),
+        ] {
+            obs.metrics
+                .push(node_metric(test, "elapsed_us", us, Unit::Micros));
+            obs.metrics
+                .push(node_metric(test, "msg_bytes", bytes, Unit::Bytes));
+            obs.metrics.push(node_metric(
+                test,
+                "bus_gib_per_sec",
+                peak * bytes / 1_073_741_824.0,
+                Unit::GibPerSec,
+            ));
+        }
+        obs.metrics.push(node_metric(
+            test,
+            "bus_gib_per_sec_peak",
+            peak,
+            Unit::GibPerSec,
+        ));
+        obs.metrics
+            .push(node_metric(test, "ranks", f64::from(gpus), Unit::Count));
+        obs.outcomes.push((test, Scope::Node, TestOutcome::Passed));
+    }
+}
+
+#[test]
+fn intranode_headline_flags_a_degraded_node_but_the_series_never_does() {
+    let names = ["n1", "n2", "n3", "n4", "n5", "n6"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut obs = HostObservations::default();
+        // n4 has a downtrained link: a fraction of everyone else's peak.
+        let peak = if *name == "n4" {
+            60.0
+        } else {
+            180.0 + i as f64
+        };
+        intranode_sweep(&mut obs, 8, peak);
+        observations.insert((*name).to_string(), obs);
+    }
+    let results = report::build(&config, observations, 1, 2);
+
+    for group in [
+        "nccl_intra_all_reduce.bus_gib_per_sec_peak",
+        "nccl_intra_all_gather.bus_gib_per_sec_peak",
+    ] {
+        // The headline is one value per node: fleet-comparable.
+        assert_eq!(results.aggregates[group].len(), names.len(), "{group}");
+        let flagged = results.fleet.outliers.get(group).expect(group);
+        assert_eq!(flagged.len(), 1, "{group}: {flagged:?}");
+        assert_eq!(flagged[0].key, "n4");
+    }
+    // The per-size series repeat their sample key: never MAD-compared.
+    for series in ["elapsed_us", "msg_bytes", "bus_gib_per_sec"] {
+        for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+            let group = format!("{test}.{series}");
+            assert!(!results.aggregates.contains_key(&group), "{group}");
+            assert!(!results.fleet.outliers.contains_key(&group), "{group}");
+        }
+    }
+    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+}
+
+#[test]
+fn intranode_series_feed_link_classes_keyed_by_gpu_count() {
+    let names = ["n1", "n2", "n3"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (name, gpus) in [("n1", 8), ("n2", 8), ("n3", 4)] {
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, gpus, 180.0);
+        observations.insert(name.to_string(), obs);
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let classes: Vec<&str> = results
+        .calibration
+        .links
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            "nccl_allgather_intranode_4gpu",
+            "nccl_allgather_intranode_8gpu",
+            "nccl_allreduce_intranode_4gpu",
+            "nccl_allreduce_intranode_8gpu",
+        ]
+    );
+    // Intra-node points never contaminate the fleet classes.
+    assert!(
+        !results
+            .calibration
+            .links
+            .contains_key("nccl_allreduce_fleet")
+    );
+
+    // The whole document survives a JSON round trip at the new schema.
+    let json = serde_json::to_string(&results).expect("serialize");
+    let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
+    // Keys exact; values to within float-text rounding.
+    assert_eq!(
+        back.calibration.links.keys().collect::<Vec<_>>(),
+        results.calibration.links.keys().collect::<Vec<_>>()
+    );
+    for (class, fit) in &results.calibration.links {
+        let decoded = back.calibration.links[class];
+        assert!((decoded.alpha_us - fit.alpha_us).abs() < 1e-9, "{class}");
+        assert!(
+            (decoded.beta_us_per_byte - fit.beta_us_per_byte).abs() < 1e-15,
+            "{class}"
+        );
+        assert!((decoded.r_squared - fit.r_squared).abs() < 1e-9, "{class}");
+    }
+    assert_eq!(back.schema_version, report::SCHEMA_VERSION);
+}

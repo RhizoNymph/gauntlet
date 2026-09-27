@@ -5,9 +5,10 @@
 //!   ensure agent deployed (hash check) -> per-phase:
 //!     phases 0-2: spawn `agent run` on every host simultaneously, decode
 //!       event streams into the collector;
-//!     phase 3: tournament rounds of `agent peer` pairs, then the
-//!       hierarchical NCCL sweeps (per-node, pairs, full fleet) with the
-//!       uniqueId relayed from rank 0 by this process;
+//!     phase 3: the intra-node NCCL sweep (node-local fan-out, one rank per
+//!       local GPU), tournament rounds of `agent peer` pairs, then the
+//!       fleet NCCL sweep with the uniqueId relayed from rank 0 by this
+//!       process;
 //!   -> collector -> analysis -> report to disk + terminal, exit code.
 //!
 //! Per-host failures (unreachable, agent Fatal, phase timeout from
@@ -17,6 +18,7 @@
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+mod intranode;
 mod nccl;
 pub mod session;
 
@@ -631,6 +633,11 @@ async fn network_phase(
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
+    // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
+    // node pairs (TCP), then the full fleet (NCCL over the fabric).
+    if config.tests.nccl_intranode {
+        intranode::intranode_sweep(config, sessions, inventories, sink).await;
+    }
     pairwise_sweep(config, sessions, sample_pairs, sink).await;
     nccl::nccl_sweep(config, sessions, inventories, sink).await;
     tcp_barrier_sweep(config, sessions, sink).await;

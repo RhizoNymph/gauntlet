@@ -26,7 +26,9 @@ use thiserror::Error;
 // message-size sweep or the combined GEMM + fleet all-reduce protocol,
 // mutually exclusive by construction), every rank reports
 // `OverlapFleetReport`, and the overlap_fleet test ids ride the wire.
-pub const PROTO_VERSION: u32 = 6;
+// v7: intra-node NCCL sweep — `AgentTaskSpec.nccl_intranode` and the
+// `nccl_intra_all_reduce` / `nccl_intra_all_gather` test ids.
+pub const PROTO_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -186,6 +188,11 @@ pub enum TestId {
     NetBandwidth,
     NcclAllReduce,
     NcclAllGather,
+    /// Intra-node all-reduce sweep: one rank per local GPU, single process
+    /// (`ncclCommInitAll`), NVLink/PCIe only.
+    NcclIntraAllReduce,
+    /// Intra-node all-gather sweep, same communicator as the all-reduce.
+    NcclIntraAllGather,
     /// Barrier-skew microbenchmark over the NCCL group (tiny all-reduce).
     NcclBarrier,
     /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
@@ -449,6 +456,10 @@ pub struct AgentTaskSpec {
     /// sends this in dedicated invocations with an empty phase list.
     #[serde(default)]
     pub counters: Option<CounterRequest>,
+    /// Intra-node NCCL message-size sweep, run from the network phase.
+    /// `None` disables it (`tests.nccl_intranode = false`).
+    #[serde(default)]
+    pub nccl_intranode: Option<NcclSweepSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -493,6 +504,36 @@ pub struct GpuTaskSpec {
     /// 0 disables (a Skipped outcome is emitted).
     #[serde(default)]
     pub sdc_check_secs: u64,
+}
+
+/// Message-size sweep parameters for the node-local (intra-node) NCCL
+/// sweep. The same knobs as the fleet sweep (`tests.nccl_sizes`,
+/// `tests.nccl_iters_per_size`), so the two hierarchy levels measure the
+/// same sizes with the same iteration counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NcclSweepSpec {
+    /// Message sizes in bytes.
+    pub sizes: Vec<u64>,
+    pub iters_per_size: u32,
+}
+
+/// Metric names shared by the NCCL sweep emitters (fleet and intra-node)
+/// and the report's link-fit extraction, so a renamed string cannot
+/// silently break the join.
+pub mod nccl_metric {
+    /// Mean microseconds per collective at one message size.
+    pub const ELAPSED_US: &str = "elapsed_us";
+    /// Message size of the sweep point (the gathered size for all-gather).
+    pub const MSG_BYTES: &str = "msg_bytes";
+    /// Bus bandwidth at one message size.
+    pub const BUS: &str = "bus_gib_per_sec";
+    /// Intra-node only: the best bus bandwidth across the sweep's sizes,
+    /// one value per node — the fleet-comparable straggler headline.
+    pub const BUS_PEAK: &str = "bus_gib_per_sec_peak";
+    /// Intra-node only: ranks (local GPUs) in the communicator; keys the
+    /// intra-node calibration link class.
+    pub const RANKS: &str = "ranks";
 }
 
 /// Parameters of an overlap step: sustained GEMM on every GPU concurrently

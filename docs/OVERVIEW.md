@@ -29,9 +29,11 @@ Overview:
       (two-sided TCP tests) and nccl subcommand modes.
     scheduler: >
       Phase DAG. Phases 0-2 and the overlap phase are embarrassingly
-      parallel across nodes. Phase 3 pairwise tests use round-robin
-      tournament scheduling: n-1 rounds of n/2 disjoint pairs, wall time
-      linear in n. The overlap phase (compute + comms under combined load)
+      parallel across nodes. Phase 3 is a hierarchy: the intra-node NCCL
+      sweep rides the same per-node fan-out (node-local communicator, no
+      rendezvous), then pairwise tests use round-robin tournament
+      scheduling (n-1 rounds of n/2 disjoint pairs, wall time linear in
+      n), then the fleet NCCL sweep. The overlap phase (compute + comms under combined load)
       runs last: its retention ratios divide the isolated phase-2 baselines
       from the same run. Target scale 32-256 nodes; a sampled mode exists
       for quick runs.
@@ -46,7 +48,7 @@ Overview:
       viewers can tail progress.
   data_flow: >
     config.toml -> orchestrator -> (scp agent, spawn `gauntlet agent` per
-    host/pair) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
+    host/pair/NCCL rank) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
     mpsc -> collector -> outlier analysis -> report.json + terminal table.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
@@ -106,12 +108,21 @@ Features Index:
     doc: docs/features/hot_sdc.md
   phase3_network:
     description: >
-      Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
-      mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
-      -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
-      t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl.rs]
-    depends_on: [phase0_inventory]
+      Hierarchical network tests, innermost first. Intra-node (proto
+      v7/schema v8, tests.nccl_intranode): all-reduce + all-gather
+      message-size sweep across every local GPU (single process,
+      ncclCommInitAll, NVLink/PCIe) via the per-node fan-out; per-size
+      series feed calibration link classes
+      nccl_{allreduce,allgather}_intranode_<n>gpu, and a per-node
+      bus_gib_per_sec_peak headline is MAD-compared across nodes (degraded
+      NVLink, downtrained PCIe switch, missing P2P path). Then pairwise TCP
+      RTT distribution (p50/p99) and bandwidth via agent peer mode,
+      tournament-scheduled full mesh. Then the fleet NCCL sweep (one rank
+      per node). Both NCCL levels share one per-size timing loop
+      (agent/sweep.rs). Fits t = alpha + beta*size per link class for
+      simulator calibration.
+    entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl.rs, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl.rs, report/intranode.rs]
+    depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
   barrier_skew:
     description: >
@@ -131,7 +142,8 @@ Features Index:
     description: >
       Combined-load straggler tests, run last. Node-local step: sustained
       GEMM concurrent with an intra-node NCCL all-reduce on the same GPUs
-      (single process, one rank per GPU, ncclCommInitAll; GEMM on a second
+      (single process, one rank per GPU, ncclCommInitAll via the NodeComm
+      helper shared with the intra-node sweep; GEMM on a second
       stream per device from one thread per GPU, gpu/worker.rs). Fleet
       step (proto v6/schema v7, tests.overlap_fleet, >= 2 GPU hosts): the
       same per-GPU GEMM load on every node while one rank per node drives
