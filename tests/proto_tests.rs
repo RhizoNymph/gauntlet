@@ -22,6 +22,7 @@ fn sample_inventory() -> InventorySnapshot {
         ib_ports: vec![],
         xid_errors: vec![79],
         gpu_libs: std::collections::BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 
@@ -198,27 +199,29 @@ fn overlap_metric_events_round_trip() {
 
 #[test]
 fn fleet_overlap_events_round_trip() {
-    use gauntlet::proto::{OverlapFleetReport, OverlapGpuGemm};
-    let event = AgentEvent::OverlapFleetReport {
-        report: Box::new(OverlapFleetReport {
-            rank: 1,
-            msg_bytes: 64 << 20,
-            isolated_bus_gib_per_sec: 44.0,
-            overlap_bus_gib_per_sec: 33.0,
-            gemm: vec![
-                OverlapGpuGemm::Ok {
-                    gpu_index: 0,
-                    gflops: 88_000.0,
-                },
-                OverlapGpuGemm::Failed {
-                    gpu_index: 1,
-                    reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
-                },
-            ],
-        }),
-    };
-    let back = decode_event(&encode_event(&event)).expect("round trip");
-    assert_eq!(back, event);
+    use gauntlet::proto::{OverlapFleetReport, OverlapGemmLeg};
+    // One report per rank (= one GPU) since proto v7.
+    for (rank, gemm) in [
+        (1, OverlapGemmLeg::Ok { gflops: 88_000.0 }),
+        (
+            2,
+            OverlapGemmLeg::Failed {
+                reason: "overlap gemm setup: CUDA_ERROR_OUT_OF_MEMORY".into(),
+            },
+        ),
+    ] {
+        let event = AgentEvent::OverlapFleetReport {
+            report: Box::new(OverlapFleetReport {
+                rank,
+                msg_bytes: 64 << 20,
+                isolated_bus_gib_per_sec: 44.0,
+                overlap_bus_gib_per_sec: 33.0,
+                gemm,
+            }),
+        };
+        let back = decode_event(&encode_event(&event)).expect("round trip");
+        assert_eq!(back, event);
+    }
 
     // Metric events under the new test ids round-trip like any other.
     for (test, name, unit) in [
@@ -246,9 +249,11 @@ fn fleet_overlap_events_round_trip() {
 
 #[test]
 fn nccl_workloads_are_mutually_exclusive_by_construction() {
-    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec};
+    use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec, RankAssignment, RankBlock};
     // A sweep workload written without the optional barrier probe.
-    let sweep = r#"{"directive":"lead","world_size":3,"socket_ifname":null,
+    let sweep = r#"{"directive":"lead",
+        "assignment":{"block":{"base":0,"count":1},"world_size":3},
+        "socket_ifname":null,
         "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
     let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
     let NcclDirective::Lead {
@@ -262,8 +267,8 @@ fn nccl_workloads_are_mutually_exclusive_by_construction() {
 
     let with_overlap = NcclDirective::Participate {
         unique_id_b64: "abc".into(),
-        rank: 2,
-        world_size: 3,
+        assignment: RankAssignment::new(RankBlock::new(2, 1).expect("block"), 3)
+            .expect("assignment"),
         socket_ifname: Some("bond0".into()),
         workload: NcclWorkload::Overlap(OverlapSpec {
             duration_secs: 30,

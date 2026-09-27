@@ -37,6 +37,19 @@ pub enum WindowRole {
     Follower,
 }
 
+/// Role of a global rank. The fleet world runs one rank per GPU and one
+/// process drives a host's whole rank block, so the lead's *host* also
+/// drives follower ranks: global rank 0 leads, and every other rank —
+/// rank 0's local siblings included — follows. The MIN reduction then
+/// works unchanged: the lead contributes the only close word.
+pub fn role_for_rank(global_rank: u32) -> WindowRole {
+    if global_rank == 0 {
+        WindowRole::Lead
+    } else {
+        WindowRole::Follower
+    }
+}
+
 /// The control word this rank contributes for the current control step.
 /// Followers ignore their own clocks entirely — a follower that closed
 /// windows on its own clock would recreate exactly the cross-host clock
@@ -99,6 +112,33 @@ pub fn failsafe_secs(budget_secs: u64) -> u64 {
 pub fn failsafe_tripped(close_seen: bool, elapsed_secs: f64, failsafe_secs: u64) -> bool {
     !close_seen && elapsed_secs > failsafe_secs as f64
 }
+
+/// Slack on top of both windows' failsafe budgets in the hard deadline:
+/// warmup collectives, worker setup/teardown, report emission.
+pub const HARD_DEADLINE_SLACK_SECS: u64 = 120;
+
+/// Hard wall-clock budget, in seconds from protocol start, of a whole
+/// overlap step (isolated window + overlapped window). Past it the step is
+/// presumed wedged — typically every rank blocked inside a collective
+/// because some other rank died — and nothing the step started may keep
+/// running: GEMM workers stop on their own at this deadline (independent
+/// of the driver ever reaching `GemmLoad::finish`), and the fleet step's
+/// watchdog terminates the process shortly after.
+///
+/// Each window gets its follower failsafe budget (so the in-protocol
+/// failsafe always gets the first chance to end things cleanly) plus
+/// [`HARD_DEADLINE_SLACK_SECS`]. Saturating, so absurd specs cannot
+/// overflow into a tiny deadline.
+pub fn hard_deadline_secs(baseline_secs: u64, duration_secs: u64) -> u64 {
+    failsafe_secs(baseline_secs)
+        .saturating_add(failsafe_secs(duration_secs))
+        .saturating_add(HARD_DEADLINE_SLACK_SECS)
+}
+
+/// Grace between the hard deadline (GEMM workers stop) and the watchdog
+/// terminating the process, so a protocol that is merely finishing up can
+/// still exit through its normal path.
+pub const WATCHDOG_GRACE_SECS: u64 = 15;
 
 /// Payload-iteration accounting for one consensus window. Only payload
 /// batches are recorded (the control reduce and its synchronizations stay
@@ -169,6 +209,41 @@ mod tests {
     }
 
     #[test]
+    fn exactly_one_lead_across_multi_rank_blocks() {
+        // Three hosts x four GPUs: ranks 0..12, blocks 0..4, 4..8, 8..12.
+        let world = 12u32;
+        let leads: Vec<u32> = (0..world)
+            .filter(|rank| role_for_rank(*rank) == WindowRole::Lead)
+            .collect();
+        assert_eq!(leads, [0], "only global rank 0 leads");
+        // Rank 0's local siblings are followers.
+        for sibling in 1..4 {
+            assert_eq!(role_for_rank(sibling), WindowRole::Follower);
+        }
+    }
+
+    #[test]
+    fn min_consensus_with_multiple_local_ranks_per_host() {
+        let reduce = |words: &[f32]| words.iter().copied().fold(f32::INFINITY, f32::min);
+        let world = 12u32;
+        // Every host's clock except the lead's says time is up: the window
+        // must stay open — rank 0's siblings share its host clock but are
+        // followers, so they cannot close it either.
+        let open: Vec<f32> = (0..world)
+            .map(|rank| contribution(role_for_rank(rank), rank != 0))
+            .collect();
+        assert!(!window_closed(reduce(&open)));
+        // Only the lead's deadline closes it, regardless of every other
+        // rank's clock.
+        for others_expired in [false, true] {
+            let closed: Vec<f32> = (0..world)
+                .map(|rank| contribution(role_for_rank(rank), rank == 0 || others_expired))
+                .collect();
+            assert!(window_closed(reduce(&closed)));
+        }
+    }
+
+    #[test]
     fn closure_is_robust_to_floating_point_residue() {
         assert!(window_closed(0.0));
         assert!(window_closed(1e-7));
@@ -212,6 +287,30 @@ mod tests {
         assert_eq!(failsafe_secs(0), FAILSAFE_FLOOR_SECS);
         // Absurd budgets must not overflow.
         assert_eq!(failsafe_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_hard_deadline_covers_both_failsafes_plus_slack() {
+        // Defaults: 5s baseline, 30s overlapped window.
+        assert_eq!(
+            hard_deadline_secs(5, 30),
+            10 + 60 + HARD_DEADLINE_SLACK_SECS
+        );
+        // Tiny windows keep the failsafe floors.
+        assert_eq!(
+            hard_deadline_secs(0, 0),
+            2 * FAILSAFE_FLOOR_SECS + HARD_DEADLINE_SLACK_SECS
+        );
+        // Always strictly later than both in-protocol failsafes combined,
+        // so the clean path gets the first chance.
+        for (baseline, duration) in [(1, 1), (5, 30), (60, 600)] {
+            assert!(
+                hard_deadline_secs(baseline, duration)
+                    > failsafe_secs(baseline) + failsafe_secs(duration)
+            );
+        }
+        // Absurd specs saturate instead of wrapping to a tiny deadline.
+        assert_eq!(hard_deadline_secs(u64::MAX, 30), u64::MAX);
     }
 
     #[test]

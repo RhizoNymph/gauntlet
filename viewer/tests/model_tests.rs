@@ -68,6 +68,7 @@ fn inventory(hostname: &str, kernel: &str) -> InventorySnapshot {
         ib_ports: Vec::new(),
         xid_errors: Vec::new(),
         gpu_libs: BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 
@@ -326,7 +327,7 @@ fn sweep_series_are_excluded_from_rows_but_links_survive() {
     let link = vm
         .links
         .iter()
-        .find(|l| l.class == "nccl_allreduce_fleet")
+        .find(|l| l.class == "nccl_allreduce_rank_per_gpu")
         .expect("fleet fit present");
     assert!(link.gib_per_sec > 0.0);
     assert!(link.alpha_us >= 0.0);

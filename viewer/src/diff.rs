@@ -44,11 +44,51 @@ pub struct RowDelta {
     pub improved: bool,
 }
 
+/// Whether the baseline measures the same things as the current run.
+/// Runs from different schema versions can share metric and fit names
+/// whose *meaning* changed (e.g. schema v8 moved the fleet NCCL world from
+/// one rank per node to one rank per GPU), so their deltas are shown but
+/// flagged as not directly comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Comparability {
+    #[default]
+    Comparable,
+    SchemaMismatch {
+        current: u32,
+        baseline: u32,
+    },
+}
+
+impl Comparability {
+    pub fn between(current: &ViewModel, baseline: &ViewModel) -> Self {
+        if current.schema_version == baseline.schema_version {
+            Comparability::Comparable
+        } else {
+            Comparability::SchemaMismatch {
+                current: current.schema_version,
+                baseline: baseline.schema_version,
+            }
+        }
+    }
+
+    /// Chip text for the diff header, if the runs are not directly
+    /// comparable.
+    pub fn note(self) -> Option<String> {
+        match self {
+            Comparability::Comparable => None,
+            Comparability::SchemaMismatch { current, baseline } => Some(format!(
+                "baseline schema v{baseline} ≠ v{current}: not directly comparable"
+            )),
+        }
+    }
+}
+
 /// Everything the UI needs to render diff mode. Keys mirror `ViewModel`:
 /// rows by (group, subject), edges by the ordered host pair.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DiffView {
     pub baseline_run_id: String,
+    pub comparability: Comparability,
     pub rows: BTreeMap<(String, String), RowDelta>,
     /// Only subjects with at least one regression appear here.
     pub node_severity: BTreeMap<String, Severity>,
@@ -152,6 +192,7 @@ impl DiffView {
 
         let mut view = DiffView {
             baseline_run_id: baseline.run_id.clone(),
+            comparability: Comparability::between(current, baseline),
             rows,
             ..DiffView::default()
         };

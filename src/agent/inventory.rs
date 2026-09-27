@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::agent::EventSink;
-use crate::proto::{AgentEvent, GpuInventory, IbPortInventory, InventorySnapshot, NicInventory};
+use crate::proto::{
+    AgentEvent, GpuInventory, IbPortInventory, InventorySnapshot, NicInventory, Scope, TestId,
+    TestOutcome, gpu_visibility_mismatch,
+};
 
 /// Upper bound on any single external probe. `collect()` runs at most a
 /// handful of these, keeping the documented < 5s budget with room to spare.
@@ -37,7 +40,17 @@ const GPU_QUERY: &str = concat!(
 /// Collect the snapshot and emit it as an event.
 pub fn run(sink: &EventSink) -> Result<()> {
     let snapshot = Box::new(collect()?);
+    // A GPU-visibility mismatch is a per-host finding: this host will run
+    // fewer fleet NCCL ranks than it has GPUs.
+    let mismatch = gpu_visibility_mismatch(&snapshot);
     sink.emit(&AgentEvent::Inventory { snapshot });
+    if let Some(reason) = mismatch {
+        sink.outcome(
+            TestId::Inventory,
+            Scope::Node,
+            TestOutcome::Failed { reason },
+        );
+    }
     Ok(())
 }
 
@@ -72,7 +85,25 @@ pub fn collect() -> Result<InventorySnapshot> {
         ib_ports: probe_ib_ports(),
         xid_errors: probe_xid_errors(),
         gpu_libs: probe_gpu_libs(),
+        cuda_visible_gpus: probe_cuda_visible_gpus(),
     })
+}
+
+/// How many devices the CUDA driver can open — the count the fleet NCCL
+/// world sizes rank blocks from. Guarded: a missing libcuda panics inside
+/// cudarc, which must degrade to "unknown", never abort the probe.
+#[cfg(feature = "gpu")]
+fn probe_cuda_visible_gpus() -> Option<u32> {
+    crate::agent::gpu::guard("cuda device count", || {
+        Ok(cudarc::driver::CudaContext::device_count()?)
+    })
+    .ok()
+    .and_then(|count| u32::try_from(count).ok())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn probe_cuda_visible_gpus() -> Option<u32> {
+    None
 }
 
 // ---------------------------------------------------------------------------

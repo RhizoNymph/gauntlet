@@ -72,7 +72,7 @@ A counter is `(domain, device, counter)`:
   with injectable sysfs roots, pure text parsers for tool output),
   `diff_snapshots`, `run` (event emission). Reuses
   `inventory::{run_capture, csv_field, parse_xid_line, PROBE_TIMEOUT}`.
-- `src/proto.rs` — `CounterDomain`, `CounterReading`, `CounterSnapshot`,
+- `src/proto/mod.rs` — `CounterDomain`, `CounterReading`, `CounterSnapshot`,
   `CounterDelta` (+`increment()`), `CounterDeltas`, `CounterRequest`,
   events `CounterBaseline`/`CounterDeltas`, `AgentTaskSpec.counters`.
   PROTO_VERSION 3.
