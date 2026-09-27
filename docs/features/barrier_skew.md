@@ -71,8 +71,11 @@ members' extreme under the polarity, the late arriver is the unique
 extreme *group*, the margin is measured against the median of the group
 values, and every rank of the late group is tallied. With singleton
 groups this is exactly the per-rank analysis (`analyze`, which the TCP
-barrier keeps using — one process per rank there). Consequently a late
-host flags *all* its GPUs (`host:gpu0..gpuN`); per-GPU localization of a
+barrier keeps using — one process per rank there). Since every rank of
+a host carries the same tally, the tally metrics are emitted once per
+host at node scope and a late host is one straggler row keyed `host` —
+per-GPU copies would weight hosts by GPU count in the MAD analysis and
+show one late host as N identical rows. Per-GPU localization of a
 bad path comes from the per-GPU p50/p99 distributions, the sweep and the
 fleet overlap retention, not from the tally.
 
@@ -99,12 +102,16 @@ straggler experiences.
    warmup + `iters` timed tiny grouped all-reduces over its local ranks
    and emits one `AgentEvent::NcclBarrierTimings { rank, elapsed_us }` per
    local rank (participants included — the one time they speak). The
-   per-host driver callbacks intercept these into a shared
-   `Arc<Mutex<Vec<RankSeries>>>` (they never reach the collector; a stray
-   one is debug-ignored, like `NcclId`). Once all host tasks join, the
-   orchestrator runs `analysis::skew::analyze_grouped(LateIsMin)` with
-   the layout's arrival groups and emits metric records, mapping each
-   rank to (host, local GPU) through `RankLayout::locate`.
+   per-host driver callbacks intercept these, with their sending host,
+   into a shared `Arc<Mutex<Vec<(host, RankSeries)>>>` (they never reach
+   the collector; a stray one is debug-ignored, like `NcclId`). Once all
+   host tasks join, `ownership::accept_owned` keeps each rank's first
+   series from the host whose block owns it (out-of-block, unknown-host
+   and duplicate series become structured host errors instead of
+   misattributed data or a voided analysis), then the orchestrator runs
+   `analysis::skew::analyze_grouped(LateIsMin)` with the layout's arrival
+   groups and emits metric records, mapping each rank to (host, local
+   GPU) through `RankLayout::locate`.
 3. **TCP path**: `tcp_barrier_sweep` runs whenever `barrier_iters > 0`
    and ≥ 2 hosts are usable. Host 0 runs `agent barrier serve --port
    <net_port_base> --world n --iters k` (via `run_agent_capture` in a
@@ -116,11 +123,14 @@ straggler experiences.
    and raw vectors would be megabytes at fleet scale) and prints one
    `TcpBarrierReport` JSON line, which the orchestrator parses and turns
    into the same metric records.
-4. **Metrics** (per rank, under `nccl_barrier.*` / `tcp_barrier.*`):
-   `p50_us`, `p90_us`, `p99_us`, `max_us` (Micros), `slowest_frac`
-   (Ratio), `slowest_considered` (Count). NCCL ranks are attributed to
-   their host under `Scope::Gpu { index: local }` (sample key
-   `host:gpuN`, schema v8); TCP ranks to their host under `Scope::Node`.
+4. **Metrics** (under `nccl_barrier.*` / `tcp_barrier.*`):
+   - per rank: `p50_us`, `p90_us`, `p99_us`, `max_us` (Micros). NCCL
+     ranks are attributed to their host under `Scope::Gpu { index: local
+     }` (sample key `host:gpuN`, schema v8) — each GPU's stream completes
+     at its own time, so these differ per GPU; TCP ranks to their host
+     under `Scope::Node`.
+   - per host, once, under `Scope::Node`: `slowest_frac` (Ratio),
+     `slowest_considered` (Count) — the arrival group's tally.
    Attribution is `orchestrator/barrier.rs::barrier_records`, pure over
    a rank → `RankSubject { host, scope }` locator. Fleet-level,
    attributed to the lead / coordinator host under `Scope::Node` like
@@ -132,8 +142,7 @@ straggler experiences.
    across every GPU of the fleet; under `tcp_barrier` a *high*-side one —
    the signed `deviation_mads` carries the direction). The tally
    additionally gets its own flagging rule:
-   `report::barrier_straggler_flags` flags a subject (`host:gpuN` for
-   NCCL, `host` for TCP) into
+   `report::barrier_straggler_flags` flags a *host* (both benchmarks) into
    `fleet.barrier_stragglers` when its median `slowest_frac` exceeds
    `thresholds.barrier_slowest_frac` (default 0.5) *and* at least
    `skew::MIN_TALLY_ITERS` (100) iterations cleared the margin. Flags
@@ -157,9 +166,9 @@ straggler experiences.
 
 - The NCCL world is one rank per GPU (docs/features/phase3_network.md,
   "Fleet NCCL world"); the barrier probe therefore reports one series per
-  GPU and its per-rank metrics move from `host` to `host:gpuN` keys.
-- Straggler flags stay per subject — `host:gpuN` — and a late host flags
-  all of its GPUs (arrival groups, above).
+  GPU and its percentile metrics move from `host` to `host:gpuN` keys.
+- The tally metrics and straggler flags stay per host (arrival groups,
+  above): one late host is one row.
 - `fleet_span_*` stays one node-scope series on the lead host.
 - The TCP barrier is unchanged (one rank per host, `analyze`).
 
@@ -181,8 +190,11 @@ straggler experiences.
   `PROTO_VERSION` 5.
 - `src/orchestrator/mod.rs` — `tcp_barrier_sweep`.
 - `src/orchestrator/nccl/mod.rs` — barrier spec on the sweep workload,
-  timing interception in the fleet NCCL driver, grouped analysis +
-  per-GPU attribution via the rank layout.
+  timing interception in the fleet NCCL driver (with the sending host),
+  ownership check, grouped analysis + per-GPU attribution via the rank
+  layout.
+- `src/orchestrator/nccl/ownership.rs` — `accept_owned` (rank
+  ownership of per-rank reports).
 - `src/orchestrator/collect.rs` — stray `NcclBarrierTimings` ignored.
 - `src/report/mod.rs` — `barrier_stragglers` field + flagging rule +
   verdict + table section, `SCHEMA_VERSION` 6.
@@ -195,8 +207,10 @@ straggler experiences.
   per-rank summaries and tallies do.
 - `slowest_frac` sums (over arrival groups — over ranks for the TCP
   barrier) to ≤ 1.0 exactly: each considered iteration blames exactly one
-  group, ties and sub-margin iterations blame none. Every rank of a group
-  carries the group's value.
+  group, ties and sub-margin iterations blame none. The tally is emitted
+  once per host, so each group counts once in the fleet comparison.
+- Per-rank reports are only accepted from the host owning the rank;
+  nothing is ever attributed to a GPU by a host that does not drive it.
 - Percentiles are nearest-rank over sorted samples, so p50 ≤ p90 ≤ p99 ≤
   max holds by construction (same convention as the peer latency probe).
 - Skew analysis needs ≥ 2 distinct ranks, ≥ 2 arrival groups, a group

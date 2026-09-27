@@ -112,10 +112,15 @@ Features Index:
       t = alpha + beta*size per link class for simulator calibration. The
       fleet NCCL world is one rank per GPU (proto v7): each NCCL-capable host
       owns a contiguous, validated rank block (RankBlock/RankAssignment,
-      laid out by RankLayout from the phase-0 GPU counts) ordered by local
-      GPU index, and one agent nccl process per host drives its whole block
-      (grouped ncclCommInitRank + grouped collectives from one thread), so
-      every GPU's PCIe/NIC path is exercised, not just GPU 0's.
+      laid out by RankLayout from the CUDA-visible GPU counts in the
+      phase-0 inventory) ordered by local GPU index, and one agent nccl
+      process per host drives its whole block (all fallible setup first,
+      then grouped ncclCommInitRank + grouped collectives from one
+      thread), so every GPU's PCIe/NIC path is exercised, not just GPU
+      0's. Failures are attributed: the first primary failure aborts the
+      rest of the world (remote kill), only the culprit is Failed, hosts
+      it aborted are Skipped/warned; abandoned agents are always killed
+      remotely; per-rank reports are accepted only from the owning host.
     entry_points: [agent/net.rs, agent/nccl/, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/nccl/, proto/ranks.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase3_network.md
@@ -154,7 +159,9 @@ Features Index:
       report::build derives retention ratios (overlapped/isolated)
       against the phase-2 GEMM baselines and each subject's own
       collective baseline, which feed the MAD outlier analysis as the
-      primary combined-load straggler signal.
+      primary combined-load straggler signal. A wedged step cannot leave
+      load behind: GEMM workers stop at a spec-derived hard deadline and
+      a watchdog terminates the fleet step's agent shortly after.
     entry_points: [agent/gpu/overlap.rs, agent/nccl/fleet_overlap.rs, agent/window.rs, orchestrator/nccl/, report/mod.rs]
     depends_on: [phase2_gpu, phase3_network]
     doc: docs/features/overlap_phase.md
@@ -185,7 +192,9 @@ Features Index:
   viewer:
     description: >
       `gauntlet-view` (workspace member `viewer/`): native GPUI desktop app
-      rendering runs as a fully connected fleet graph — node color = host
+      rendering runs as a fully connected fleet graph (diff mode marks a
+      baseline from another schema version as not directly comparable) —
+      node color = host
       health, edge color = pairwise-path health — plus per-direction edge
       details, roofline cards, link fits, and a filterable quantitative
       metric table. Sidebar lists all runs (selectable, baseline-pinnable);

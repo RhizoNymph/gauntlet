@@ -49,6 +49,13 @@ connected fleet graph plus a quantitative metric table.
   aggregates are re-derived on load.
 - Diff mode is noise-aware: when both runs carry spreads (n >= 2), a delta
   must clear ~2x the pooled spread in addition to the 5%/15% floors.
+- Diff mode is schema-aware: a baseline whose `schema_version` differs
+  from the current run's is marked not directly comparable
+  (`diff::Comparability::SchemaMismatch`, a warn-colored header chip
+  "baseline schema vX ≠ vY: not directly comparable"). Deltas are still
+  shown — the chip qualifies them — because metric names can survive a
+  schema bump while their meaning changes (schema v8's rank-per-GPU NCCL
+  world).
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report
@@ -104,7 +111,9 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/diff.rs` — pure run-to-run diff: `DiffView::new(current,
   baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
   improved flag) plus node/edge regression severities and capped issue
-  lists. `higher_is_better(unit)` is the direction-of-goodness oracle.
+  lists, and a `Comparability` verdict (same schema or not, with the chip
+  text). `higher_is_better(unit)` is the direction-of-goodness oracle.
+  `ViewModel.schema_version` carries each run's schema.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
   (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals
   shadow stale partials), `effective_baseline`, `scan` (directory scan
@@ -129,7 +138,7 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
   real `report::build` pipeline.
 - `viewer/tests/layout_tests.rs` — geometry and hit-testing.
 - `viewer/tests/diff_tests.rs` — regression directions, thresholds,
-  node/edge attribution, issue capping.
+  node/edge attribution, issue capping, schema comparability.
 - `viewer/tests/runs_tests.rs` — classification, ordering, baseline
   resolution, scanning, timestamp math.
 - `viewer/tests/bootstrap_tests.rs` — matrix projection and stalled-run
