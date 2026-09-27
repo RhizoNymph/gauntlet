@@ -66,7 +66,7 @@ pub async fn peer(args: PeerArgs) -> Result<()> {
             duration_secs,
         } => {
             let report = measure_latency(&target, duration_secs).await?;
-            println!("{}", serde_json::to_string(&report)?);
+            crate::agent::channel::write_line(&serde_json::to_string(&report)?)?;
             Ok(())
         }
         PeerCommand::Bandwidth {
@@ -74,7 +74,7 @@ pub async fn peer(args: PeerArgs) -> Result<()> {
             duration_secs,
         } => {
             let report = measure_bandwidth(&target, duration_secs).await?;
-            println!("{}", serde_json::to_string(&report)?);
+            crate::agent::channel::write_line(&serde_json::to_string(&report)?)?;
             Ok(())
         }
     }

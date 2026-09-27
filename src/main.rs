@@ -5,6 +5,11 @@ use gauntlet::cli::{AgentCommand, Cli, Command};
 fn main() -> Result<()> {
     let cli = Cli::parse();
     gauntlet::init_tracing(cli.verbose);
+    if matches!(cli.command, Command::Agent(_)) {
+        // Before the runtime exists (its workers start at build time): move
+        // the protocol off fd 1 so library stdout cannot corrupt it.
+        gauntlet::agent::channel::isolate_stdout()?;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -20,6 +25,7 @@ fn main() -> Result<()> {
             AgentCommand::Barrier(barrier) => {
                 runtime.block_on(gauntlet::agent::barrier::barrier(barrier))
             }
+            AgentCommand::StdoutIsolationCheck => gauntlet::agent::channel::isolation_check(),
         },
     }
 }

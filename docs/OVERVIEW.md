@@ -20,7 +20,10 @@ Overview:
       the remote sha256 matches), drives the phase schedule, aggregates
       results over an mpsc channel into a single lock-free collector task.
     agent: >
-      Same binary in `gauntlet agent` mode, executed on each node. Built for
+      Same binary in `gauntlet agent` mode, executed on each node. At
+      startup, before any thread exists, the agent moves its protocol
+      channel to a private dup of stdout and points fd 1 at stderr, so
+      library output (NCCL_DEBUG, CUDA) cannot corrupt events. Built for
       glibc (static musl cannot dlopen, which cudarc requires; a musl build
       only makes sense with --no-default-features). GPU tests use cudarc with
       dynamic-loading + the cuda-12040 API baseline: libcuda/libcublas/libnccl

@@ -89,6 +89,10 @@ pub enum AgentCommand {
     Nccl,
     /// TCP star-barrier participant (barrier-skew microbenchmark).
     Barrier(BarrierArgs),
+    /// Test hook: interleave protocol events with raw fd-1 writes to prove
+    /// the protocol channel is isolated from library stdout.
+    #[command(hide = true)]
+    StdoutIsolationCheck,
 }
 
 #[derive(Debug, Args)]
