@@ -2,26 +2,34 @@
 //! (gpu feature only).
 //!
 //! Every collective is issued once per local rank inside one NCCL group.
+//! The per-size loop itself is `agent::sweep::run_plan`, shared with the
+//! intra-node sweep; `RankBlockCollectives` supplies this level's launch
+//! (grouped, once per local rank) and its timer (global rank 0's stream).
 //! Sweep timing comes from global rank 0 only: the host holding it times
 //! each size until *its* stream (local rank 0 = global rank 0) completes
 //! and emits the measurements; every other host runs silently. The
 //! barrier probe times every local rank separately and reports one
 //! `NcclBarrierTimings` per rank.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::nccl::ReduceOp;
 
+use super::F32_BYTES;
 use super::local::{LocalRanks, PreparedRanks};
-use super::{F32_BYTES, all_gather_bus_gib_per_sec, all_reduce_bus_gib_per_sec};
 use crate::agent::EventSink;
-use crate::proto::{AgentEvent, BarrierSpec, MetricRecord, Scope, TestId, Unit};
+use crate::agent::sweep::{
+    self, Collective, SweepCollectives, SweepLevel, SweepPlan, SweepStep, point_records, run_plan,
+};
+use crate::proto::{AgentEvent, BarrierSpec};
 
-/// Untimed iterations before the sweep, so channel setup and algorithm
-/// selection do not land in the first measured size.
+/// Untimed iterations before the barrier probe and the fleet overlap
+/// windows, so channel setup and algorithm selection stay out of the
+/// measurement (the sweep's own warmup is `agent::sweep::WARMUP_ITERS`).
 pub(super) const WARMUP_ITERS: usize = 5;
 
 /// Per-rank payload buffers, one pair per local rank on that rank's stream.
@@ -73,12 +81,9 @@ pub(super) struct SweepBuffers {
 
 impl SweepBuffers {
     pub(super) fn alloc(prepared: &PreparedRanks, sizes: &[u64]) -> Result<Self> {
-        let max_elements = sizes
-            .iter()
-            .map(|size| *size as usize / F32_BYTES)
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        // Same sizing rule as `SweepPlan::max_elements` (the world size is
+        // not needed for it, and the communicators do not exist yet).
+        let max_elements = sweep::max_elements(sizes);
         Ok(Self {
             buffers: Buffers::alloc(&prepared.streams(), max_elements)?,
             max_elements,
@@ -97,63 +102,35 @@ pub(super) fn run_sweep(
 ) -> Result<()> {
     let emit_sweep = ranks.assignment().block().holds_lead();
     let world_size = ranks.world_size();
+    let world = NonZeroU32::new(world_size).context("fleet world size must be at least 1")?;
+    let plan = SweepPlan::new(sizes, world);
     let SweepBuffers {
         mut buffers,
         max_elements,
     } = buffers;
+    anyhow::ensure!(
+        plan.max_elements() <= max_elements,
+        "sweep buffers hold {max_elements} elements, the plan needs {}",
+        plan.max_elements()
+    );
 
-    for _ in 0..WARMUP_ITERS {
-        buffers.all_reduce(ranks, "warmup all_reduce", max_elements, &ReduceOp::Sum)?;
-    }
-    ranks.sync_all()?;
-
-    let iters = iters_per_size.max(1);
-    let world = world_size as usize;
-
-    for &size in sizes {
-        let elements = (size as usize / F32_BYTES).clamp(1, max_elements);
-
-        let elapsed = timed_on_rank0(ranks, iters, || {
-            buffers.all_reduce(ranks, "all_reduce", elements, &ReduceOp::Sum)
-        })?;
-        if emit_sweep {
-            emit_collective(
-                sink,
-                TestId::NcclAllReduce,
-                (elements * F32_BYTES) as f64,
-                elapsed / f64::from(iters),
-                world_size,
-            );
-        }
-
-        // All-gather: every rank contributes one shard and receives the
-        // whole thing, so the *gathered* result is the message size the
-        // bus-bandwidth formula wants. Sizes too small to split across the
-        // world have no meaningful all-gather and are skipped.
-        let shard = elements / world;
-        if shard == 0 {
-            continue;
-        }
-        let gathered = shard * world;
-        let elapsed = timed_on_rank0(ranks, iters, || {
-            let Buffers { send, recv } = &mut buffers;
-            ranks.collective("all_gather", |index, rank| {
-                rank.comm.all_gather(
-                    &send[index].slice(0..shard),
-                    &mut recv[index].slice_mut(0..gathered),
-                )
-            })
-        })?;
-        if emit_sweep {
-            emit_collective(
-                sink,
-                TestId::NcclAllGather,
-                (gathered * F32_BYTES) as f64,
-                elapsed / f64::from(iters),
-                world_size,
-            );
-        }
-    }
+    // Only the host holding global rank 0 emits; every other host runs the
+    // same collectives silently.
+    run_plan(
+        &mut RankBlockCollectives {
+            ranks,
+            buffers: &mut buffers,
+        },
+        &plan,
+        iters_per_size,
+        |point| {
+            if emit_sweep {
+                for record in point_records(SweepLevel::Fleet, point, world_size) {
+                    sink.metric(record);
+                }
+            }
+        },
+    )?;
 
     if let Some(spec) = barrier {
         barrier_probe(sink, ranks, &mut buffers, max_elements, spec)?;
@@ -210,57 +187,48 @@ fn barrier_probe(
     Ok(())
 }
 
-/// Total wall seconds for `iters` grouped collectives, measured until
-/// local rank 0's stream completes (on the lead host that is global rank
-/// 0, the sweep's only timer). Every stream is drained on both sides, so
-/// the interval covers exactly the device work — collectives are enqueued
-/// asynchronously and would otherwise be timed at launch cost.
-fn timed_on_rank0(
-    ranks: &LocalRanks,
-    iters: u32,
-    mut op: impl FnMut() -> Result<()>,
-) -> Result<f64> {
-    ranks.sync_all()?;
-    let start = Instant::now();
-    for _ in 0..iters {
-        op()?;
-    }
-    let elapsed = match ranks.ranks().first() {
-        Some(rank0) => {
-            rank0.stream().synchronize()?;
-            start.elapsed().as_secs_f64()
-        }
-        None => 0.0,
-    };
-    ranks.sync_all()?;
-    Ok(elapsed)
+/// This host's rank block for the shared sweep loop: every collective
+/// issued once per local rank inside one NCCL group, the clock stopped by
+/// local rank 0's stream (on the lead host that is global rank 0, the
+/// sweep's only timer), every stream drained on both sides.
+struct RankBlockCollectives<'a> {
+    ranks: &'a LocalRanks,
+    buffers: &'a mut Buffers,
 }
 
-fn emit_collective(
-    sink: &EventSink,
-    test: TestId,
-    message_bytes: f64,
-    per_iter_secs: f64,
-    world_size: u32,
-) {
-    let bus = match test {
-        TestId::NcclAllGather => {
-            all_gather_bus_gib_per_sec(message_bytes, per_iter_secs, world_size)
+impl SweepCollectives for RankBlockCollectives<'_> {
+    type Error = anyhow::Error;
+
+    fn launch(&mut self, step: &SweepStep) -> Result<()> {
+        match step.collective {
+            Collective::AllReduce => self.buffers.all_reduce(
+                self.ranks,
+                "all_reduce",
+                step.send_elements,
+                &ReduceOp::Sum,
+            ),
+            // Every rank contributes one shard and receives the whole
+            // gathered message (the size the bus formula wants).
+            Collective::AllGather => {
+                let Buffers { send, recv } = &mut *self.buffers;
+                self.ranks.collective("all_gather", |index, rank| {
+                    rank.comm.all_gather(
+                        &send[index].slice(0..step.send_elements),
+                        &mut recv[index].slice_mut(0..step.message_elements),
+                    )
+                })
+            }
         }
-        _ => all_reduce_bus_gib_per_sec(message_bytes, per_iter_secs, world_size),
-    };
-    for (name, value, unit) in [
-        ("elapsed_us", per_iter_secs * 1e6, Unit::Micros),
-        ("msg_bytes", message_bytes, Unit::Bytes),
-        ("bus_gib_per_sec", bus, Unit::GibPerSec),
-    ] {
-        sink.metric(MetricRecord {
-            test,
-            scope: Scope::Node,
-            name: name.to_string(),
-            value,
-            unit,
-            repeat: 0,
-        });
+    }
+
+    fn sync(&mut self) -> Result<()> {
+        self.ranks.sync_all()
+    }
+
+    fn wait_timed(&mut self) -> Result<()> {
+        if let Some(rank0) = self.ranks.ranks().first() {
+            rank0.stream().synchronize()?;
+        }
+        Ok(())
     }
 }

@@ -67,6 +67,13 @@ fn nccl_rank_count(inventory: &InventorySnapshot) -> u32 {
     inventory.cuda_visible_gpus.unwrap_or(0)
 }
 
+/// Whether a host's libnccl is loadable per its inventory dlopen probe.
+/// Hosts predating the probe (empty map) are given the benefit of the
+/// doubt. Shared by the fleet world selection and the intra-node sweep.
+pub(super) fn nccl_loadable(inventory: &InventorySnapshot) -> bool {
+    inventory.gpu_libs.get("nccl").copied().unwrap_or(true)
+}
+
 /// Hosts eligible for a fleet-wide NCCL world, laid out one rank per GPU:
 /// GPU-bearing (probing hosts whose inventory is missing) with a loadable
 /// libnccl, each contributing its CUDA-visible GPU count.
@@ -89,8 +96,7 @@ async fn nccl_world(
         .iter()
         .filter_map(|session| {
             let inventory = inventories.get(session.addr())?;
-            let nccl_loads = inventory.gpu_libs.get("nccl").copied().unwrap_or(true);
-            nccl_loads.then(|| (Arc::clone(session), nccl_rank_count(inventory)))
+            nccl_loadable(inventory).then(|| (Arc::clone(session), nccl_rank_count(inventory)))
         })
         .collect();
     if nccl_hosts.is_empty() {

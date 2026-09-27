@@ -38,6 +38,8 @@ inventory saw GPUs is reported as Failed (broken driver is a finding).
   GpuPair scope; no-p2p pairs ⇒ Skipped outcome.
 
 ## NCCL (phase 3 component, same owner)
+Both sweep levels (fleet `agent nccl`, intra-node `agent run` network arm)
+share `agent::sweep::run_plan`; see docs/features/phase3_network.md.
 `agent nccl` reads `NcclDirective` from stdin. GenerateId (rank 0) prints
 `NcclUniqueId` JSON on stdout. Participate: set NCCL_SOCKET_IFNAME if
 given, init communicator (one process/node, one GPU/rank v1), warmup, then

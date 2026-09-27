@@ -6,6 +6,7 @@
 //! second source of truth.
 
 pub mod history;
+pub mod intranode;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -22,7 +23,7 @@ use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
-    consistency_fields, overlap_metric,
+    consistency_fields, nccl_metric, overlap_metric,
 };
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
@@ -51,7 +52,11 @@ use crate::proto::{
 // nccl_{allreduce,allgather}_rank_per_gpu so v7-vs-v8 baselines cannot
 // line up under one key. Inventory snapshots gain cuda_visible_gpus. No
 // field changed shape.
-pub const SCHEMA_VERSION: u32 = 8;
+// v9: intra-node NCCL sweep — nccl_intra_all_reduce / nccl_intra_all_gather
+// metric groups (per-size series plus the fleet-comparable
+// bus_gib_per_sec_peak_<n>gpu headline) and calibration.links classes
+// nccl_{allreduce,allgather}_intranode_<n>gpu. No field changed shape.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -167,8 +172,9 @@ pub struct ConsistencyFinding {
 pub struct Calibration {
     /// Per-host sustained capability numbers.
     pub rooflines: BTreeMap<String, NodeRoofline>,
-    /// Alpha-beta fits keyed by link class ("tcp_pairwise",
-    /// "nccl_allreduce_rank_per_gpu", "tcp_pairwise", ...).
+    /// Alpha-beta fits keyed by link class (
+    /// "nccl_allreduce_rank_per_gpu", "nccl_allreduce_intranode_8gpu",
+    /// "tcp_pairwise", ...).
     pub links: BTreeMap<String, AlphaBetaFit>,
 }
 
@@ -228,6 +234,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NetBandwidth => "net_bandwidth",
         TestId::NcclAllReduce => "nccl_all_reduce",
         TestId::NcclAllGather => "nccl_all_gather",
+        TestId::NcclIntraAllReduce => "nccl_intra_all_reduce",
+        TestId::NcclIntraAllGather => "nccl_intra_all_gather",
         TestId::NcclBarrier => "nccl_barrier",
         TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
@@ -891,6 +899,7 @@ fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<Stri
     if let Some(fit) = tcp_pairwise_fit(observations) {
         links.insert("tcp_pairwise".to_string(), fit);
     }
+    links.extend(intranode::link_fits(observations));
     links
 }
 
@@ -910,8 +919,8 @@ fn sweep_points(
                 continue;
             }
             match record.name.as_str() {
-                "msg_bytes" => sizes.push(record.value),
-                "elapsed_us" => timings.push(record.value),
+                nccl_metric::MSG_BYTES => sizes.push(record.value),
+                nccl_metric::ELAPSED_US => timings.push(record.value),
                 _ => {}
             }
         }

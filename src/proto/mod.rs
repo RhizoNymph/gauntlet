@@ -37,7 +37,9 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // carry `cuda_visible_gpus` (rank blocks are sized from it), `agent nccl`
 // sends Hello before anything can fail, and exits with
 // `AGENT_EXIT_CASCADE` when it stopped because the fleet stopped.
-pub const PROTO_VERSION: u32 = 7;
+// v8: intra-node NCCL sweep — `AgentTaskSpec.nccl_intranode` and the
+// `nccl_intra_all_reduce` / `nccl_intra_all_gather` test ids.
+pub const PROTO_VERSION: u32 = 8;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -205,6 +207,11 @@ pub enum TestId {
     NetBandwidth,
     NcclAllReduce,
     NcclAllGather,
+    /// Intra-node all-reduce sweep: one rank per local GPU, single process
+    /// (`ncclCommInitAll`), NVLink/PCIe only.
+    NcclIntraAllReduce,
+    /// Intra-node all-gather sweep, same communicator as the all-reduce.
+    NcclIntraAllGather,
     /// Barrier-skew microbenchmark over the NCCL group (tiny all-reduce).
     NcclBarrier,
     /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
@@ -497,6 +504,10 @@ pub struct AgentTaskSpec {
     /// sends this in dedicated invocations with an empty phase list.
     #[serde(default)]
     pub counters: Option<CounterRequest>,
+    /// Intra-node NCCL message-size sweep, run from the network phase.
+    /// `None` disables it (`tests.nccl_intranode = false`).
+    #[serde(default)]
+    pub nccl_intranode: Option<NcclSweepSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -541,6 +552,52 @@ pub struct GpuTaskSpec {
     /// 0 disables (a Skipped outcome is emitted).
     #[serde(default)]
     pub sdc_check_secs: u64,
+}
+
+/// Message-size sweep parameters for the node-local (intra-node) NCCL
+/// sweep. The same knobs as the fleet sweep (`tests.nccl_sizes`,
+/// `tests.nccl_iters_per_size`), so the two hierarchy levels measure the
+/// same sizes with the same iteration counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NcclSweepSpec {
+    /// Message sizes in bytes.
+    pub sizes: Vec<u64>,
+    pub iters_per_size: u32,
+}
+
+/// Metric names shared by the NCCL sweep emitters (fleet and intra-node)
+/// and the report's link-fit extraction, so a renamed string cannot
+/// silently break the join.
+pub mod nccl_metric {
+    /// Mean microseconds per collective at one message size.
+    pub const ELAPSED_US: &str = "elapsed_us";
+    /// Message size of the sweep point (the gathered size for all-gather).
+    pub const MSG_BYTES: &str = "msg_bytes";
+    /// Bus bandwidth at one message size.
+    pub const BUS: &str = "bus_gib_per_sec";
+    /// Intra-node only: prefix of the per-node headline, the best bus
+    /// bandwidth across the sweep's sizes. Always emitted keyed by
+    /// communicator size (`bus_peak`), never bare.
+    pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
+    /// Intra-node only: ranks (local GPUs) in the communicator; keys the
+    /// intra-node calibration link class.
+    pub const RANKS: &str = "ranks";
+
+    /// Topology suffix shared by the intra-node headline and the intra-node
+    /// calibration link classes: `<n>gpu`.
+    pub fn gpu_class_suffix(gpus: u32) -> String {
+        format!("{gpus}gpu")
+    }
+
+    /// Intra-node headline name for a communicator of `gpus` ranks:
+    /// `bus_gib_per_sec_peak_<n>gpu`. Different GPU counts are different
+    /// links (8-GPU NVLink vs 4-GPU PCIe), so each gets its own metric —
+    /// and therefore its own MAD comparison group — just like its own
+    /// calibration link class.
+    pub fn bus_peak(gpus: u32) -> String {
+        format!("{BUS_PEAK_PREFIX}_{}", gpu_class_suffix(gpus))
+    }
 }
 
 /// Parameters of an overlap step: sustained GEMM on every GPU concurrently

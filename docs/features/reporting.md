@@ -41,7 +41,9 @@ produce the same shape:
 
 ## Key formats (contract with the orchestrator)
 - `metric_key(test, name)` = "<test_display_name>.<name>", e.g.
-  `mem_bandwidth.triad`, `nccl_all_reduce.elapsed_us`.
+  `mem_bandwidth.triad`, `nccl_all_reduce.elapsed_us`,
+  `nccl_intra_all_reduce.bus_gib_per_sec_peak_8gpu`. NCCL sweep metric names
+  are the `proto::nccl_metric` consts, shared by emitters and extraction.
 - `scope_label(scope)`: `Node` → `None`; `Core{3}` → `core3`;
   `Numa{0}` → `numa0`; `Gpu{1}` → `gpu1`; `GpuPair{0,2}` → `gpupair0-2`;
   `Disk{"/tmp"}` → `disk:/tmp`; `HostPair{"n7"}` → `pair:n7`.
@@ -53,9 +55,15 @@ A group is a fleet comparison only when every sample key in it is
 distinct. A repeated key means the metric is a per-host *series*, not one
 reading per subject: the NCCL sweeps emit `msg_bytes`/`elapsed_us` once per
 message size, so their spread is the design, not a straggler signal. Such
-groups are skipped by MAD analysis (they feed `calibration.links` instead).
-Absolute thresholds still apply to them, since a configured bound is an
-explicit per-value opt-in.
+series groups are skipped by MAD analysis (they feed `calibration.links`
+instead). Absolute thresholds still apply to them, since a configured
+bound is an explicit per-value opt-in.
+
+The intra-node sweep's `bus_gib_per_sec_peak_<n>gpu` and `ranks` are one
+value per node, so they *are* fleet comparisons — the peak is the
+intra-node straggler headline. Its name carries the GPU count, so nodes
+are only compared within their own topology (the same keying as the
+`_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
 
 ## Statistics contracts (stats.rs)
 - `median`: ignores non-finite; None on empty (after filtering).
@@ -89,6 +97,13 @@ Per-host `NodeRoofline`:
   metric list the sweep emits `msg_bytes` and `elapsed_us` as parallel
   metrics, one of each per size, so they are joined by emission order and
   fitted with `fit_alpha_beta` over the whole fleet's points.
+- `nccl_allreduce_intranode_<n>gpu` / `nccl_allgather_intranode_<n>gpu`
+  (schema v9, `report/intranode.rs`): the intra-node sweep's
+  `nccl_intra_all_*` series, joined by emission order within each (host,
+  repeat) and bucketed by that run's `ranks` value (local GPU count), one
+  fit per bucket. Keyed by GPU count because different counts are
+  different links; every node's data is kept. Runs without a valid
+  `ranks` record (sweep failed part-way) contribute nothing.
 - `tcp_pairwise`: a two-point *synthesis*, not a regression — the peer
   tests measure latency and streaming bandwidth separately, with no size
   sweep. `alpha_us` = median `net_latency.rtt_p50`, `beta_us_per_byte` =
@@ -142,7 +157,7 @@ tail progress:
   missing directory yielding an empty list — the viewer's discovery call.
 
 ## Files
-`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history}.rs`,
+`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history,intranode}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`).
 

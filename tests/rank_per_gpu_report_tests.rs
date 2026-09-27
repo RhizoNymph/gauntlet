@@ -191,5 +191,7 @@ fn nccl_barrier_stragglers_are_one_row_per_host_with_per_gpu_percentiles() {
 
 #[test]
 fn schema_version_tracks_the_rank_per_gpu_granularity_change() {
-    assert_eq!(report::SCHEMA_VERSION, 8);
+    // v8 introduced the rank-per-GPU granularity; later bumps (v9: the
+    // intra-node sweep) keep it.
+    const { assert!(report::SCHEMA_VERSION >= 8) };
 }
