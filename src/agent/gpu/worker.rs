@@ -15,6 +15,12 @@
 //!   parked at the start barrier (error paths where the combined window
 //!   never began), so it is safe to call on every path.
 //!
+//! Hard deadline: every worker also stops on its own once the `deadline`
+//! passed to `spawn` elapses, whether or not `finish` is ever called. A
+//! driver blocked forever inside a collective (a peer rank died mid-window)
+//! therefore cannot leave the GPUs saturated after the step's budget —
+//! `window::hard_deadline_secs` derives that budget from the spec.
+//!
 //! Workers reach both barriers on *every* path, including failed setup, so
 //! the driver can never deadlock; `finish` consumes the load, so workers
 //! can never leak past the window that spawned them. Operand matrices are
@@ -60,8 +66,14 @@ pub(crate) struct GemmLoad {
 impl GemmLoad {
     /// Spawn one worker per context. The operand matrices are filled once
     /// here and shared; workers upload and warm up immediately but do not
-    /// start the timed loop until [`GemmLoad::start`].
-    pub(crate) fn spawn(contexts: &[Arc<CudaContext>], dim: u32, dtype: GemmDtype) -> Self {
+    /// start the timed loop until [`GemmLoad::start`], and leave it at the
+    /// stop flag or at `deadline`, whichever comes first.
+    pub(crate) fn spawn(
+        contexts: &[Arc<CudaContext>],
+        dim: u32,
+        dtype: GemmDtype,
+        deadline: Instant,
+    ) -> Self {
         let n = dim.max(1) as usize;
         let mut rng = Xorshift64::new(GEMM_SEED);
         let host_a: Arc<Vec<f32>> = Arc::new(fill_matrix(&mut rng, n * n));
@@ -81,7 +93,13 @@ impl GemmLoad {
                 let ready = Arc::clone(&ready);
                 let start = Arc::clone(&start);
                 std::thread::spawn(move || {
-                    gemm_worker(ctx, dim, dtype, &host_a, &host_b, &stop, &ready, &start)
+                    let signals = WorkerSignals {
+                        stop: &stop,
+                        ready: &ready,
+                        start: &start,
+                        deadline,
+                    };
+                    gemm_worker(ctx, dim, dtype, &host_a, &host_b, signals)
                 })
             })
             .collect();
@@ -141,29 +159,37 @@ struct GemmState {
     dtype: GemmDtype,
 }
 
+/// The driver's handles on one worker: stop flag, the two barriers, and
+/// the hard deadline.
+struct WorkerSignals<'a> {
+    stop: &'a AtomicBool,
+    ready: &'a Barrier,
+    start: &'a Barrier,
+    deadline: Instant,
+}
+
 /// Set up, park at the ready barrier, wait for the start barrier, then
-/// hammer GEMMs until told to stop.
+/// hammer GEMMs until told to stop or the hard deadline passes.
 ///
 /// Both barriers are reached on *every* path — including a failed setup —
 /// so the driver thread can never deadlock waiting for a worker.
-#[allow(clippy::too_many_arguments)]
 fn gemm_worker(
     ctx: Arc<CudaContext>,
     dim: u32,
     dtype: GemmDtype,
     host_a: &[f32],
     host_b: &[f32],
-    stop: &AtomicBool,
-    ready: &Barrier,
-    start: &Barrier,
+    signals: WorkerSignals<'_>,
 ) -> Result<GemmThroughput, String> {
     let prepared = guard("overlap gemm setup", || {
         prepare(&ctx, dim, dtype, host_a, host_b)
     });
-    ready.wait();
-    start.wait();
+    signals.ready.wait();
+    signals.start.wait();
     let mut state = prepared?;
-    guard("overlap gemm loop", || gemm_loop(&mut state, stop))
+    guard("overlap gemm loop", || {
+        gemm_loop(&mut state, signals.stop, signals.deadline)
+    })
 }
 
 fn prepare(
@@ -199,12 +225,19 @@ fn prepare(
     })
 }
 
-fn gemm_loop(state: &mut GemmState, stop: &AtomicBool) -> Result<GemmThroughput> {
+fn gemm_loop(
+    state: &mut GemmState,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<GemmThroughput> {
     let (a_ptr, b_ptr) = state.operands.device_ptrs(&state.stream);
     let c_ptr = write_ptr(&mut state.c, &state.stream);
     let started = Instant::now();
     let mut iters = 0u64;
-    while !stop.load(Ordering::Relaxed) {
+    // The deadline is checked every batch, so compute stops at most one
+    // batch (GEMM_BATCH launches) after it — no matter what the driver
+    // thread is stuck on.
+    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
         for _ in 0..GEMM_BATCH {
             // SAFETY: the pointers come from the live allocations held in
             // `state`, sized n*n as `launch_gemm` requires, on the stream

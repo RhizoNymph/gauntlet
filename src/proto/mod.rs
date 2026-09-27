@@ -12,6 +12,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod ranks;
+
+pub use ranks::{RankAssignment, RankBlock, RankError};
+
 // v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
 // on the wire plus `CpuTaskSpec::sdc_hot_secs` / `GpuTaskSpec::sdc_check_secs`
 // in the task spec (which is `deny_unknown_fields`, so a v1 agent would
@@ -26,9 +30,24 @@ use thiserror::Error;
 // message-size sweep or the combined GEMM + fleet all-reduce protocol,
 // mutually exclusive by construction), every rank reports
 // `OverlapFleetReport`, and the overlap_fleet test ids ride the wire.
-// v7: intra-node NCCL sweep — `AgentTaskSpec.nccl_intranode` and the
+// v7: rank-per-GPU fleet NCCL world — the directives carry a validated
+// `RankAssignment` (the host's contiguous `RankBlock` plus world size)
+// instead of a single rank, one process drives every local rank, and each
+// `OverlapFleetReport` covers exactly one rank (= one GPU); inventories
+// carry `cuda_visible_gpus` (rank blocks are sized from it), `agent nccl`
+// sends Hello before anything can fail, and exits with
+// `AGENT_EXIT_CASCADE` when it stopped because the fleet stopped.
+// v8: intra-node NCCL sweep — `AgentTaskSpec.nccl_intranode` and the
 // `nccl_intra_all_reduce` / `nccl_intra_all_gather` test ids.
-pub const PROTO_VERSION: u32 = 7;
+pub const PROTO_VERSION: u32 = 8;
+
+/// Exit status of an `agent nccl` process that stopped *itself* because
+/// the fleet stopped, not because of a fault on its own host: the fleet
+/// overlap hard-deadline watchdog, or a follower whose lead never signalled
+/// a window close. The orchestrator classifies it like a timeout — a
+/// secondary failure attributed to whichever host failed first. (124 is
+/// coreutils `timeout`'s status, for the same reason.)
+pub const AGENT_EXIT_CASCADE: i32 = 124;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -309,6 +328,35 @@ pub struct InventorySnapshot {
     /// actually experience, unlike ldconfig or nvidia-smi presence.
     #[serde(default)]
     pub gpu_libs: BTreeMap<String, bool>,
+    /// GPUs the CUDA driver can actually open (`cuDeviceGetCount` in the
+    /// agent), as opposed to the nvidia-smi listing in `gpus`. The fleet
+    /// NCCL world sizes each host's rank block from this; `None` when the
+    /// agent could not ask CUDA (no driver, or built without the gpu
+    /// feature). See [`gpu_visibility_mismatch`].
+    #[serde(default)]
+    pub cuda_visible_gpus: Option<u32>,
+}
+
+/// The per-host inventory finding for a GPU-visibility mismatch: nvidia-smi
+/// lists GPUs that CUDA does not expose (a GPU fell off the bus, MIG is on,
+/// or CUDA_VISIBLE_DEVICES is set in the agent's environment). Such a host
+/// runs fewer NCCL ranks than it has GPUs. `None` when the counts agree or
+/// the host lists no GPUs at all.
+pub fn gpu_visibility_mismatch(inventory: &InventorySnapshot) -> Option<String> {
+    let listed = inventory.gpus.len();
+    if listed == 0 {
+        return None;
+    }
+    match inventory.cuda_visible_gpus {
+        Some(visible) if visible as usize == listed => None,
+        Some(visible) => Some(format!(
+            "nvidia-smi lists {listed} GPUs but CUDA can open {visible} \
+             (GPU off the bus, MIG enabled, or CUDA_VISIBLE_DEVICES set?)"
+        )),
+        None => Some(format!(
+            "nvidia-smi lists {listed} GPUs but CUDA could not enumerate devices"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -615,10 +663,13 @@ pub mod overlap_metric {
     pub const OVERLAP_BUS: &str = "overlap_bus_gib_per_sec";
 }
 
-/// One rank's fleet-overlap results. Bus bandwidths are the rank's *local*
+/// One rank's fleet-overlap results; the fleet world runs one rank per
+/// GPU, so this is one GPU's report. Bus bandwidths are the rank's *local*
 /// timings (arrival skew makes them differ across ranks — that spread is
-/// part of the signal); `gemm` carries one entry per local GPU, ascending
-/// by index.
+/// part of the signal); `gemm` is the overlapped compute leg on the same
+/// GPU. The orchestrator maps `rank` to (host, local GPU) through its rank
+/// layout, so the report carries no separate GPU index that could
+/// disagree with it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlapFleetReport {
@@ -628,26 +679,17 @@ pub struct OverlapFleetReport {
     pub msg_bytes: u64,
     pub isolated_bus_gib_per_sec: f64,
     pub overlap_bus_gib_per_sec: f64,
-    pub gemm: Vec<OverlapGpuGemm>,
+    pub gemm: OverlapGemmLeg,
 }
 
-/// Per-GPU outcome of the fleet-overlap compute leg. One GPU failing must
-/// not hide the others, so failure is a value here, not a dead rank.
+/// Outcome of one GPU's fleet-overlap compute leg. A GPU whose GEMM worker
+/// failed still ran its collective rank, so failure is a value here, not a
+/// dead rank.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum OverlapGpuGemm {
-    Ok { gpu_index: u32, gflops: f64 },
-    Failed { gpu_index: u32, reason: String },
-}
-
-impl OverlapGpuGemm {
-    pub fn gpu_index(&self) -> u32 {
-        match self {
-            OverlapGpuGemm::Ok { gpu_index, .. } | OverlapGpuGemm::Failed { gpu_index, .. } => {
-                *gpu_index
-            }
-        }
-    }
+pub enum OverlapGemmLeg {
+    Ok { gflops: f64 },
+    Failed { reason: String },
 }
 
 /// Barrier-skew microbenchmark parameters, appended to the NCCL sweep when
@@ -685,22 +727,22 @@ pub enum NcclWorkload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "directive", rename_all = "snake_case")]
 pub enum NcclDirective {
-    /// Rank 0: mint the rendezvous id, announce it as an `NcclId` event, and
-    /// stay alive through the whole workload (the id's bootstrap listen
-    /// socket lives in this process).
+    /// The host holding global rank 0 (its block starts at 0): mint the
+    /// rendezvous id, announce it as an `NcclId` event, and stay alive
+    /// through the whole workload (the id's bootstrap listen socket lives
+    /// in this process). Drives every rank of its block.
     Lead {
-        world_size: u32,
+        assignment: RankAssignment,
         /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
         socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
-    /// Ranks 1..n: join the lead's communicator and run the workload
-    /// silently (barrier timings and fleet-overlap reports are the two
-    /// things participants report).
+    /// Every other host: join the lead's communicator with every rank of
+    /// its block and run the workload silently (barrier timings and
+    /// fleet-overlap reports are the two things participants report).
     Participate {
         unique_id_b64: String,
-        rank: u32,
-        world_size: u32,
+        assignment: RankAssignment,
         socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
@@ -797,19 +839,28 @@ mod tests {
         assert_eq!(decode_event(&line).expect("decode"), event);
     }
 
+    fn assignment(base: u32, count: u32, world_size: u32) -> RankAssignment {
+        RankAssignment::new(RankBlock::new(base, count).expect("block"), world_size)
+            .expect("assignment")
+    }
+
     #[test]
     fn sweep_workloads_default_the_barrier_absent() {
         // A sweep directive written without the optional barrier probe.
-        let json = r#"{"directive":"lead","world_size":4,"socket_ifname":null,
+        let json = r#"{"directive":"lead",
+            "assignment":{"block":{"base":0,"count":8},"world_size":16},
+            "socket_ifname":null,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         let directive: NcclDirective = serde_json::from_str(json).expect("decode sweep lead");
         let NcclDirective::Lead {
+            assignment: decoded,
             workload: NcclWorkload::Sweep { barrier, .. },
             ..
         } = directive
         else {
             panic!("expected a Lead sweep directive");
         };
+        assert_eq!(decoded, assignment(0, 8, 16));
         assert_eq!(barrier, None);
     }
 
@@ -817,8 +868,7 @@ mod tests {
     fn barrier_specs_ride_the_sweep_workload() {
         let directive = NcclDirective::Participate {
             unique_id_b64: "abc".into(),
-            rank: 2,
-            world_size: 4,
+            assignment: assignment(8, 8, 24),
             socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Sweep {
                 sizes: vec![1024],
@@ -837,7 +887,7 @@ mod tests {
     #[test]
     fn overlap_workloads_ride_the_directive() {
         let directive = NcclDirective::Lead {
-            world_size: 3,
+            assignment: assignment(0, 4, 12),
             socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Overlap(OverlapSpec {
                 duration_secs: 30,
@@ -854,28 +904,100 @@ mod tests {
     }
 
     #[test]
+    fn directives_with_an_invalid_rank_block_do_not_decode() {
+        // The v6 single-rank shape is gone, and a block reaching past the
+        // world is rejected at decode time rather than inside the agent.
+        let v6 = r#"{"directive":"participate","unique_id_b64":"abc","rank":1,
+            "world_size":2,"socket_ifname":null,
+            "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+        assert!(serde_json::from_str::<NcclDirective>(v6).is_err());
+        let outside = r#"{"directive":"participate","unique_id_b64":"abc",
+            "assignment":{"block":{"base":4,"count":8},"world_size":8},
+            "socket_ifname":null,
+            "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+        assert!(serde_json::from_str::<NcclDirective>(outside).is_err());
+    }
+
+    #[test]
     fn overlap_fleet_reports_round_trip() {
-        let event = AgentEvent::OverlapFleetReport {
-            report: Box::new(OverlapFleetReport {
-                rank: 2,
-                msg_bytes: 64 << 20,
-                isolated_bus_gib_per_sec: 42.5,
-                overlap_bus_gib_per_sec: 31.25,
-                gemm: vec![
-                    OverlapGpuGemm::Ok {
-                        gpu_index: 0,
-                        gflops: 91_000.0,
-                    },
-                    OverlapGpuGemm::Failed {
-                        gpu_index: 1,
-                        reason: "worker panicked".into(),
-                    },
-                ],
-            }),
+        for gemm in [
+            OverlapGemmLeg::Ok { gflops: 91_000.0 },
+            OverlapGemmLeg::Failed {
+                reason: "worker panicked".into(),
+            },
+        ] {
+            let event = AgentEvent::OverlapFleetReport {
+                report: Box::new(OverlapFleetReport {
+                    rank: 9,
+                    msg_bytes: 64 << 20,
+                    isolated_bus_gib_per_sec: 42.5,
+                    overlap_bus_gib_per_sec: 31.25,
+                    gemm,
+                }),
+            };
+            let line = encode_event(&event);
+            assert!(line.contains("overlap_fleet_report"), "{line}");
+            assert_eq!(decode_event(&line).expect("decode"), event);
+        }
+    }
+
+    fn inventory_with(listed: usize, visible: Option<u32>) -> InventorySnapshot {
+        let gpu = GpuInventory {
+            index: 0,
+            name: "H100".into(),
+            uuid: "u".into(),
+            vbios: "v".into(),
+            mem_total_bytes: 1,
+            ecc_volatile_errors: None,
+            remapped_rows_pending: None,
+            pcie_gen_current: None,
+            pcie_gen_max: None,
+            pcie_width_current: None,
+            pcie_width_max: None,
+            nvlinks_active: None,
+            persistence_mode: None,
         };
-        let line = encode_event(&event);
-        assert!(line.contains("overlap_fleet_report"), "{line}");
-        assert_eq!(decode_event(&line).expect("decode"), event);
+        InventorySnapshot {
+            hostname: "n1".into(),
+            kernel: "6.8".into(),
+            cpu_model: "x".into(),
+            logical_cores: 8,
+            numa_nodes: 1,
+            mem_total_bytes: 1,
+            cpu_governor: None,
+            clock_offset_ms: None,
+            nvidia_driver: None,
+            cuda_version: None,
+            gpus: vec![gpu; listed],
+            nics: vec![],
+            ib_ports: vec![],
+            xid_errors: vec![],
+            gpu_libs: BTreeMap::new(),
+            cuda_visible_gpus: visible,
+        }
+    }
+
+    #[test]
+    fn gpu_visibility_mismatches_are_findings() {
+        assert_eq!(gpu_visibility_mismatch(&inventory_with(8, Some(8))), None);
+        assert_eq!(gpu_visibility_mismatch(&inventory_with(0, None)), None);
+        let fewer = gpu_visibility_mismatch(&inventory_with(8, Some(7))).expect("finding");
+        assert!(
+            fewer.contains("lists 8") && fewer.contains("open 7"),
+            "{fewer}"
+        );
+        assert!(gpu_visibility_mismatch(&inventory_with(8, None)).is_some());
+    }
+
+    #[test]
+    fn inventories_without_a_cuda_count_still_decode() {
+        let mut value = serde_json::to_value(inventory_with(2, Some(2))).expect("to value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("cuda_visible_gpus");
+        let back: InventorySnapshot = serde_json::from_value(value).expect("decode");
+        assert_eq!(back.cuda_visible_gpus, None);
     }
 
     #[test]

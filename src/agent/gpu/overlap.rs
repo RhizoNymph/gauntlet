@@ -36,6 +36,7 @@ use super::node_comm::{NodeComm, nccl_error};
 use super::worker::GemmLoad;
 use crate::agent::EventSink;
 use crate::agent::nccl::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
+use crate::agent::window::hard_deadline_secs;
 use crate::proto::{
     LogLevel, MetricRecord, OverlapSpec, Scope, TestId, TestOutcome, Unit, overlap_metric,
 };
@@ -96,6 +97,7 @@ fn node_outcomes(sink: &EventSink, outcome: impl Fn(String) -> TestOutcome, reas
 // ---------------------------------------------------------------------------
 
 fn execute(sink: &EventSink, spec: &OverlapSpec, device_count: u32) -> Result<()> {
+    let protocol_start = Instant::now();
     let elements = message_elements(spec.msg_bytes);
     let message_bytes = (elements * F32_BYTES) as f64;
 
@@ -115,7 +117,11 @@ fn execute(sink: &EventSink, spec: &OverlapSpec, device_count: u32) -> Result<()
     // One GEMM worker per GPU (`gpu::worker`). Workers set up (upload,
     // warm launch) off the timed path; `wait_ready` + `start` releases
     // them together and the combined window begins.
-    let mut load = GemmLoad::spawn(&node.contexts, spec.gemm_dim, spec.gemm_dtype);
+    // Same hard compute deadline as the fleet step: a wedged collective
+    // must never leave the GPUs saturated past the step's budget.
+    let deadline = protocol_start
+        + Duration::from_secs(hard_deadline_secs(spec.baseline_secs, spec.duration_secs));
+    let mut load = GemmLoad::spawn(&node.contexts, spec.gemm_dim, spec.gemm_dtype, deadline);
     load.wait_ready();
     load.start();
 

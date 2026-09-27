@@ -86,7 +86,7 @@ machinery; all-zero mismatch groups have zero MAD and are never flagged.
   check execution, metric/outcome emission.
 - `src/agent/cpu.rs` — `run_hot_correctness`, `hot_worker`,
   `HotCoreReport`.
-- `src/proto.rs` — `TestId::{CpuSdcHot,GpuGemmSdc}`,
+- `src/proto/mod.rs` — `TestId::{CpuSdcHot,GpuGemmSdc}`,
   `CpuTaskSpec::sdc_hot_secs`, `GpuTaskSpec::sdc_check_secs`
   (PROTO_VERSION 3).
 - `src/config.rs` — `cpu_sdc_hot_secs` (default 10),

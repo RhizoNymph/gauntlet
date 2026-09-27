@@ -15,6 +15,7 @@
 //! `tests.phase_timeout_secs`) mark that host failed and the run continues;
 //! the failure lands in the report instead of aborting the fleet.
 
+mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
@@ -34,12 +35,12 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
 use self::session::{HostSession, single_quote};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
-use crate::analysis::skew::BarrierSkew;
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::proto::{
@@ -800,6 +801,30 @@ async fn probe_pair(
     Ok((latency, bandwidth))
 }
 
+/// `pkill -f` pattern for a deployed agent running `agent <args>`. The
+/// remote command line is `<remote_dir>/bin/gauntlet-agent agent <args>`
+/// (`HostSession::run_agent`); the bracket keeps the pattern from matching
+/// the `pkill` invocation itself.
+fn agent_kill_pattern(args: &str) -> String {
+    format!("[g]auntlet-agent agent {args}")
+}
+
+/// Kill a remote agent process by its command line. Dropping the ssh
+/// future on a timeout does not stop the remote process — it can sit
+/// blocked (a collective, a socket) and never write to stdout again, so it
+/// never even dies of SIGPIPE — so every timeout that abandons an agent
+/// ends here. Best effort: a failed cleanup command is logged, not raised.
+async fn kill_remote_agent(session: &HostSession, args: &str) {
+    let pattern = agent_kill_pattern(args);
+    match session
+        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
+        .await
+    {
+        Ok(_) => debug!(host = %session.addr(), pattern, "remote agent cleanup sent"),
+        Err(error) => warn!(host = %session.addr(), %error, "remote agent cleanup failed"),
+    }
+}
+
 /// Graceful shutdown frame first; a remote `pkill` as the backstop for
 /// fleets where the operator cannot reach the peer port directly.
 async fn stop_peer(
@@ -818,14 +843,7 @@ async fn stop_peer(
         Ok(Err(error)) => debug!(target, %error, "graceful peer shutdown failed"),
         Err(_) => debug!(target, "graceful peer shutdown timed out"),
     }
-    // The bracket keeps the pattern from matching the pkill invocation itself.
-    let pattern = format!("[g]auntlet-agent peer serve --port {port}");
-    if let Err(error) = server
-        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-        .await
-    {
-        debug!(host = %server.addr(), %error, "peer cleanup command failed");
-    }
+    kill_remote_agent(server, &format!("peer serve --port {port}")).await;
     if tokio::time::timeout(PEER_SHUTDOWN_TIMEOUT, child.wait())
         .await
         .is_err()
@@ -894,79 +912,6 @@ fn peer_endpoint(ssh_addr: &str) -> &str {
         }
     }
     host
-}
-
-/// Turn a barrier-skew analysis into metric records: per-rank distribution
-/// and tally metrics against each rank's host, fleet-level barrier-time
-/// distribution against the coordinator/lead host (index 0), mirroring how
-/// the NCCL sweeps attribute fleet-wide numbers to rank 0.
-///
-/// Metric semantics differ by polarity — under `NcclBarrier` the per-rank
-/// values are local waits (a straggler is a *low* outlier), under
-/// `TcpBarrier` they are release-to-response times (a straggler is a *high*
-/// outlier) — but `slowest_frac` always means "fraction of considered
-/// iterations this host was the late arriver", which is what the report's
-/// flagging rule consumes.
-fn emit_barrier_metrics(
-    sink: &ObservationSink,
-    test: TestId,
-    rank_hosts: &[String],
-    skew: &BarrierSkew,
-) {
-    for rank in &skew.per_rank {
-        let Some(host) = rank_hosts.get(rank.rank as usize) else {
-            warn!(
-                rank = rank.rank,
-                hosts = rank_hosts.len(),
-                "barrier rank has no host"
-            );
-            continue;
-        };
-        for (name, value, unit) in [
-            ("p50_us", rank.p50_us, Unit::Micros),
-            ("p90_us", rank.p90_us, Unit::Micros),
-            ("p99_us", rank.p99_us, Unit::Micros),
-            ("max_us", rank.max_us, Unit::Micros),
-            ("slowest_frac", rank.slowest_frac, Unit::Ratio),
-            (
-                "slowest_considered",
-                skew.considered_iters as f64,
-                Unit::Count,
-            ),
-        ] {
-            sink.metric(
-                host,
-                MetricRecord {
-                    test,
-                    scope: Scope::Node,
-                    name: name.to_string(),
-                    value,
-                    unit,
-                    repeat: 0,
-                },
-            );
-        }
-    }
-    if let Some(host) = rank_hosts.first() {
-        for (name, value) in [
-            ("fleet_span_p50_us", skew.fleet.p50_us),
-            ("fleet_span_p90_us", skew.fleet.p90_us),
-            ("fleet_span_p99_us", skew.fleet.p99_us),
-            ("fleet_span_max_us", skew.fleet.max_us),
-        ] {
-            sink.metric(
-                host,
-                MetricRecord {
-                    test,
-                    scope: Scope::Node,
-                    name: name.to_string(),
-                    value,
-                    unit: Unit::Micros,
-                    repeat: 0,
-                },
-            );
-        }
-    }
 }
 
 /// TCP star-barrier sweep: the CPU-only barrier-skew probe, run across the
@@ -1087,13 +1032,7 @@ async fn tcp_barrier_sweep(
         Ok(Err(error)) => Err(anyhow::anyhow!("barrier serve task panicked: {error}")),
         Err(_) => {
             // The coordinator is wedged; kill it so the phase can move on.
-            let pattern = format!("[g]auntlet-agent barrier serve --port {port}");
-            if let Err(error) = server
-                .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-                .await
-            {
-                debug!(host = %server_addr, %error, "barrier cleanup command failed");
-            }
+            kill_remote_agent(&server, &format!("barrier serve --port {port}")).await;
             Err(anyhow::anyhow!(
                 "barrier serve timed out after {}s",
                 timeout.as_secs()
@@ -1102,11 +1041,20 @@ async fn tcp_barrier_sweep(
     };
     match report {
         Ok(report) => {
-            let rank_hosts: Vec<String> = sessions
-                .iter()
-                .map(|session| session.addr().to_string())
-                .collect();
-            emit_barrier_metrics(sink, TestId::TcpBarrier, &rank_hosts, &report.skew);
+            // One TCP rank per host (its fleet index): node-scope subjects.
+            let locate = |rank: u32| {
+                sessions.get(rank as usize).map(|session| RankSubject {
+                    host: session.addr().to_string(),
+                    scope: Scope::Node,
+                })
+            };
+            emit_barrier_metrics(
+                sink,
+                TestId::TcpBarrier,
+                &report.skew,
+                locate,
+                Some(&server_addr),
+            );
         }
         Err(error) => sink.error(&server_addr, format!("TCP barrier failed: {error:#}")),
     }
@@ -1203,6 +1151,27 @@ mod tests {
         // Bare IPv6 literals keep every colon they came with.
         assert_eq!(peer_endpoint("fd00::1"), "fd00::1");
         assert_eq!(peer_endpoint("user@fd00::1"), "fd00::1");
+    }
+
+    #[test]
+    fn kill_patterns_match_the_remote_agent_command_line_but_not_pkill() {
+        let agent = format!("/scratch/gauntlet/{}", deploy::AGENT_RELPATH);
+        for args in [
+            "nccl",
+            "peer serve --port 29500",
+            "barrier serve --port 29500",
+        ] {
+            let pattern = agent_kill_pattern(args);
+            // `[g]` matches a literal `g` in the regex: the effective
+            // pattern is the plain text below.
+            let effective = pattern.replacen("[g]", "g", 1);
+            let cmdline = format!("{agent} agent {args}");
+            assert!(cmdline.contains(&effective), "{pattern} vs {cmdline}");
+            // The pkill command line carries the bracketed text, which the
+            // regex does not match.
+            let pkill = format!("pkill -f '{pattern}'");
+            assert!(!pkill.contains(&effective), "{pkill}");
+        }
     }
 
     #[test]

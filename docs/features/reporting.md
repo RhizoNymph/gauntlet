@@ -54,15 +54,16 @@ produce the same shape:
 A group is a fleet comparison only when every sample key in it is
 distinct. A repeated key means the metric is a per-host *series*, not one
 reading per subject: the NCCL sweeps emit `msg_bytes`/`elapsed_us` once per
-message size, so their spread is the design, not a straggler signal. The
-intra-node sweep's `bus_gib_per_sec_peak_<n>gpu` and `ranks` are one
+message size, so their spread is the design, not a straggler signal. Such
+series groups are skipped by MAD analysis (they feed `calibration.links`
+instead). Absolute thresholds still apply to them, since a configured
+bound is an explicit per-value opt-in.
+
+The intra-node sweep's `bus_gib_per_sec_peak_<n>gpu` and `ranks` are one
 value per node, so they *are* fleet comparisons — the peak is the
 intra-node straggler headline. Its name carries the GPU count, so nodes
 are only compared within their own topology (the same keying as the
-`_<n>gpu` link classes); a topology with fewer than 4 nodes never flags. Such
-groups are skipped by MAD analysis (they feed `calibration.links` instead).
-Absolute thresholds still apply to them, since a configured bound is an
-explicit per-value opt-in.
+`_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
 
 ## Statistics contracts (stats.rs)
 - `median`: ignores non-finite; None on empty (after filtering).
@@ -90,12 +91,14 @@ Per-host `NodeRoofline`:
   (distinct mount points are not comparable, so the best is the headline).
 
 `calibration.links`:
-- `nccl_allreduce_fleet` / `nccl_allgather_fleet`: within each host's
+- `nccl_allreduce_rank_per_gpu` / `nccl_allgather_rank_per_gpu` (named
+  `nccl_*_fleet` before schema v8; renamed because the world changed
+  meaning, see below): within each host's
   metric list the sweep emits `msg_bytes` and `elapsed_us` as parallel
   metrics, one of each per size, so they are joined by emission order and
   fitted with `fit_alpha_beta` over the whole fleet's points.
 - `nccl_allreduce_intranode_<n>gpu` / `nccl_allgather_intranode_<n>gpu`
-  (schema v8, `report/intranode.rs`): the intra-node sweep's
+  (schema v9, `report/intranode.rs`): the intra-node sweep's
   `nccl_intra_all_*` series, joined by emission order within each (host,
   repeat) and bucketed by that run's `ranks` value (local GPU count), one
   fit per bucket. Keyed by GPU count because different counts are
@@ -237,3 +240,39 @@ and `overlap_retention.fleet_all_reduce` (per node, over the fleet step's
 own isolated window — the two steps' communicators are not comparable, so
 their baselines never cross). No field changed shape; pre-v7 documents
 decode unchanged.
+
+## Rank-per-GPU granularity (schema v8)
+
+The fleet NCCL world became one rank per GPU (proto v7; see
+docs/features/phase3_network.md), which changes the granularity of three
+metric families and the *meaning* of others, without changing any
+field's shape:
+- `nccl_barrier.{p50_us,p90_us,p99_us,max_us}`: `host` → `host:gpuN`
+  subjects. The tally (`slowest_frac`, `slowest_considered`) stays one
+  node-scope value per host — a host's ranks share one arrival group, so
+  per-GPU copies would weight hosts by GPU count — and so do
+  `fleet.barrier_stragglers.nccl_barrier` keys (one row per late host;
+  docs/features/barrier_skew.md). `fleet_span_*` stays one node-scope
+  series on the lead host. `tcp_barrier.*` is unchanged.
+- `overlap_fleet_all_reduce.*`: per GPU (each GPU is a rank with its own
+  isolated and overlapped windows).
+- `overlap_retention.fleet_all_reduce`: per GPU, each dividing that GPU's
+  own isolated window. `derive_overlap_retention` joins bus baselines on
+  (step, repeat, scope label), so node-scope inputs (the node-local
+  step, older documents) still derive node-scope ratios.
+- Meaning change: the phase-3 sweep series (`nccl_all_reduce.*`,
+  `nccl_all_gather.*`) keep their names and node scope on the lead host
+  (timed on global rank 0), but now measure a world of n = total GPUs
+  whose ring mixes NVLink with the fabric; they are not comparable with
+  v7 numbers. The fits were therefore renamed
+  `nccl_{allreduce,allgather}_fleet` →
+  `nccl_{allreduce,allgather}_rank_per_gpu`, so a v7 baseline cannot line
+  up with them under one key, and the viewer's diff mode marks any
+  baseline with a different `schema_version` as not directly comparable
+  (docs/features/viewer.md).
+- `hosts.*.inventory` gains `cuda_visible_gpus`, and a mismatch with the
+  nvidia-smi GPU count is a Failed `inventory` outcome on that host
+  (verdict at least Stragglers).
+- Fleet NCCL failures are attributed (docs/features/phase3_network.md):
+  `fleet.failed_hosts` lists only the host that caused a sweep failure;
+  hosts it aborted are warnings, not host failures.

@@ -1,13 +1,14 @@
 //! Message-size sweep shared by every level of the NCCL hierarchy.
 //!
-//! The fleet sweep (`agent nccl`, one rank per node) and the intra-node
-//! sweep (`agent run` network phase, one rank per local GPU) run the *same*
-//! per-size timing loop: a warmup at the largest size, then per message size
-//! `iters` all-reduces followed by `iters` all-gathers, each bracketed by a
-//! full synchronization so the interval covers completed device work only.
-//! Only how a collective is launched differs (one communicator on one
-//! stream vs. an NCCL group across every local rank), so that is the one
-//! thing abstracted here: `SweepCollectives`. Everything else — which sizes
+//! The fleet sweep (`agent nccl`, one rank per GPU across the fleet, this
+//! host's rank block driven from one thread) and the intra-node sweep
+//! (`agent run` network phase, a node-local communicator over every local
+//! GPU) run the *same* per-size timing loop: a warmup at the largest size,
+//! then per message size `iters` all-reduces followed by `iters`
+//! all-gathers, each bracketed by a full drain so the interval covers
+//! completed device work only. What differs per level is how a collective
+//! is launched and which stream stops the clock (the fleet sweep times on
+//! global rank 0 only), so exactly that is abstracted: `SweepCollectives`. Everything else — which sizes
 //! run, the all-gather sharding, the timing, the metric records — is pure
 //! and unit-tested without a GPU.
 
@@ -106,12 +107,7 @@ impl SweepPlan {
     /// that leg). Sizes are payloads of f32 elements, never zero.
     pub fn new(sizes: &[u64], world: NonZeroU32) -> Self {
         let world = world.get() as usize;
-        let max_elements = sizes
-            .iter()
-            .map(|size| *size as usize / F32_BYTES)
-            .max()
-            .unwrap_or(0)
-            .max(1);
+        let max_elements = max_elements(sizes);
         let mut steps = Vec::with_capacity(sizes.len() * 2);
         for &size in sizes {
             let elements = (size as usize / F32_BYTES).clamp(1, max_elements);
@@ -141,6 +137,20 @@ impl SweepPlan {
     }
 }
 
+/// f32 elements of the largest configured size (never zero): the
+/// per-rank buffer size a sweep over `sizes` needs. Callers that must
+/// allocate before the world size is known (the fleet sweep allocates
+/// before communicator init) use this directly; it is the same value
+/// `SweepPlan::max_elements` reports.
+pub fn max_elements(sizes: &[u64]) -> usize {
+    sizes
+        .iter()
+        .map(|size| *size as usize / F32_BYTES)
+        .max()
+        .unwrap_or(0)
+        .max(1)
+}
+
 /// How one sweep level launches collectives. Launches are asynchronous;
 /// `sync` blocks until every launched collective has completed on every
 /// rank this process drives.
@@ -148,6 +158,12 @@ pub trait SweepCollectives {
     type Error;
     fn launch(&mut self, step: &SweepStep) -> Result<(), Self::Error>;
     fn sync(&mut self) -> Result<(), Self::Error>;
+    /// Block until the *timing* rank's work is done; the clock stops when
+    /// this returns. Defaults to a full `sync`; the fleet sweep times on
+    /// global rank 0's stream only.
+    fn wait_timed(&mut self) -> Result<(), Self::Error> {
+        self.sync()
+    }
 }
 
 /// One measured sweep point.
@@ -167,7 +183,9 @@ impl SweepPoint {
 }
 
 /// Run a plan: `WARMUP_ITERS` full-size all-reduces, then per step
-/// `iters_per_size` (at least 1) timed launches with a sync on both sides.
+/// `iters_per_size` (at least 1) timed launches: a full sync before, the
+/// clock stopped by `wait_timed`, then a full sync so the next step starts
+/// from drained streams.
 /// `on_point` sees each point as soon as it is measured, so emitters can
 /// stream results live. The first collective error aborts the sweep.
 pub fn run_plan<C: SweepCollectives>(
@@ -189,10 +207,12 @@ pub fn run_plan<C: SweepCollectives>(
         for _ in 0..iters {
             collectives.launch(step)?;
         }
+        collectives.wait_timed()?;
+        let elapsed = start.elapsed().as_secs_f64();
         collectives.sync()?;
         let point = SweepPoint {
             step: *step,
-            per_iter_secs: start.elapsed().as_secs_f64() / f64::from(iters),
+            per_iter_secs: elapsed / f64::from(iters),
         };
         on_point(&point);
     }
@@ -399,6 +419,7 @@ mod tests {
     enum Call {
         Launch(Collective, usize),
         Sync,
+        Timed,
     }
 
     impl SweepCollectives for Recorder {
@@ -422,6 +443,60 @@ mod tests {
             self.calls.push(Call::Sync);
             Ok(())
         }
+
+        fn wait_timed(&mut self) -> Result<(), String> {
+            self.calls.push(Call::Timed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffer_sizing_is_one_rule() {
+        let sizes = [4096, 1 << 20, 64];
+        assert_eq!(max_elements(&sizes), (1 << 20) / 4);
+        assert_eq!(max_elements(&[]), 1);
+        assert_eq!(
+            SweepPlan::new(&sizes, world(8)).max_elements(),
+            max_elements(&sizes)
+        );
+    }
+
+    /// Only `sync`: the default `wait_timed` is a full sync.
+    struct SyncOnly(Vec<Call>);
+
+    impl SweepCollectives for SyncOnly {
+        type Error = String;
+        fn launch(&mut self, step: &SweepStep) -> Result<(), String> {
+            self.0
+                .push(Call::Launch(step.collective, step.send_elements));
+            Ok(())
+        }
+        fn sync(&mut self) -> Result<(), String> {
+            self.0.push(Call::Sync);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_default_timer_is_a_full_sync() {
+        let plan = SweepPlan::new(&[64], world(2));
+        let mut only = SyncOnly(Vec::new());
+        run_plan(&mut only, &plan, 1, |_| {}).expect("sweep");
+        // warmup(5) sync | sync launch timed(=sync) sync
+        let tail: Vec<Call> = only.0[6..].to_vec();
+        assert_eq!(
+            tail,
+            [
+                Call::Sync,
+                Call::Launch(Collective::AllReduce, 16),
+                Call::Sync,
+                Call::Sync,
+                Call::Sync,
+                Call::Launch(Collective::AllGather, 8),
+                Call::Sync,
+                Call::Sync,
+            ]
+        );
     }
 
     #[test]
@@ -439,6 +514,7 @@ mod tests {
                 Call::Launch(step.collective, step.send_elements),
                 3,
             ));
+            expected.push(Call::Timed);
             expected.push(Call::Sync);
         }
         assert_eq!(recorder.calls, expected);

@@ -81,8 +81,9 @@ pub struct RankSkew {
     pub p90_us: f64,
     pub p99_us: f64,
     pub max_us: f64,
-    /// Iterations in which this rank was the (unique, beyond-margin) late
-    /// arriver.
+    /// Iterations in which this rank's arrival group was the (unique,
+    /// beyond-margin) late arriver. Under [`analyze`] every rank is its own
+    /// group; under [`analyze_grouped`] siblings share their group's tally.
     pub slowest_iters: u64,
     /// `slowest_iters / considered_iters`; 0.0 when nothing was considered.
     pub slowest_frac: f64,
@@ -112,13 +113,40 @@ pub struct BarrierSkew {
     pub fleet: FleetBarrier,
 }
 
-/// Analyze per-rank barrier timings. Returns `None` when the input cannot
-/// carry a skew signal: fewer than two ranks, duplicate rank ids, or no
-/// iteration in which every rank has a finite value.
+/// Analyze per-rank barrier timings where every rank arrives
+/// independently (one process per rank, e.g. the TCP star barrier).
+/// Returns `None` when the input cannot carry a skew signal: fewer than
+/// two ranks, duplicate rank ids, or no iteration in which every rank has
+/// a finite value.
 pub fn analyze(
     series: &[RankSeries],
     polarity: SkewPolarity,
     margin: Margin,
+) -> Option<BarrierSkew> {
+    analyze_grouped(series, polarity, margin, Some)
+}
+
+/// Analyze per-rank barrier timings whose ranks come in *arrival groups*:
+/// ranks launched by one thread (the fleet NCCL world's per-host rank
+/// block) share one arrival instant, so which sibling shows the extreme
+/// value within an iteration is completion noise, not lateness. Tallying
+/// per rank would split a late host's blame across its GPUs and keep
+/// every one of them under the straggler threshold.
+///
+/// Per iteration, each group's value is its members' extreme under
+/// `polarity` (the group's arrival as seen through its most telling rank);
+/// the late arriver is the unique extreme *group*, the noise margin is
+/// measured against the median of the group values, and every rank of the
+/// late group is tallied. With singleton groups this is exactly the
+/// per-rank analysis. Percentiles stay per rank.
+///
+/// `group_of` maps a rank to its group; `None` for any rank, fewer than
+/// two groups, or the degenerate inputs of [`analyze`] yield `None`.
+pub fn analyze_grouped(
+    series: &[RankSeries],
+    polarity: SkewPolarity,
+    margin: Margin,
+    group_of: impl Fn(u32) -> Option<u32>,
 ) -> Option<BarrierSkew> {
     if series.len() < 2 {
         return None;
@@ -133,6 +161,22 @@ pub fn analyze(
     let mut ordered: Vec<&RankSeries> = series.iter().collect();
     ordered.sort_by_key(|s| s.rank);
 
+    // Dense group slot per rank, groups in ascending id order.
+    let group_ids: Vec<u32> = ordered
+        .iter()
+        .map(|s| group_of(s.rank))
+        .collect::<Option<Vec<u32>>>()?;
+    let mut distinct = group_ids.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if distinct.len() < 2 {
+        return None;
+    }
+    let slot_of: Vec<usize> = group_ids
+        .iter()
+        .map(|id| distinct.binary_search(id).unwrap_or_default())
+        .collect();
+
     let aligned = ordered
         .iter()
         .map(|s| s.elapsed_us.len())
@@ -140,8 +184,12 @@ pub fn analyze(
         .unwrap_or(0);
 
     let mut spans: Vec<f64> = Vec::with_capacity(aligned);
-    let mut tallies: Vec<u64> = vec![0; ordered.len()];
+    let mut group_tallies: Vec<u64> = vec![0; distinct.len()];
     let mut considered: u64 = 0;
+    let beats: fn(f64, f64) -> bool = match polarity {
+        SkewPolarity::LateIsMin => |a, b| a < b,
+        SkewPolarity::LateIsMax => |a, b| a > b,
+    };
 
     for iter in 0..aligned {
         let values: Vec<f64> = ordered.iter().map(|s| s.elapsed_us[iter]).collect();
@@ -151,22 +199,28 @@ pub fn analyze(
         let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         spans.push(max);
 
-        let late = match polarity {
-            SkewPolarity::LateIsMin => unique_extreme(&values, |a, b| a < b),
-            SkewPolarity::LateIsMax => unique_extreme(&values, |a, b| a > b),
-        };
-        let Some((late_index, late_value)) = late else {
+        let mut group_values: Vec<Option<f64>> = vec![None; distinct.len()];
+        for (&slot, &value) in slot_of.iter().zip(&values) {
+            let current = &mut group_values[slot];
+            if current.is_none_or(|existing| beats(value, existing)) {
+                *current = Some(value);
+            }
+        }
+        let group_values: Vec<f64> = group_values.into_iter().flatten().collect();
+
+        let Some((late_slot, late_value)) = unique_extreme(&group_values, beats) else {
             continue;
         };
-        let mut sorted = values.clone();
+        let mut sorted = group_values;
         sorted.sort_by(f64::total_cmp);
         let center = median_of_sorted(&sorted);
         let cutoff = (margin.frac * center.abs()).max(margin.floor_us);
         if (late_value - center).abs() > cutoff {
             considered += 1;
-            tallies[late_index] += 1;
+            group_tallies[late_slot] += 1;
         }
     }
+    let tallies: Vec<u64> = slot_of.iter().map(|&slot| group_tallies[slot]).collect();
 
     if spans.is_empty() {
         return None;
@@ -492,5 +546,120 @@ mod tests {
         let json = serde_json::to_string(&skew).expect("serialize");
         let back: BarrierSkew = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, skew);
+    }
+
+    /// Two hosts x four GPUs; host 1 (ranks 4..8) always arrives ~200us
+    /// late. One process drives each host's ranks, so siblings share the
+    /// arrival instant and differ only by completion noise.
+    fn two_host_block_fleet() -> Vec<RankSeries> {
+        let iters = 300;
+        (0..8u32)
+            .map(|rank| {
+                let values: Vec<f64> = (0..iters)
+                    .map(|i| {
+                        // Sibling completion noise: which sibling is the
+                        // per-iteration minimum rotates.
+                        let noise = ((i + rank as usize) % 4) as f64;
+                        if rank >= 4 {
+                            5.0 + noise
+                        } else {
+                            200.0 + noise
+                        }
+                    })
+                    .collect();
+                series(rank, &values)
+            })
+            .collect()
+    }
+
+    fn host_of(rank: u32) -> Option<u32> {
+        (rank < 8).then_some(rank / 4)
+    }
+
+    #[test]
+    fn per_rank_tallies_dilute_a_straggling_host_across_its_siblings() {
+        // Documents why grouping exists: without arrival groups the late
+        // host's blame spreads over its four GPUs and no single rank gets
+        // near the straggler threshold.
+        let skew = analyze(
+            &two_host_block_fleet(),
+            SkewPolarity::LateIsMin,
+            Margin::default(),
+        )
+        .expect("analyzable");
+        for rank in &skew.per_rank[4..] {
+            assert!(rank.slowest_frac < 0.5, "{rank:?}");
+        }
+    }
+
+    #[test]
+    fn grouped_tallies_blame_every_rank_of_the_late_arrival_group() {
+        let skew = analyze_grouped(
+            &two_host_block_fleet(),
+            SkewPolarity::LateIsMin,
+            Margin::default(),
+            host_of,
+        )
+        .expect("analyzable");
+        assert_eq!(skew.iters, 300);
+        assert_eq!(skew.considered_iters, 300);
+        for rank in &skew.per_rank[..4] {
+            assert_eq!(rank.slowest_iters, 0, "{rank:?}");
+        }
+        for rank in &skew.per_rank[4..] {
+            assert_eq!(rank.slowest_iters, 300, "{rank:?}");
+            assert!((rank.slowest_frac - 1.0).abs() < 1e-12);
+        }
+        // Per-rank distributions stay per rank.
+        assert_eq!(skew.per_rank[4].rank, 4);
+        assert!(skew.per_rank[4].p50_us < 10.0);
+        assert!(skew.per_rank[0].p50_us > 190.0);
+    }
+
+    #[test]
+    fn grouped_fractions_sum_to_at_most_one_over_groups() {
+        let skew = analyze_grouped(
+            &two_host_block_fleet(),
+            SkewPolarity::LateIsMin,
+            Margin::default(),
+            host_of,
+        )
+        .expect("analyzable");
+        // One representative rank per group.
+        let total: f64 = [0usize, 4]
+            .iter()
+            .map(|index| skew.per_rank[*index].slowest_frac)
+            .sum();
+        assert!(total <= 1.0 + 1e-12, "{total}");
+    }
+
+    #[test]
+    fn singleton_groups_match_the_per_rank_analysis() {
+        let fleet = straggler_fleet();
+        let plain = analyze(&fleet, SkewPolarity::LateIsMin, Margin::default());
+        let grouped = analyze_grouped(&fleet, SkewPolarity::LateIsMin, Margin::default(), Some);
+        assert_eq!(plain, grouped);
+        let tcp = analyze(&fleet, SkewPolarity::LateIsMax, Margin::default());
+        let tcp_grouped = analyze_grouped(&fleet, SkewPolarity::LateIsMax, Margin::default(), Some);
+        assert_eq!(tcp, tcp_grouped);
+    }
+
+    #[test]
+    fn grouped_analysis_needs_two_groups_and_a_group_for_every_rank() {
+        let fleet = two_host_block_fleet();
+        assert!(
+            analyze_grouped(&fleet, SkewPolarity::LateIsMin, Margin::default(), |_| {
+                Some(0)
+            })
+            .is_none(),
+            "one arrival group has no skew"
+        );
+        assert!(
+            analyze_grouped(&fleet, SkewPolarity::LateIsMin, Margin::default(), |rank| {
+                (rank < 7).then_some(rank / 4)
+            })
+            .is_none(),
+            "a rank outside the layout is a protocol error"
+        );
     }
 }

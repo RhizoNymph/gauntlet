@@ -678,6 +678,24 @@ impl RootView {
                 None => ("diff: no baseline".to_string(), WARN),
             }
         };
+        let comparability_note = self
+            .diff
+            .as_ref()
+            .filter(|_| self.diff_enabled)
+            .and_then(|diff| diff.comparability.note());
+        if let Some(note) = comparability_note {
+            header = header.child(
+                div()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .text_size(px(11.0))
+                    .text_color(rgb(WARN))
+                    .border_1()
+                    .border_color(rgb(WARN))
+                    .child(note),
+            );
+        }
         header.child(
             div()
                 .id("diff-toggle")
