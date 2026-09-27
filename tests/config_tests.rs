@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use gauntlet::config::{ConfigError, FleetConfig};
+use gauntlet::nccl_env::{NcclEnvError, NcclEnvValueError};
 use gauntlet::proto::Phase;
 
 fn parse(text: &str) -> Result<FleetConfig, String> {
@@ -214,4 +215,212 @@ fn hot_sdc_knobs_default_on_and_flow_into_the_spec() {
     let spec = tuned.task_spec(&[Phase::CpuMem, Phase::Gpu]);
     assert_eq!(spec.cpu.sdc_hot_secs, 7);
     assert_eq!(spec.gpu.sdc_check_secs, 0);
+}
+
+// ---------------------------------------------------------------------------
+// [nccl] env passthrough
+// ---------------------------------------------------------------------------
+
+fn load_str(text: &str) -> Result<FleetConfig, ConfigError> {
+    FleetConfig::from_toml_str(text, Path::new("inline.toml"))
+}
+
+#[test]
+fn socket_ifname_only_config_still_loads() {
+    // The shape of every pre-passthrough config (deny_unknown_fields must
+    // keep accepting it).
+    let text = r#"
+        hosts = ["10.0.0.1", "10.0.0.2"]
+        [nccl]
+        socket_ifname = "bond0"
+    "#;
+    let config = load_str(text).expect("socket_ifname-only config loads");
+    assert_eq!(config.nccl.socket_ifname(), Some("bond0"));
+    let env = config.nccl_env();
+    assert_eq!(
+        env.iter().collect::<Vec<_>>(),
+        vec![("NCCL_SOCKET_IFNAME", "bond0")]
+    );
+    // The serde-only path (no typed pre-check) agrees.
+    let parsed = parse(text).expect("parses");
+    assert_eq!(parsed.nccl_env(), env);
+}
+
+#[test]
+fn unknown_nccl_fields_are_still_rejected() {
+    let error = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifnam = "bond0"
+        "#,
+    )
+    .expect_err("typo'd [nccl] key must fail");
+    assert!(error.contains("socket_ifnam"), "got: {error}");
+}
+
+#[test]
+fn no_nccl_section_means_an_empty_env() {
+    let config = load_str(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert!(config.nccl_env().is_empty());
+    assert_eq!(config.nccl.socket_ifname(), None);
+}
+
+#[test]
+fn nccl_env_map_parses_and_resolves_with_socket_ifname() {
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_DEBUG = "WARN", NCCL_IB_GID_INDEX = "3" }
+        "#,
+    )
+    .expect("env config loads");
+    let env = config.nccl_env();
+    assert_eq!(env.get("NCCL_IB_HCA"), Some("mlx5_0,mlx5_1"));
+    assert_eq!(env.get("NCCL_DEBUG"), Some("WARN"));
+    assert_eq!(env.get("NCCL_IB_GID_INDEX"), Some("3"));
+    assert_eq!(env.get("NCCL_SOCKET_IFNAME"), Some("bond0"));
+    assert_eq!(env.len(), 4);
+}
+
+#[test]
+fn nccl_env_accepts_table_syntax() {
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        [nccl.env]
+        NCCL_P2P_LEVEL = "NVL"
+        "#,
+    )
+    .expect("config");
+    let env = config.nccl_env();
+    assert_eq!(env.get("NCCL_P2P_LEVEL"), Some("NVL"));
+    assert_eq!(env.get("NCCL_SOCKET_IFNAME"), Some("bond0"));
+    // `resolved_env` is the same map the accessor hands out.
+    assert_eq!(config.nccl.resolved_env(), &env);
+}
+
+#[test]
+fn non_nccl_env_keys_are_typed_config_errors() {
+    for key in ["LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "nccl_debug", "NCCL_"] {
+        let text = format!(
+            r#"
+            hosts = ["10.0.0.1"]
+            [nccl.env]
+            "{key}" = "x"
+            "#
+        );
+        let error = load_str(&text).expect_err("key must be rejected");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Nccl {
+                    source: NcclEnvError::InvalidKey { key: bad }
+                } if bad == key
+            ),
+            "{key}: got {error:?}"
+        );
+        // The serde-only path rejects it too.
+        let message = parse(&text).expect_err("serde path rejects");
+        assert!(message.contains(key), "{key}: got {message}");
+    }
+}
+
+#[test]
+fn socket_ifname_conflict_is_a_typed_config_error() {
+    let text = r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_SOCKET_IFNAME = "bond0" }
+    "#;
+    let error = load_str(text).expect_err("conflict must fail");
+    assert!(
+        matches!(
+            error,
+            ConfigError::Nccl {
+                source: NcclEnvError::SocketIfnameConflict
+            }
+        ),
+        "got {error:?}"
+    );
+    assert!(parse(text).is_err());
+
+    // Through the map alone it is just another knob.
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        env = { NCCL_SOCKET_IFNAME = "bond0" }
+        "#,
+    )
+    .expect("map-only ifname");
+    assert_eq!(config.nccl_env().get("NCCL_SOCKET_IFNAME"), Some("bond0"));
+    assert_eq!(config.nccl.socket_ifname(), None);
+}
+
+#[test]
+fn empty_and_nul_values_are_typed_config_errors() {
+    for (value, reason) in [
+        (r#""""#, NcclEnvValueError::Empty),
+        (r#""WA\u0000RN""#, NcclEnvValueError::ContainsNul),
+    ] {
+        let text = format!(
+            r#"
+            hosts = ["10.0.0.1"]
+            [nccl.env]
+            NCCL_DEBUG = {value}
+            "#
+        );
+        let error = load_str(&text).expect_err("bad value must fail");
+        assert!(
+            matches!(
+                &error,
+                ConfigError::Nccl {
+                    source: NcclEnvError::InvalidValue { key, reason: got }
+                } if key == "NCCL_DEBUG" && *got == reason
+            ),
+            "{value}: got {error:?}"
+        );
+    }
+    let error = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = ""
+        "#,
+    )
+    .expect_err("empty socket_ifname must fail");
+    assert!(
+        matches!(
+            &error,
+            ConfigError::Nccl {
+                source: NcclEnvError::InvalidValue {
+                    key,
+                    reason: NcclEnvValueError::Empty
+                }
+            } if key == "NCCL_SOCKET_IFNAME"
+        ),
+        "got {error:?}"
+    );
+}
+
+#[test]
+fn syntax_and_shape_errors_stay_parse_errors() {
+    let error = load_str("hosts = [").expect_err("broken TOML");
+    assert!(matches!(error, ConfigError::Parse { .. }), "got {error:?}");
+    // A non-string env value is a shape error, not an NCCL policy error.
+    let error = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl.env]
+        NCCL_IB_GID_INDEX = 3
+        "#,
+    )
+    .expect_err("integer value");
+    assert!(matches!(error, ConfigError::Parse { .. }), "got {error:?}");
 }

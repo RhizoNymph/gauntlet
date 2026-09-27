@@ -348,17 +348,22 @@ fn epoch_secs() -> u64 {
 /// the handshake). Order follows the config so host indices are stable.
 async fn connect_fleet(config: &FleetConfig, sink: &ObservationSink) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
+    // Set on every agent spawn's command line: the one path by which NCCL
+    // tuning reaches every communicator (sweep, barrier, both overlap
+    // steps) without the agent ever mutating its own environment.
+    let nccl_env = Arc::new(config.nccl_env());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
         count += 1;
         let ssh = config.ssh.clone();
+        let nccl_env = Arc::clone(&nccl_env);
         let permits = Arc::clone(&permits);
         let sink = sink.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh).await {
+            match HostSession::connect(host, &ssh, &nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
                     sink.error(&addr, format!("ssh connect failed: {error:#}"));

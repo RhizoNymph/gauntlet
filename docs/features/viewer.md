@@ -49,6 +49,11 @@ connected fleet graph plus a quantitative metric table.
   aggregates are re-derived on load.
 - Diff mode is noise-aware: when both runs carry spreads (n >= 2), a delta
   must clear ~2x the pooled spread in addition to the 5%/15% floors.
+- NCCL tuning drift (schema v8 `nccl_env`): diff mode shows an "nccl env
+  drift" chip and one line per added/removed/changed NCCL_* key vs the
+  baseline (`DiffView.nccl_env_drift`, via
+  `gauntlet::report::nccl_env::nccl_env_drift`); the overview shows the
+  run's env. Drift is context for NCCL deltas, never a node regression.
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report
@@ -104,7 +109,8 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/diff.rs` — pure run-to-run diff: `DiffView::new(current,
   baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
   improved flag) plus node/edge regression severities and capped issue
-  lists. `higher_is_better(unit)` is the direction-of-goodness oracle.
+  lists, and `nccl_env_drift` (NCCL tuning differences vs the baseline).
+  `higher_is_better(unit)` is the direction-of-goodness oracle.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
   (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals
   shadow stale partials), `effective_baseline`, `scan` (directory scan

@@ -131,6 +131,7 @@ mod tests {
             aggregates: Default::default(),
             finished_epoch_secs: 2,
             hosts: BTreeMap::new(),
+            nccl_env: BTreeMap::new(),
             fleet: FleetAnalysis::default(),
             calibration: Calibration::default(),
         }

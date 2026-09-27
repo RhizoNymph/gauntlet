@@ -6,6 +6,7 @@
 //! second source of truth.
 
 pub mod history;
+pub mod nccl_env;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -40,7 +41,10 @@ use crate::proto::{
 // groups and derived overlap_retention.fleet_gemm_<dtype> /
 // overlap_retention.fleet_all_reduce records. No field changed shape, so
 // pre-v7 documents decode unchanged (they simply lack the new groups).
-pub const SCHEMA_VERSION: u32 = 7;
+// v8: run-level `nccl_env` — the resolved NCCL environment every NCCL
+// communicator in the run was created under. Defaults to empty, so pre-v8
+// documents decode as untuned runs.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -75,6 +79,15 @@ pub struct RunResults {
     #[serde(default)]
     pub debug_build: bool,
     pub hosts: BTreeMap<String, HostObservations>,
+    /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
+    /// NCCL_SOCKET_IFNAME) sent to every host and every NCCL-creating
+    /// invocation. Run-level because it is fleet-uniform by construction;
+    /// baseline comparisons diff it (`nccl_env::nccl_env_drift`) since
+    /// tuning drift makes NCCL numbers incomparable. A plain string map
+    /// (not the validated wire type) so a document always decodes, even
+    /// under a future, different key policy.
+    #[serde(default)]
+    pub nccl_env: BTreeMap<String, String>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -370,6 +383,7 @@ pub fn build(
         finished_epoch_secs,
         debug_build: false,
         hosts: observations,
+        nccl_env: config.nccl_env().to_string_map(),
         fleet,
         aggregates,
         calibration,
@@ -984,6 +998,11 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
             .finished_epoch_secs
             .saturating_sub(results.started_epoch_secs),
         verdict(results),
+    )?;
+    writeln!(
+        out,
+        "nccl env: {}",
+        nccl_env::format_nccl_env(&results.nccl_env)
     )?;
 
     render_hosts(results, out)?;

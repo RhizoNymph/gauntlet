@@ -37,7 +37,17 @@ Orchestrator phase-3 driver:
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth
 probes; ssh control traffic stays on `addr`. Without it, the target is
 `addr` stripped of user/port. NCCL interface selection is orthogonal:
-`[nccl] socket_ifname` pins NCCL_SOCKET_IFNAME (e.g. "bond0").
+`[nccl] socket_ifname` pins NCCL_SOCKET_IFNAME (e.g. "bond0") so NCCL's
+bootstrap and socket transport ride the data plane rather than whatever
+interface it would pick first. It stays the typed first-class knob for
+this; other NCCL tuning (NCCL_IB_HCA, NCCL_IB_GID_INDEX,
+NCCL_NET_GDR_LEVEL, ...) goes in `[nccl] env`. The orchestrator folds
+`socket_ifname` into that map as NCCL_SOCKET_IFNAME (setting it in both
+places is a config error) and sets the resolved map on the remote
+`env ... gauntlet agent ...` command line of every agent spawn, so it is
+in each rank's environment before the process starts (the agent never
+calls `set_var`; proto v7 dropped `socket_ifname` from the directives).
+See docs/features/nccl_env.md.
 
 ## Peer wire format (net.rs)
 First byte from client selects mode: 0x01 latency, 0x02 bandwidth, 0xFF

@@ -118,6 +118,9 @@ pub struct ViewModel {
     pub verdict: Verdict,
     /// The producing orchestrator/agent was an unoptimized build.
     pub debug_build: bool,
+    /// The run's resolved NCCL environment (empty for untuned or pre-v8
+    /// runs); diff mode compares it against the baseline's.
+    pub nccl_env: BTreeMap<String, String>,
     /// Sorted by host.
     pub nodes: Vec<NodeView>,
     /// Sorted by (a, b).
@@ -304,6 +307,7 @@ impl ViewModel {
         ViewModel {
             run_id: results.run_id.clone(),
             debug_build: results.debug_build,
+            nccl_env: results.nccl_env.clone(),
             wall_secs: results
                 .finished_epoch_secs
                 .saturating_sub(results.started_epoch_secs),

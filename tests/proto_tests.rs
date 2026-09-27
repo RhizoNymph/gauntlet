@@ -264,7 +264,6 @@ fn nccl_workloads_are_mutually_exclusive_by_construction() {
         unique_id_b64: "abc".into(),
         rank: 2,
         world_size: 3,
-        socket_ifname: Some("bond0".into()),
         workload: NcclWorkload::Overlap(OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,

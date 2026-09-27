@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 
 use super::deploy::AGENT_RELPATH;
 use crate::config::{HostConfig, SshConfig};
+use crate::nccl_env::NcclEnv;
 use crate::proto::{AgentEvent, PROTO_VERSION, decode_event};
 
 /// Captured result of a remote command that was allowed to fail.
@@ -68,12 +69,20 @@ pub struct HostSession {
     remote_dir: String,
     /// `<remote_dir>/bin/gauntlet-agent`.
     agent_path: String,
+    /// Pre-quoted `KEY=value` words placed between `env` and the agent
+    /// binary on every spawn (`agent_env_words`).
+    env_words: Vec<String>,
 }
 
 impl HostSession {
     /// Establish a session. `connect_timeout_secs` applies; errors carry the
     /// host address for attribution.
-    pub async fn connect(host: HostConfig, ssh: &SshConfig) -> Result<HostSession> {
+    /// `nccl_env` is set on every agent spawn of this session.
+    pub async fn connect(
+        host: HostConfig,
+        ssh: &SshConfig,
+        nccl_env: &NcclEnv,
+    ) -> Result<HostSession> {
         let timeout = Duration::from_secs(ssh.connect_timeout_secs.max(1));
 
         let mut builder = SessionBuilder::default();
@@ -114,12 +123,14 @@ impl HostSession {
         })??;
 
         let agent_path = format!("{remote_dir}/{AGENT_RELPATH}");
+        let env_words = agent_env_words(&remote_dir, nccl_env);
         debug!(host = %host.addr, remote_dir = %remote_dir, "ssh session established");
         Ok(HostSession {
             host,
             session,
             remote_dir,
             agent_path,
+            env_words,
         })
     }
 
@@ -135,14 +146,6 @@ impl HostSession {
     /// Absolute path of the deployed agent binary.
     pub fn agent_path(&self) -> &str {
         &self.agent_path
-    }
-
-    /// Environment for every agent invocation. `<remote_dir>/lib` holds
-    /// shim symlinks bootstrap may have created for runtime-only libraries
-    /// (e.g. libnccl.so -> libnccl.so.2); dlopen consults LD_LIBRARY_PATH
-    /// as captured at process start, so it must be set at spawn time.
-    fn agent_env(&self) -> String {
-        format!("LD_LIBRARY_PATH={}/lib", self.remote_dir)
     }
 
     /// Run a short remote command, capturing stdout (used by deploy for
@@ -252,7 +255,7 @@ impl HostSession {
     ) -> Result<ExitStatus> {
         let mut command = self.session.command("env");
         command
-            .arg(self.agent_env())
+            .raw_args(self.env_words.iter())
             .arg(self.agent_path.clone())
             // The deployed binary is the full multi-command CLI; node-side
             // modes all live under its `agent` subcommand.
@@ -341,7 +344,7 @@ impl HostSession {
     ) -> Result<RemoteOutput> {
         let mut command = self.session.command("env");
         command
-            .arg(self.agent_env())
+            .raw_args(self.env_words.iter())
             .arg(self.agent_path.clone())
             // The deployed binary is the full multi-command CLI; node-side
             // modes all live under its `agent` subcommand.
@@ -390,7 +393,7 @@ impl HostSession {
     pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
         let mut command = Arc::clone(&self.session).arc_command("env");
         command
-            .arg(self.agent_env())
+            .raw_args(self.env_words.iter())
             .arg(self.agent_path.clone())
             .arg("agent")
             .args(args.iter().copied())
@@ -482,6 +485,40 @@ async fn run_shell(session: &Session, addr: &str, script: &str) -> Result<Remote
     })
 }
 
+/// Environment words for every agent invocation, in order, each already a
+/// single quoted POSIX-sh word (they go through `raw_arg`, unescaped by
+/// openssh):
+///
+/// - `LD_LIBRARY_PATH=<remote_dir>/lib`: `<remote_dir>/lib` holds shim
+///   symlinks bootstrap may have created for runtime-only libraries (e.g.
+///   libnccl.so -> libnccl.so.2); dlopen consults LD_LIBRARY_PATH as
+///   captured at process start, so it must be set at spawn time.
+/// - one `NCCL_*=<value>` per resolved NCCL env entry, in key order. NCCL
+///   reads its knobs with `getenv` at communicator init; setting them here
+///   puts them in the environment before the agent starts any thread. The
+///   agent itself never calls `set_var` — it runs on a multi-threaded tokio
+///   runtime, where mutating the environment is unsound.
+///
+/// Keys are validated `^NCCL_[A-Z0-9_]+$` (literal shell words); values are
+/// single-quoted, so spaces, quotes, `$`, backticks and globs stay literal.
+pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<String> {
+    std::iter::once(format!(
+        "LD_LIBRARY_PATH={}",
+        single_quote(&format!("{remote_dir}/lib"))
+    ))
+    .chain(nccl_env_words(nccl_env))
+    .collect()
+}
+
+/// `KEY='value'` words for the NCCL env, in key order; empty for an empty
+/// env (no prefix at all).
+pub(crate) fn nccl_env_words(nccl_env: &NcclEnv) -> Vec<String> {
+    nccl_env
+        .iter()
+        .map(|(key, value)| format!("{key}={}", single_quote(value)))
+        .collect()
+}
+
 /// Quote `path` as a single POSIX-sh word. A leading `~` is turned into
 /// `$HOME` inside double quotes so the *remote* shell expands it; every other
 /// path is single-quoted verbatim.
@@ -538,6 +575,85 @@ mod tests {
         assert_eq!(shell_path("/opt/g x"), "'/opt/g x'");
         // A `~` that is not the first character is not a home reference.
         assert_eq!(shell_path("/opt/~x"), "'/opt/~x'");
+    }
+
+    fn nccl_env(entries: &[(&str, &str)]) -> NcclEnv {
+        let raw = entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        NcclEnv::from_map(&raw).expect("valid env")
+    }
+
+    #[test]
+    fn empty_nccl_env_adds_no_words() {
+        assert!(nccl_env_words(&NcclEnv::default()).is_empty());
+        assert_eq!(
+            agent_env_words("/home/u/.gauntlet", &NcclEnv::default()),
+            vec!["LD_LIBRARY_PATH='/home/u/.gauntlet/lib'".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_words_follow_ld_library_path_in_key_order() {
+        let raw = [("NCCL_IB_HCA", "mlx5_0,mlx5_1"), ("NCCL_DEBUG", "WARN")]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        let env = NcclEnv::resolve(Some("bond0"), &raw).expect("valid env");
+        assert_eq!(
+            agent_env_words("/opt/g", &env),
+            vec![
+                "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
+                "NCCL_DEBUG='WARN'".to_string(),
+                "NCCL_IB_HCA='mlx5_0,mlx5_1'".to_string(),
+                "NCCL_SOCKET_IFNAME='bond0'".to_string(),
+            ]
+        );
+    }
+
+    /// The real contract: after a POSIX shell parses the words (as the
+    /// remote login shell does), the process sees each value byte for byte
+    /// and nothing expands or executes.
+    #[test]
+    fn adversarial_values_survive_a_real_shell_verbatim() {
+        let values = [
+            "mlx5_0,mlx5_1",
+            "a b  c",
+            "it's",
+            "'''",
+            "\"double\"",
+            "$HOME",
+            "${PATH}",
+            "$(touch /nonexistent/pwned)",
+            "`id`",
+            "a;b|c&d>e<f",
+            "*",
+            "~",
+            "back\\slash",
+            "line\nbreak",
+            "tab\there",
+            "=mlx5_0:1",
+            "-x",
+            "^docker0,lo",
+            "\u{e9}t\u{e9}",
+        ];
+        for value in values {
+            let words = nccl_env_words(&nccl_env(&[("NCCL_TEST_VALUE", value)]));
+            let script = format!("env {} printenv NCCL_TEST_VALUE", words.join(" "));
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("run sh");
+            assert!(output.status.success(), "{value:?}: {script}");
+            let stdout = String::from_utf8(output.stdout).expect("utf8");
+            assert_eq!(
+                stdout.strip_suffix('\n'),
+                Some(value),
+                "value mangled by the shell: {script}"
+            );
+        }
     }
 
     #[test]

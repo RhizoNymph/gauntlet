@@ -14,8 +14,13 @@
 //! ranks emit only Fatal on error.
 //!
 //! One process per node, one GPU per rank for v1 (world_size == node count;
-//! intra-node NVLink is covered by the p2p test). `socket_ifname`, when
-//! set, is exported as NCCL_SOCKET_IFNAME before init.
+//! intra-node NVLink is covered by the p2p test).
+//!
+//! NCCL env (NCCL_SOCKET_IFNAME and any `[nccl] env` knobs) is never set
+//! here: the orchestrator puts it on the remote `env ... gauntlet agent`
+//! command line, so it is in the process environment before `main` builds
+//! the multi-threaded tokio runtime. `std::env::set_var` after that point
+//! would be unsound.
 //!
 //! Fleet overlap: the directive's `NcclWorkload::Overlap` runs the
 //! combined-load protocol instead of the sweep — an isolated fleet
@@ -198,13 +203,11 @@ pub mod imp {
     pub fn lead(directive: &NcclDirective) -> Result<()> {
         let NcclDirective::Lead {
             world_size,
-            socket_ifname,
             workload,
         } = directive
         else {
             bail!("lead requires a Lead directive");
         };
-        set_socket_ifname(socket_ifname);
 
         let sink = EventSink::stdout();
         sink.emit(&AgentEvent::Hello {
@@ -226,7 +229,6 @@ pub mod imp {
             unique_id_b64,
             rank,
             world_size,
-            socket_ifname,
             workload,
         } = directive
         else {
@@ -235,7 +237,6 @@ pub mod imp {
         if *rank == 0 {
             bail!("rank 0 must run the Lead directive");
         }
-        set_socket_ifname(socket_ifname);
         let id = decode_id(unique_id_b64)?;
         let sink = EventSink::stdout();
         sink.emit(&AgentEvent::Hello {
@@ -243,17 +244,6 @@ pub mod imp {
             hostname: crate::agent::hostname()?,
         });
         run_rank(&sink, false, id, *rank, *world_size, workload)
-    }
-
-    fn set_socket_ifname(socket_ifname: &Option<String>) {
-        if let Some(ifname) = socket_ifname {
-            // NCCL reads this once, at communicator init.
-            //
-            // SAFETY: nothing has been spawned yet — no communicator, no NCCL
-            // helper threads, no threads of our own — so no other thread can
-            // be reading the environment concurrently with this write.
-            unsafe { std::env::set_var("NCCL_SOCKET_IFNAME", ifname) };
-        }
     }
 
     fn run_rank(

@@ -26,7 +26,10 @@ use thiserror::Error;
 // message-size sweep or the combined GEMM + fleet all-reduce protocol,
 // mutually exclusive by construction), every rank reports
 // `OverlapFleetReport`, and the overlap_fleet test ids ride the wire.
-pub const PROTO_VERSION: u32 = 6;
+// v7: NCCL env passthrough — `socket_ifname` leaves the NCCL directives.
+// The resolved NCCL env (socket_ifname folded in as NCCL_SOCKET_IFNAME)
+// is set on the remote `env` command line at spawn, never on the wire.
+pub const PROTO_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -633,8 +636,6 @@ pub enum NcclDirective {
     /// socket lives in this process).
     Lead {
         world_size: u32,
-        /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
-        socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
     /// Ranks 1..n: join the lead's communicator and run the workload
@@ -644,7 +645,6 @@ pub enum NcclDirective {
         unique_id_b64: String,
         rank: u32,
         world_size: u32,
-        socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
 }
@@ -762,7 +762,6 @@ mod tests {
             unique_id_b64: "abc".into(),
             rank: 2,
             world_size: 4,
-            socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Sweep {
                 sizes: vec![1024],
                 iters_per_size: 20,
@@ -781,7 +780,6 @@ mod tests {
     fn overlap_workloads_ride_the_directive() {
         let directive = NcclDirective::Lead {
             world_size: 3,
-            socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Overlap(OverlapSpec {
                 duration_secs: 30,
                 baseline_secs: 5,

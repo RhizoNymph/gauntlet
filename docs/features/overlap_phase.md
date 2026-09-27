@@ -52,7 +52,11 @@ rounds × window cost for little extra attribution.
      `gpu::guard` (dlopen panics become findings, per the phase-2 pattern).
    - `execute`: one `CudaContext` per GPU; NCCL communicator via
      `Comm::from_devices` (`ncclCommInitAll`, single process, one rank per
-     GPU, each rank on its device's default stream). Warmup rounds, then
+     GPU, each rank on its device's default stream). The init sees the
+     run's NCCL env because the orchestrator set it on the `agent run`
+     spawn command line (`agent run` executes on the multi-threaded tokio
+     runtime, so the agent never mutates its own env;
+     docs/features/nccl_env.md). Warmup rounds, then
      the **isolated baseline**: `timed_rounds` drives grouped all-reduces
      (`ncclGroupStart`/`End`, `ROUND_ITERS` per sync) for `baseline_secs`.
    - **Combined window**: one plain thread per GPU
@@ -97,7 +101,8 @@ compute leg spans *every* local GPU (`gpu::worker`, one thread + one extra
 stream per GPU), so GPU 0's collective path contends with the whole node's
 compute, power, and PCIe pressure — the "every GPU loaded, fabric busy"
 regime training actually runs in. Rendezvous reuses the `agent nccl` relay
-(rank 0 mints the `NcclId`, the orchestrator relays it).
+(rank 0 mints the `NcclId`, the orchestrator relays it); the NCCL env
+arrives the same way as for the sweep, on the spawn command line.
 
 ### Window consensus without clock sync
 Both measurement windows (isolated baseline, then overlapped) must end

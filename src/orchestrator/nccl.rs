@@ -73,9 +73,9 @@ async fn nccl_world(
 
 /// What one fleet-wide `agent nccl` job runs, beyond the world itself. The
 /// lead and participant directives differ only in rendezvous plumbing, so
-/// one job builds both.
+/// one job builds both. NCCL env is not part of the job: every session
+/// sets it on the agent's spawn command line (`HostSession::connect`).
 struct NcclJob {
-    socket_ifname: Option<String>,
     workload: NcclWorkload,
 }
 
@@ -83,7 +83,6 @@ impl NcclJob {
     fn lead(&self, world_size: u32) -> NcclDirective {
         NcclDirective::Lead {
             world_size,
-            socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
@@ -93,7 +92,6 @@ impl NcclJob {
             unique_id_b64: unique_id_b64.to_string(),
             rank,
             world_size,
-            socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
@@ -304,7 +302,6 @@ pub(super) async fn nccl_sweep(
         })
     };
     let job = NcclJob {
-        socket_ifname: config.nccl.socket_ifname.clone(),
         workload: NcclWorkload::Sweep {
             sizes: config.tests.nccl_sizes.clone(),
             iters_per_size: config.tests.nccl_iters_per_size,
@@ -396,7 +393,6 @@ pub(super) async fn overlap_fleet_sweep(
         })
     };
     let job = NcclJob {
-        socket_ifname: config.nccl.socket_ifname.clone(),
         workload: NcclWorkload::Overlap(spec),
     };
     let failures = drive_fleet_nccl(

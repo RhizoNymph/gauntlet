@@ -1052,3 +1052,70 @@ fn rooflines_reduce_over_per_subject_medians() {
         Some(3000.0)
     );
 }
+
+// ---------------------------------------------------------------------------
+// NCCL env in the results document (schema v8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn results_record_the_resolved_nccl_env() {
+    let config = FleetConfig::from_toml_str(
+        r#"
+        hosts = ["a", "b"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_DEBUG = "WARN" }
+        "#,
+        std::path::Path::new("inline.toml"),
+    )
+    .expect("config");
+    let results = report::build(&config, BTreeMap::new(), 1, 2);
+    assert_eq!(results.schema_version, report::SCHEMA_VERSION);
+    let expected: BTreeMap<String, String> = [
+        ("NCCL_DEBUG", "WARN"),
+        ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+        ("NCCL_SOCKET_IFNAME", "bond0"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    assert_eq!(results.nccl_env, expected);
+    assert_eq!(results.nccl_env, config.nccl_env().to_string_map());
+
+    // The document round-trips, and the table names the tuning up front.
+    let json = serde_json::to_string(&results).expect("serialize");
+    let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.nccl_env, expected);
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let rendered = String::from_utf8(rendered).expect("utf8");
+    assert!(
+        rendered.contains(
+            "nccl env: NCCL_DEBUG=WARN NCCL_IB_HCA=mlx5_0,mlx5_1 NCCL_SOCKET_IFNAME=bond0"
+        ),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn untuned_runs_and_pre_v8_documents_carry_an_empty_nccl_env() {
+    let results = report::build(&config_for(&["a"]), BTreeMap::new(), 1, 2);
+    assert!(results.nccl_env.is_empty());
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (none)")
+    );
+
+    // A v7 document has no nccl_env field at all.
+    let mut value = serde_json::to_value(&results).expect("to value");
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("nccl_env")
+        .expect("field present in v8");
+    let old: report::RunResults = serde_json::from_value(value).expect("pre-v8 decodes");
+    assert!(old.nccl_env.is_empty());
+}
