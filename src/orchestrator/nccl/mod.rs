@@ -514,10 +514,20 @@ pub(super) async fn nccl_sweep(
     sink: &ObservationSink,
 ) {
     let world = nccl_world(sessions, inventories).await;
+    let world_size = world.world_size();
+    if let Some(skipped) = sweep_gate(world_size) {
+        info!(
+            world_size,
+            "fewer than two NCCL ranks; skipping the fleet sweep"
+        );
+        for (session, _) in world.members() {
+            emit_outcomes(sink, session.addr(), skipped.clone());
+        }
+        return;
+    }
     let Some((lead, _)) = world.members().first() else {
         return;
     };
-    let world_size = world.world_size();
     info!(
         world_size,
         hosts = world.member_count(),
@@ -706,6 +716,26 @@ pub(super) async fn overlap_fleet_sweep(
     }
 }
 
+/// The fleet sweep needs a peer: with fewer than two ranks an "all-reduce"
+/// is a local copy, and its timings would feed the `_rank_per_gpu` link
+/// fits a link that does not exist. Returns the Skipped outcomes to record
+/// on every world member, or `None` when the sweep should run. The gate is
+/// on ranks, not hosts: one host with two GPUs is a real two-rank world.
+fn sweep_gate(world_size: u32) -> Option<Vec<records::OutcomeRecord>> {
+    (world_size < 2).then(|| {
+        let reason = format!("fleet nccl sweep needs at least 2 ranks, found {world_size}");
+        [TestId::NcclAllReduce, TestId::NcclAllGather]
+            .into_iter()
+            .map(|test| {
+                let outcome = TestOutcome::Skipped {
+                    reason: reason.clone(),
+                };
+                (test, Scope::Node, outcome)
+            })
+            .collect()
+    })
+}
+
 fn emit_outcomes(sink: &ObservationSink, host: &str, outcomes: Vec<records::OutcomeRecord>) {
     for (test, scope, outcome) in outcomes {
         sink.event(
@@ -737,6 +767,32 @@ mod tests {
                 msg_bytes: 64 << 20,
             }),
         }
+    }
+
+    #[test]
+    fn a_single_rank_world_skips_the_sweep() {
+        // One rank has no peer: an "all-reduce" is a local copy, so its
+        // timings would calibrate a link that does not exist.
+        for world_size in [0, 1] {
+            let outcomes = sweep_gate(world_size).expect("must skip");
+            let tests: Vec<TestId> = outcomes.iter().map(|(test, _, _)| *test).collect();
+            assert_eq!(tests, [TestId::NcclAllReduce, TestId::NcclAllGather]);
+            for (_, scope, outcome) in &outcomes {
+                assert_eq!(*scope, Scope::Node);
+                let TestOutcome::Skipped { reason } = outcome else {
+                    panic!("expected Skipped, got {outcome:?}");
+                };
+                assert!(reason.contains("at least 2 ranks"), "{reason}");
+                assert!(reason.contains(&format!("found {world_size}")), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_ranks_run_the_sweep_even_on_one_host() {
+        // A single host with two GPUs is a real two-rank world.
+        assert!(sweep_gate(2).is_none());
+        assert!(sweep_gate(16).is_none());
     }
 
     #[test]

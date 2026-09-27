@@ -395,6 +395,12 @@ Fleet NCCL world:
 - Fleet NCCL rank blocks tile `0..world_size` contiguously in fleet order,
   one rank per GPU, no zero-GPU host, global rank 0 on the first host's
   GPU 0; every directive's block lies inside its world by construction.
+- The fleet sweep never runs on a world of fewer than 2 ranks
+  (`orchestrator::nccl::sweep_gate`): a one-rank "all-reduce" is a local
+  copy, whose timings would calibrate the `_rank_per_gpu` fits with a link
+  that does not exist. Every member records Skipped for
+  `nccl_all_reduce` / `nccl_all_gather` with the rank count as the reason.
+  The gate is on ranks, not hosts — one host with 2+ GPUs is a real world.
 - One `agent nccl` process per host, whatever its GPU count; grouped init
   is all-or-nothing per host, and nothing fallible but `ncclCommInitRank`
   runs inside the init group.
