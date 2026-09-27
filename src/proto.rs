@@ -629,7 +629,7 @@ pub enum NcclWorkload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "directive", rename_all = "snake_case")]
+#[serde(tag = "directive", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NcclDirective {
     /// Rank 0: mint the rendezvous id, announce it as an `NcclId` event, and
     /// stay alive through the whole workload (the id's bootstrap listen
@@ -743,7 +743,7 @@ mod tests {
     #[test]
     fn sweep_workloads_default_the_barrier_absent() {
         // A sweep directive written without the optional barrier probe.
-        let json = r#"{"directive":"lead","world_size":4,"socket_ifname":null,
+        let json = r#"{"directive":"lead","world_size":4,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         let directive: NcclDirective = serde_json::from_str(json).expect("decode sweep lead");
         let NcclDirective::Lead {
@@ -792,6 +792,26 @@ mod tests {
         assert!(json.contains(r#""kind":"overlap""#), "{json}");
         let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, directive);
+    }
+
+    #[test]
+    fn stale_directive_fields_fail_loudly() {
+        // v6's socket_ifname (now set on the spawn command line) must not be
+        // silently ignored, for either variant.
+        for json in [
+            r#"{"directive":"lead","world_size":2,"socket_ifname":"bond0",
+                "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#,
+            r#"{"directive":"participate","unique_id_b64":"abc","rank":1,"world_size":2,
+                "socket_ifname":null,
+                "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#,
+        ] {
+            let error = serde_json::from_str::<NcclDirective>(json).expect_err("stale field");
+            assert!(error.to_string().contains("socket_ifname"), "{error}");
+        }
+        // The same documents without it decode.
+        let clean = r#"{"directive":"participate","unique_id_b64":"abc","rank":1,
+            "world_size":2,"workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+        assert!(serde_json::from_str::<NcclDirective>(clean).is_ok());
     }
 
     #[test]

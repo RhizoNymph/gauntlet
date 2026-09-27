@@ -248,7 +248,7 @@ fn fleet_overlap_events_round_trip() {
 fn nccl_workloads_are_mutually_exclusive_by_construction() {
     use gauntlet::proto::{NcclDirective, NcclWorkload, OverlapSpec};
     // A sweep workload written without the optional barrier probe.
-    let sweep = r#"{"directive":"lead","world_size":3,"socket_ifname":null,
+    let sweep = r#"{"directive":"lead","world_size":3,
         "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
     let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
     let NcclDirective::Lead {
