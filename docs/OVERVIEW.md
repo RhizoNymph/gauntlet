@@ -114,7 +114,8 @@ Features Index:
       ncclCommInitAll, NVLink/PCIe) via the per-node fan-out; per-size
       series feed calibration link classes
       nccl_{allreduce,allgather}_intranode_<n>gpu, and a per-node
-      bus_gib_per_sec_peak headline is MAD-compared across nodes (degraded
+      bus_gib_per_sec_peak_<n>gpu headline is MAD-compared across nodes of
+      the same GPU count (degraded
       NVLink, downtrained PCIe switch, missing P2P path). Then pairwise TCP
       RTT distribution (p50/p99) and bandwidth via agent peer mode,
       tournament-scheduled full mesh. Then the fleet NCCL sweep (one rank

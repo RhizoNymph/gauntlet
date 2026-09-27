@@ -483,6 +483,16 @@ fn intranode_sweep_spec_rides_the_task_spec() {
 }
 
 #[test]
+fn intranode_headline_names_carry_the_topology() {
+    use gauntlet::proto::nccl_metric;
+    assert_eq!(nccl_metric::bus_peak(8), "bus_gib_per_sec_peak_8gpu");
+    assert_eq!(nccl_metric::bus_peak(4), "bus_gib_per_sec_peak_4gpu");
+    assert_ne!(nccl_metric::bus_peak(8), nccl_metric::bus_peak(4));
+    assert!(nccl_metric::bus_peak(2).starts_with(nccl_metric::BUS_PEAK_PREFIX));
+    assert_eq!(nccl_metric::gpu_class_suffix(8), "8gpu");
+}
+
+#[test]
 fn intranode_test_ids_and_metrics_round_trip() {
     for (test, wire) in [
         (TestId::NcclIntraAllReduce, "nccl_intra_all_reduce"),
@@ -497,7 +507,7 @@ fn intranode_test_ids_and_metrics_round_trip() {
             ("elapsed_us", Unit::Micros),
             ("msg_bytes", Unit::Bytes),
             ("bus_gib_per_sec", Unit::GibPerSec),
-            ("bus_gib_per_sec_peak", Unit::GibPerSec),
+            ("bus_gib_per_sec_peak_8gpu", Unit::GibPerSec),
             ("ranks", Unit::Count),
         ] {
             let event = AgentEvent::Metric {

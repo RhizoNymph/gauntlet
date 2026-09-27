@@ -85,20 +85,32 @@ shows. The level also calibrates the simulator's intra-node link class.
    `elapsed_us`, `msg_bytes`, `bus_gib_per_sec` under
    `nccl_intra_all_reduce` / `nccl_intra_all_gather` (`sweep::point_records`,
    the fleet sweep's exact shape). After the sweep, per collective
-   (`intranode::summary`): `bus_gib_per_sec_peak` (headline) and `ranks`
+   (`intranode::summary`): `bus_gib_per_sec_peak_<n>gpu` (headline, named
+   by `proto::nccl_metric::bus_peak`) and `ranks`
    (communicator size) plus a Passed outcome — or Skipped when no
    configured size could run for that collective (all-gather sizes too
    small to shard across the GPUs).
 
 ### Headline metric choice
-`bus_gib_per_sec_peak` is the **maximum** bus bandwidth across the sweep's
+`bus_gib_per_sec_peak_<n>gpu` is the **maximum** bus bandwidth across the sweep's
 sizes, not the value at the largest size: the largest configured size is
 not guaranteed to be the saturating one (a sweep capped below the knee, an
 all-gather leg skipped at the top), and the best achieved figure is what
 operators compare to the link's peak. Non-finite values are ignored; no
 finite value means no headline (and the Skipped outcome above). It is one
 value per node per repeat, so the fleet-comparability rule MADs it across
-nodes — the straggler signal. The per-size groups repeat their sample key
+nodes — the straggler signal.
+
+The name carries the communicator size (`_<n>gpu`, the same suffix as the
+calibration link classes, `nccl_metric::gpu_class_suffix`), so every
+topology is its own MAD group: an 8-GPU NVLink node (~200 GiB/s) is never
+compared against a 4-GPU PCIe node (~20 GiB/s). Under one shared group a
+healthy minority topology would be flagged wholesale and a degraded node
+inside it could not be told from its peers. The consequence is that a
+topology needs at least 4 nodes (`flag_outliers`' minimum) before its
+nodes can be flagged at all; a smaller group reports its values but never
+flags. Keying happens at emission rather than in report grouping so the
+report stays generic — no metric-specific grouping rule. The per-size groups repeat their sample key
 and are excluded from MAD (they feed calibration).
 
 ### Bus bandwidth
@@ -206,6 +218,7 @@ by construction.
   outcomes for both intra-node tests, never a silent gap and never a
   failed-host verdict (the agent itself exits cleanly).
 - Intra-node per-size series are never MAD-compared; the
-  `bus_gib_per_sec_peak` headline (one per node per repeat) always is.
+  `bus_gib_per_sec_peak_<n>gpu` headline (one per node per repeat) always
+  is, and only against nodes with the same GPU count.
 - Intra-node link classes never mix GPU counts, and intra-node points
   never enter the fleet classes (distinct TestIds).

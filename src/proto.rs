@@ -528,12 +528,28 @@ pub mod nccl_metric {
     pub const MSG_BYTES: &str = "msg_bytes";
     /// Bus bandwidth at one message size.
     pub const BUS: &str = "bus_gib_per_sec";
-    /// Intra-node only: the best bus bandwidth across the sweep's sizes,
-    /// one value per node — the fleet-comparable straggler headline.
-    pub const BUS_PEAK: &str = "bus_gib_per_sec_peak";
+    /// Intra-node only: prefix of the per-node headline, the best bus
+    /// bandwidth across the sweep's sizes. Always emitted keyed by
+    /// communicator size (`bus_peak`), never bare.
+    pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
     /// Intra-node only: ranks (local GPUs) in the communicator; keys the
     /// intra-node calibration link class.
     pub const RANKS: &str = "ranks";
+
+    /// Topology suffix shared by the intra-node headline and the intra-node
+    /// calibration link classes: `<n>gpu`.
+    pub fn gpu_class_suffix(gpus: u32) -> String {
+        format!("{gpus}gpu")
+    }
+
+    /// Intra-node headline name for a communicator of `gpus` ranks:
+    /// `bus_gib_per_sec_peak_<n>gpu`. Different GPU counts are different
+    /// links (8-GPU NVLink vs 4-GPU PCIe), so each gets its own metric —
+    /// and therefore its own MAD comparison group — just like its own
+    /// calibration link class.
+    pub fn bus_peak(gpus: u32) -> String {
+        format!("{BUS_PEAK_PREFIX}_{}", gpu_class_suffix(gpus))
+    }
 }
 
 /// Parameters of an overlap step: sustained GEMM on every GPU concurrently

@@ -43,7 +43,7 @@ use crate::proto::{
 // pre-v7 documents decode unchanged (they simply lack the new groups).
 // v8: intra-node NCCL sweep — nccl_intra_all_reduce / nccl_intra_all_gather
 // metric groups (per-size series plus the fleet-comparable
-// bus_gib_per_sec_peak headline) and calibration.links classes
+// bus_gib_per_sec_peak_<n>gpu headline) and calibration.links classes
 // nccl_{allreduce,allgather}_intranode_<n>gpu. No field changed shape.
 pub const SCHEMA_VERSION: u32 = 8;
 

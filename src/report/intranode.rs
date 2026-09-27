@@ -30,7 +30,7 @@ pub const LINK_PREFIXES: [(TestId, &str); 2] = [
 
 /// Link-class key for one intra-node collective at one communicator size.
 pub fn link_class(prefix: &str, gpus: u32) -> String {
-    format!("{prefix}_{gpus}gpu")
+    format!("{prefix}_{}", nccl_metric::gpu_class_suffix(gpus))
 }
 
 /// `(msg_bytes, elapsed_us)` points of one intra-node test across the
@@ -127,7 +127,7 @@ mod tests {
                 .push(record(test, "bus_gib_per_sec", 100.0, repeat));
         }
         obs.metrics
-            .push(record(test, "bus_gib_per_sec_peak", 100.0, repeat));
+            .push(record(test, &nccl_metric::bus_peak(gpus), 100.0, repeat));
         obs.metrics
             .push(record(test, "ranks", f64::from(gpus), repeat));
     }

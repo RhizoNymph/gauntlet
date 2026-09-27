@@ -8,8 +8,11 @@
 //! report excludes it from MAD and fits it into `calibration.links`), then
 //! one node-level headline per collective:
 //!
-//! - `bus_gib_per_sec_peak`: the best bus bandwidth across the sweep's
-//!   sizes. One value per node, so it is fleet-comparable — the straggler
+//! - `bus_gib_per_sec_peak_<n>gpu`: the best bus bandwidth across the
+//!   sweep's sizes, named by communicator size so nodes are only ever
+//!   MAD-compared against nodes of the same GPU count (an 8-GPU NVLink
+//!   node and a 4-GPU PCIe node are different links). One value per node
+//!   per topology group, so it is fleet-comparable — the straggler
 //!   signal for degraded NVLink, a downtrained PCIe switch, or a missing
 //!   P2P path that pairwise p2p numbers can hide under collective traffic.
 //! - `ranks`: the communicator size (local GPU count), which keys the
@@ -149,7 +152,7 @@ pub fn peak_bus_gib_per_sec(
 }
 
 /// Node-level records and outcomes once the sweep completed: per
-/// collective, `bus_gib_per_sec_peak` + `ranks` and Passed, or Skipped
+/// collective, `bus_gib_per_sec_peak_<n>gpu` + `ranks` and Passed, or Skipped
 /// when no size of that collective could run (all-gather on sizes too
 /// small to shard across the local GPUs).
 pub fn summary(
@@ -163,13 +166,17 @@ pub fn summary(
         match peak_bus_gib_per_sec(points, collective, world) {
             Some(peak) => {
                 for (name, value, unit) in [
-                    (nccl_metric::BUS_PEAK, peak, Unit::GibPerSec),
-                    (nccl_metric::RANKS, f64::from(world.get()), Unit::Count),
+                    (nccl_metric::bus_peak(world.get()), peak, Unit::GibPerSec),
+                    (
+                        nccl_metric::RANKS.to_string(),
+                        f64::from(world.get()),
+                        Unit::Count,
+                    ),
                 ] {
                     records.push(MetricRecord {
                         test,
                         scope: Scope::Node,
-                        name: name.to_string(),
+                        name,
                         value,
                         unit,
                         repeat: 0,
@@ -410,13 +417,13 @@ mod tests {
             [
                 (
                     TestId::NcclIntraAllReduce,
-                    "bus_gib_per_sec_peak",
+                    "bus_gib_per_sec_peak_4gpu",
                     Unit::GibPerSec
                 ),
                 (TestId::NcclIntraAllReduce, "ranks", Unit::Count),
                 (
                     TestId::NcclIntraAllGather,
-                    "bus_gib_per_sec_peak",
+                    "bus_gib_per_sec_peak_4gpu",
                     Unit::GibPerSec
                 ),
                 (TestId::NcclIntraAllGather, "ranks", Unit::Count),

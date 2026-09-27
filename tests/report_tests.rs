@@ -1076,7 +1076,7 @@ fn intranode_sweep(obs: &mut HostObservations, gpus: u32, peak: f64) {
         }
         obs.metrics.push(node_metric(
             test,
-            "bus_gib_per_sec_peak",
+            &gauntlet::proto::nccl_metric::bus_peak(gpus),
             peak,
             Unit::GibPerSec,
         ));
@@ -1105,8 +1105,8 @@ fn intranode_headline_flags_a_degraded_node_but_the_series_never_does() {
     let results = report::build(&config, observations, 1, 2);
 
     for group in [
-        "nccl_intra_all_reduce.bus_gib_per_sec_peak",
-        "nccl_intra_all_gather.bus_gib_per_sec_peak",
+        "nccl_intra_all_reduce.bus_gib_per_sec_peak_8gpu",
+        "nccl_intra_all_gather.bus_gib_per_sec_peak_8gpu",
     ] {
         // The headline is one value per node: fleet-comparable.
         assert_eq!(results.aggregates[group].len(), names.len(), "{group}");
@@ -1121,6 +1121,87 @@ fn intranode_headline_flags_a_degraded_node_but_the_series_never_does() {
             assert!(!results.aggregates.contains_key(&group), "{group}");
             assert!(!results.fleet.outliers.contains_key(&group), "{group}");
         }
+    }
+    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+}
+
+/// Mixed-topology fleet: `majority` 8-GPU NVLink nodes around 200 GiB/s
+/// plus `minority` 4-GPU PCIe nodes around 20 GiB/s. `degraded`, when set,
+/// is a 4-GPU node whose peak is a fraction of its 4-GPU peers.
+fn mixed_fleet(
+    majority: usize,
+    minority: usize,
+    degraded: Option<&str>,
+) -> (FleetConfig, BTreeMap<String, HostObservations>) {
+    let mut names = Vec::new();
+    let mut observations = BTreeMap::new();
+    for i in 0..majority {
+        let name = format!("big{i:02}");
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, 8, 200.0 + i as f64);
+        observations.insert(name.clone(), obs);
+        names.push(name);
+    }
+    for i in 0..minority {
+        let name = format!("small{i:02}");
+        let peak = if degraded == Some(name.as_str()) {
+            6.0
+        } else {
+            20.0 + 0.1 * i as f64
+        };
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, 4, peak);
+        observations.insert(name.clone(), obs);
+        names.push(name);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    (config_for(&refs), observations)
+}
+
+#[test]
+fn a_healthy_minority_topology_is_never_a_straggler() {
+    // 10x 8-GPU NVLink (~200 GiB/s) + 3x 4-GPU PCIe (~20 GiB/s): under one
+    // shared group every 4-GPU node would be a 10x low outlier.
+    let (config, observations) = mixed_fleet(10, 3, None);
+    let results = report::build(&config, observations, 1, 2);
+    for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+        let big = format!("{test}.bus_gib_per_sec_peak_8gpu");
+        let small = format!("{test}.bus_gib_per_sec_peak_4gpu");
+        // Each topology is its own comparison group...
+        assert_eq!(results.aggregates[&big].len(), 10, "{big}");
+        assert_eq!(results.aggregates[&small].len(), 3, "{small}");
+        assert!(
+            results.aggregates[&big]
+                .keys()
+                .all(|key| key.starts_with("big"))
+        );
+        // ...so nobody is flagged: the 8-GPU group is healthy, and three
+        // 4-GPU nodes are below flag_outliers' minimum sample count.
+        assert!(!results.fleet.outliers.contains_key(&big), "{big}");
+        assert!(!results.fleet.outliers.contains_key(&small), "{small}");
+        assert!(
+            !results
+                .aggregates
+                .contains_key(&format!("{test}.bus_gib_per_sec_peak"))
+        );
+    }
+    assert_eq!(report::verdict(&results), Verdict::Clean);
+}
+
+#[test]
+fn a_degraded_node_is_found_within_its_own_topology() {
+    // Enough 4-GPU nodes for a comparison: the degraded one stands out
+    // against its peers, and no healthy 4-GPU node is flagged.
+    let (config, observations) = mixed_fleet(10, 6, Some("small03"));
+    let results = report::build(&config, observations, 1, 2);
+    for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+        let small = format!("{test}.bus_gib_per_sec_peak_4gpu");
+        let flagged = results.fleet.outliers.get(&small).expect(&small);
+        let keys: Vec<&str> = flagged.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["small03"], "{small}");
+        assert!(flagged[0].deviation_mads < 0.0, "a low outlier");
+        let big = format!("{test}.bus_gib_per_sec_peak_8gpu");
+        assert!(!results.fleet.outliers.contains_key(&big), "{big}");
     }
     assert_eq!(report::verdict(&results), Verdict::Stragglers);
 }

@@ -42,7 +42,7 @@ produce the same shape:
 ## Key formats (contract with the orchestrator)
 - `metric_key(test, name)` = "<test_display_name>.<name>", e.g.
   `mem_bandwidth.triad`, `nccl_all_reduce.elapsed_us`,
-  `nccl_intra_all_reduce.bus_gib_per_sec_peak`. NCCL sweep metric names
+  `nccl_intra_all_reduce.bus_gib_per_sec_peak_8gpu`. NCCL sweep metric names
   are the `proto::nccl_metric` consts, shared by emitters and extraction.
 - `scope_label(scope)`: `Node` → `None`; `Core{3}` → `core3`;
   `Numa{0}` → `numa0`; `Gpu{1}` → `gpu1`; `GpuPair{0,2}` → `gpupair0-2`;
@@ -55,9 +55,11 @@ A group is a fleet comparison only when every sample key in it is
 distinct. A repeated key means the metric is a per-host *series*, not one
 reading per subject: the NCCL sweeps emit `msg_bytes`/`elapsed_us` once per
 message size, so their spread is the design, not a straggler signal. The
-intra-node sweep's `bus_gib_per_sec_peak` and `ranks` are one value per
-node, so they *are* fleet comparisons — the peak is the intra-node
-straggler headline. Such
+intra-node sweep's `bus_gib_per_sec_peak_<n>gpu` and `ranks` are one
+value per node, so they *are* fleet comparisons — the peak is the
+intra-node straggler headline. Its name carries the GPU count, so nodes
+are only compared within their own topology (the same keying as the
+`_<n>gpu` link classes); a topology with fewer than 4 nodes never flags. Such
 groups are skipped by MAD analysis (they feed `calibration.links` instead).
 Absolute thresholds still apply to them, since a configured bound is an
 explicit per-value opt-in.
