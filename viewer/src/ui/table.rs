@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use gauntlet::proto::Unit;
+use gauntlet::report::nccl_env::format_nccl_env;
 
 use super::{
     BAD, BG, MUTED, OK, PANEL, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN,
@@ -98,6 +99,7 @@ impl RootView {
             };
             let (warned, failed) = (count(Severity::Warn), count(Severity::Bad));
             let regressed_links = diff.edge_severity.len();
+            let drift = diff.nccl_env_drift.as_ref();
             card = card
                 .child(title(format!("diff vs {}", diff.baseline_run_id)))
                 .child(
@@ -121,8 +123,25 @@ impl RootView {
                                     if regressed_links == 1 { "" } else { "s" }
                                 ),
                             ))
+                        })
+                        .when(drift.is_some_and(|d| !d.is_empty()), |row| {
+                            row.child(chip(WARN, "nccl env drift".into()))
                         }),
                 );
+            // Tuning drift explains (or invalidates) NCCL deltas, so it is
+            // spelled out, not just flagged.
+            if let Some(changes) = drift.filter(|d| !d.is_empty()) {
+                let mut drift = div().flex().flex_col().gap_1();
+                for change in changes {
+                    drift = drift.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(WARN))
+                            .child(change.describe()),
+                    );
+                }
+                card = card.child(drift);
+            }
         } else {
             // Chips split by cause: performance findings vs version skew,
             // so "outliers" never means "merely unpatched".
@@ -171,6 +190,15 @@ impl RootView {
                     .when(skewed > 0, |row| {
                         row.child(chip(WARN, format!("{skewed} version skew")))
                     }),
+            );
+            card = card.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "nccl env: {}",
+                        format_nccl_env(vm.nccl_env.as_ref())
+                    )),
             );
         }
 

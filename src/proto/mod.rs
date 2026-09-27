@@ -39,7 +39,11 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // `AGENT_EXIT_CASCADE` when it stopped because the fleet stopped.
 // v8: intra-node NCCL sweep — `AgentTaskSpec.nccl_intranode` and the
 // `nccl_intra_all_reduce` / `nccl_intra_all_gather` test ids.
-pub const PROTO_VERSION: u32 = 8;
+// v9: NCCL env passthrough — `socket_ifname` leaves the NCCL directives
+// (now `deny_unknown_fields`). The resolved NCCL env (socket_ifname folded
+// in as NCCL_SOCKET_IFNAME) is set on the remote `env` command line at
+// spawn, never on the wire.
+pub const PROTO_VERSION: u32 = 9;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -725,7 +729,7 @@ pub enum NcclWorkload {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "directive", rename_all = "snake_case")]
+#[serde(tag = "directive", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NcclDirective {
     /// The host holding global rank 0 (its block starts at 0): mint the
     /// rendezvous id, announce it as an `NcclId` event, and stay alive
@@ -733,8 +737,6 @@ pub enum NcclDirective {
     /// in this process). Drives every rank of its block.
     Lead {
         assignment: RankAssignment,
-        /// Value for NCCL_SOCKET_IFNAME, if the cluster needs it.
-        socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
     /// Every other host: join the lead's communicator with every rank of
@@ -743,7 +745,6 @@ pub enum NcclDirective {
     Participate {
         unique_id_b64: String,
         assignment: RankAssignment,
-        socket_ifname: Option<String>,
         workload: NcclWorkload,
     },
 }
@@ -849,7 +850,6 @@ mod tests {
         // A sweep directive written without the optional barrier probe.
         let json = r#"{"directive":"lead",
             "assignment":{"block":{"base":0,"count":8},"world_size":16},
-            "socket_ifname":null,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         let directive: NcclDirective = serde_json::from_str(json).expect("decode sweep lead");
         let NcclDirective::Lead {
@@ -869,7 +869,6 @@ mod tests {
         let directive = NcclDirective::Participate {
             unique_id_b64: "abc".into(),
             assignment: assignment(8, 8, 24),
-            socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Sweep {
                 sizes: vec![1024],
                 iters_per_size: 20,
@@ -888,7 +887,6 @@ mod tests {
     fn overlap_workloads_ride_the_directive() {
         let directive = NcclDirective::Lead {
             assignment: assignment(0, 4, 12),
-            socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Overlap(OverlapSpec {
                 duration_secs: 30,
                 baseline_secs: 5,
@@ -904,16 +902,39 @@ mod tests {
     }
 
     #[test]
+    fn stale_directive_fields_fail_loudly() {
+        // socket_ifname (now set on the spawn command line) must not be
+        // silently ignored, for either variant.
+        for json in [
+            r#"{"directive":"lead",
+                "assignment":{"block":{"base":0,"count":2},"world_size":4},
+                "socket_ifname":"bond0",
+                "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#,
+            r#"{"directive":"participate","unique_id_b64":"abc",
+                "assignment":{"block":{"base":2,"count":2},"world_size":4},
+                "socket_ifname":null,
+                "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#,
+        ] {
+            let error = serde_json::from_str::<NcclDirective>(json).expect_err("stale field");
+            assert!(error.to_string().contains("socket_ifname"), "{error}");
+        }
+        // The same documents without it decode.
+        let clean = r#"{"directive":"participate","unique_id_b64":"abc",
+            "assignment":{"block":{"base":2,"count":2},"world_size":4},
+            "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
+        assert!(serde_json::from_str::<NcclDirective>(clean).is_ok());
+    }
+
+    #[test]
     fn directives_with_an_invalid_rank_block_do_not_decode() {
         // The v6 single-rank shape is gone, and a block reaching past the
         // world is rejected at decode time rather than inside the agent.
         let v6 = r#"{"directive":"participate","unique_id_b64":"abc","rank":1,
-            "world_size":2,"socket_ifname":null,
+            "world_size":2,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         assert!(serde_json::from_str::<NcclDirective>(v6).is_err());
         let outside = r#"{"directive":"participate","unique_id_b64":"abc",
             "assignment":{"block":{"base":4,"count":8},"world_size":8},
-            "socket_ifname":null,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         assert!(serde_json::from_str::<NcclDirective>(outside).is_err());
     }

@@ -543,3 +543,29 @@ fn schema_v1_runs_without_aggregates_still_render_rows() {
     assert_eq!(row.n, 1);
     assert!(row.spread_mad.is_none());
 }
+
+#[test]
+fn view_model_carries_the_run_nccl_env() {
+    let tuned = config(
+        r#"
+        hosts = ["a", "b"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_DEBUG = "WARN" }
+        "#,
+    );
+    let vm = ViewModel::new(&results(&tuned, BTreeMap::new()));
+    let env = vm.nccl_env.expect("recorded");
+    assert_eq!(
+        env.get("NCCL_SOCKET_IFNAME").map(String::as_str),
+        Some("bond0")
+    );
+    assert_eq!(env.get("NCCL_DEBUG").map(String::as_str), Some("WARN"));
+
+    let untuned = config(r#"hosts = ["a", "b"]"#);
+    assert_eq!(
+        ViewModel::new(&results(&untuned, BTreeMap::new())).nccl_env,
+        Some(BTreeMap::new()),
+        "untuned is recorded as empty, not as unknown"
+    );
+}

@@ -6,8 +6,13 @@
 //! whole block from a single thread (`local`): grouped `ncclCommInitRank`
 //! for every local device inside `ncclGroupStart`/`ncclGroupEnd`, then
 //! every collective issued once per local rank inside a group per
-//! operation. `socket_ifname`, when set, is exported as
-//! NCCL_SOCKET_IFNAME before init.
+//! operation.
+//!
+//! NCCL env (NCCL_SOCKET_IFNAME and any `[nccl] env` knobs) is never set
+//! here: the orchestrator puts it on the remote `env ... gauntlet agent`
+//! command line, so it is in the process environment before `main` builds
+//! the multi-threaded tokio runtime. `std::env::set_var` after that point
+//! would be unsound.
 //!
 //! Rendezvous: the host holding global rank 0 runs the `Lead` directive,
 //! mints the `NcclUniqueId` in-process and announces it as an `NcclId`
@@ -227,10 +232,9 @@ pub mod imp {
     }
 
     fn run_directive(sink: &EventSink, directive: &NcclDirective) -> Result<()> {
-        let (assignment, socket_ifname, workload, rendezvous) = match directive {
+        let (assignment, workload, rendezvous) = match directive {
             NcclDirective::Lead {
                 assignment,
-                socket_ifname,
                 workload,
             } => {
                 if !assignment.block().holds_lead() {
@@ -239,22 +243,20 @@ pub mod imp {
                         assignment.block().base()
                     );
                 }
-                (assignment, socket_ifname, workload, Rendezvous::Mint)
+                (assignment, workload, Rendezvous::Mint)
             }
             NcclDirective::Participate {
                 unique_id_b64,
                 assignment,
-                socket_ifname,
                 workload,
             } => {
                 if assignment.block().holds_lead() {
                     bail!("the block holding global rank 0 must run the Lead directive");
                 }
                 let id = decode_id(unique_id_b64)?;
-                (assignment, socket_ifname, workload, Rendezvous::Join(id))
+                (assignment, workload, Rendezvous::Join(id))
             }
         };
-        set_socket_ifname(socket_ifname);
 
         // Stage 1, no NCCL: device check, contexts, binds, buffers. The
         // lead finishes it before minting the id, so a lead that cannot
@@ -300,17 +302,6 @@ pub mod imp {
     enum Buffers {
         Sweep(SweepBuffers),
         Overlap(OverlapBuffers),
-    }
-
-    fn set_socket_ifname(socket_ifname: &Option<String>) {
-        if let Some(ifname) = socket_ifname {
-            // NCCL reads this once, at communicator init.
-            //
-            // SAFETY: nothing has been spawned yet — no communicator, no NCCL
-            // helper threads, no threads of our own — so no other thread can
-            // be reading the environment concurrently with this write.
-            unsafe { std::env::set_var("NCCL_SOCKET_IFNAME", ifname) };
-        }
     }
 }
 

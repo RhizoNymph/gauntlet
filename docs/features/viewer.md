@@ -56,6 +56,12 @@ connected fleet graph plus a quantitative metric table.
   shown — the chip qualifies them — because metric names can survive a
   schema bump while their meaning changes (schema v8's rank-per-GPU NCCL
   world).
+- NCCL tuning drift (schema v10 `nccl_env`): diff mode shows an "nccl env
+  drift" chip and one line per added/removed/changed NCCL_* key vs the
+  baseline (`DiffView.nccl_env_drift`, via
+  `gauntlet::report::nccl_env::nccl_env_drift`). The overview shows the
+  run's env. Drift is context for NCCL deltas, never a node regression.
+  If either run predates the field (`nccl_env: None`), no drift is shown.
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report
@@ -111,8 +117,9 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/diff.rs` — pure run-to-run diff: `DiffView::new(current,
   baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
   improved flag) plus node/edge regression severities and capped issue
-  lists, and a `Comparability` verdict (same schema or not, with the chip
-  text). `higher_is_better(unit)` is the direction-of-goodness oracle.
+  lists, a `Comparability` verdict (same schema or not, with the chip
+  text), and `nccl_env_drift` (NCCL tuning differences vs the baseline).
+  `higher_is_better(unit)` is the direction-of-goodness oracle.
   `ViewModel.schema_version` carries each run's schema.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
   (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals

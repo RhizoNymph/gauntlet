@@ -1,10 +1,16 @@
 //! Node-side mode. Invoked over ssh by the orchestrator; never run by hand.
 //!
-//! stdout carries the JSON-lines event protocol (see `crate::proto`), so
-//! nothing in agent mode may print to stdout except through `EventSink`.
+//! stdout carries the JSON-lines event protocol (see `crate::proto`).
+//! Invariant: only `channel::protocol_writer` (via `EventSink` or
+//! `channel::write_line`) reaches the orchestrator. `main` calls
+//! `channel::isolate_stdout` before any thread exists, which moves the
+//! protocol to a private dup of the original stdout and points fd 1 at
+//! stderr — so library output on fd 1 (NCCL_DEBUG, CUDA, a stray
+//! `println!`) lands in the stderr log instead of corrupting events.
 //! Logs go to stderr via `tracing`.
 
 pub mod barrier;
+pub mod channel;
 pub mod counters;
 pub mod cpu;
 pub mod disk;
@@ -38,9 +44,11 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// Sink on the protocol channel (the private stdout duplicate once
+    /// `channel::isolate_stdout` ran).
     pub fn stdout() -> Self {
         Self {
-            out: Mutex::new(Box::new(std::io::stdout())),
+            out: Mutex::new(channel::protocol_writer()),
         }
     }
 
@@ -198,7 +206,7 @@ fn intranode_sweep(sink: &EventSink, _sweep: &crate::proto::NcclSweepSpec) -> Re
 /// JSON document on stdout (used by bootstrap for capability detection).
 pub fn probe() -> Result<()> {
     let snapshot = inventory::collect()?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    channel::write_line(&serde_json::to_string_pretty(&snapshot)?)?;
     Ok(())
 }
 

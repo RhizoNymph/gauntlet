@@ -254,7 +254,6 @@ fn nccl_workloads_are_mutually_exclusive_by_construction() {
     // A sweep workload written without the optional barrier probe.
     let sweep = r#"{"directive":"lead",
         "assignment":{"block":{"base":0,"count":1},"world_size":3},
-        "socket_ifname":null,
         "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
     let directive: NcclDirective = serde_json::from_str(sweep).expect("decode sweep lead");
     let NcclDirective::Lead {
@@ -270,7 +269,6 @@ fn nccl_workloads_are_mutually_exclusive_by_construction() {
         unique_id_b64: "abc".into(),
         assignment: RankAssignment::new(RankBlock::new(2, 1).expect("block"), 3)
             .expect("assignment"),
-        socket_ifname: Some("bond0".into()),
         workload: NcclWorkload::Overlap(OverlapSpec {
             duration_secs: 30,
             baseline_secs: 5,

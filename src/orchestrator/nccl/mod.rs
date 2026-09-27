@@ -141,9 +141,9 @@ fn block_owners(world: &FleetWorld) -> BTreeMap<String, RankBlock> {
 
 /// What one fleet-wide `agent nccl` job runs, beyond the world itself. The
 /// lead and participant directives differ only in rendezvous plumbing, so
-/// one job builds both.
+/// one job builds both. NCCL env is not part of the job: every session
+/// sets it on the agent's spawn command line (`HostSession::connect`).
 struct NcclJob {
-    socket_ifname: Option<String>,
     workload: NcclWorkload,
 }
 
@@ -151,7 +151,6 @@ impl NcclJob {
     fn lead(&self, assignment: RankAssignment) -> NcclDirective {
         NcclDirective::Lead {
             assignment,
-            socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
@@ -160,7 +159,6 @@ impl NcclJob {
         NcclDirective::Participate {
             unique_id_b64: unique_id_b64.to_string(),
             assignment,
-            socket_ifname: self.socket_ifname.clone(),
             workload: self.workload.clone(),
         }
     }
@@ -553,7 +551,6 @@ pub(super) async fn nccl_sweep(
         })
     };
     let job = NcclJob {
-        socket_ifname: config.nccl.socket_ifname.clone(),
         workload: NcclWorkload::Sweep {
             sizes: config.tests.nccl_sizes.clone(),
             iters_per_size: config.tests.nccl_iters_per_size,
@@ -672,7 +669,6 @@ pub(super) async fn overlap_fleet_sweep(
         })
     };
     let job = NcclJob {
-        socket_ifname: config.nccl.socket_ifname.clone(),
         workload: NcclWorkload::Overlap(spec),
     };
     let failures = drive_fleet_nccl(
@@ -733,7 +729,6 @@ mod tests {
 
     fn job() -> NcclJob {
         NcclJob {
-            socket_ifname: Some("bond0".into()),
             workload: NcclWorkload::Overlap(OverlapSpec {
                 duration_secs: 30,
                 baseline_secs: 5,

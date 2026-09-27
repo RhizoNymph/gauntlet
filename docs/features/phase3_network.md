@@ -135,16 +135,24 @@ calibration).
 `nccl::{all_reduce,all_gather}_bus_gib_per_sec`: all-reduce `2(n-1)/n`,
 all-gather `(n-1)/n` over the gathered size, n = local GPU count.
 
-### socket_ifname does not apply
-`[nccl] socket_ifname` is not exported for the intra-node sweep. The
-communicator is created with `ncclCommInitAll` inside one process: its
-bootstrap handshake connects the process to itself, and the data path is
-P2P/NVLink/SHM — no socket transport carries payload, so the interface
-choice cannot change what is measured. Exporting it would also mean a
-`set_var` inside `agent run`, which (unlike `agent nccl`) executes on the
-multi-threaded tokio runtime, where mutating the environment is unsound.
-The overlap phase's node-local communicator has the same shape and
-likewise does not set it.
+### NCCL env in the intra-node sweep
+The resolved `[nccl]` env, including `socket_ifname` as
+NCCL_SOCKET_IFNAME, reaches the intra-node sweep in the same way as every
+other agent process. The orchestrator sets it on the remote `env ...
+gauntlet agent run` command line, so it is already in the process
+environment before `agent run` builds its multi-threaded tokio runtime.
+The agent never calls `set_var`. The same applies to the overlap phase's
+node-local communicator (docs/features/nccl_env.md).
+
+Some knobs have no effect here:
+- NCCL_SOCKET_IFNAME changes nothing measurable. The communicator is
+  created with `ncclCommInitAll` inside one process, its bootstrap
+  handshake connects the process to itself, and the data path is
+  P2P/NVLink/SHM, so no socket transport carries payload.
+- The same holds for the IB/NET knobs.
+
+Other knobs do act on intra-node paths: NCCL_P2P_LEVEL, NCCL_ALGO,
+NCCL_PROTO and NCCL_DEBUG.
 
 ### Calibration link classes
 `report/intranode.rs`: per (host, repeat), `msg_bytes` and `elapsed_us`
@@ -272,7 +280,17 @@ invisible). Real training runs one rank per GPU; so does this.
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth
 probes; ssh control traffic stays on `addr`. Without it, the target is
 `addr` stripped of user/port. NCCL interface selection is orthogonal:
-`[nccl] socket_ifname` pins NCCL_SOCKET_IFNAME (e.g. "bond0").
+`[nccl] socket_ifname` pins NCCL_SOCKET_IFNAME (e.g. "bond0") so NCCL's
+bootstrap and socket transport ride the data plane rather than whatever
+interface it would pick first. It stays the typed first-class knob for
+this; other NCCL tuning (NCCL_IB_HCA, NCCL_IB_GID_INDEX,
+NCCL_NET_GDR_LEVEL, ...) goes in `[nccl] env`. The orchestrator folds
+`socket_ifname` into that map as NCCL_SOCKET_IFNAME (setting it in both
+places is a config error) and sets the resolved map on the remote
+`env ... gauntlet agent ...` command line of every agent spawn, so it is
+in each rank's environment before the process starts (the agent never
+calls `set_var`; proto v9 dropped `socket_ifname` from the directives).
+See docs/features/nccl_env.md.
 
 ## Peer wire format (net.rs)
 First byte from client selects mode: 0x01 latency, 0x02 bandwidth, 0xFF

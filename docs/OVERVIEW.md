@@ -20,7 +20,10 @@ Overview:
       the remote sha256 matches), drives the phase schedule, aggregates
       results over an mpsc channel into a single lock-free collector task.
     agent: >
-      Same binary in `gauntlet agent` mode, executed on each node. Built for
+      Same binary in `gauntlet agent` mode, executed on each node. At
+      startup, before any thread exists, the agent moves its protocol
+      channel to a private dup of stdout and points fd 1 at stderr, so
+      library output (NCCL_DEBUG, CUDA) cannot corrupt events. Built for
       glibc (static musl cannot dlopen, which cudarc requires; a musl build
       only makes sense with --no-default-features). GPU tests use cudarc with
       dynamic-loading + the cuda-12040 API baseline: libcuda/libcublas/libnccl
@@ -50,6 +53,10 @@ Overview:
     config.toml -> orchestrator -> (scp agent, spawn `gauntlet agent` per
     host/pair/NCCL rank) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
     mpsc -> collector -> outlier analysis -> report.json + terminal table.
+    The resolved `[nccl]` env (validated NCCL_* map) is set on the remote
+    `env ... gauntlet agent ...` command line of every agent spawn — never
+    on the wire, never via set_var in the agent — and recorded run-level
+    in RunResults.nccl_env.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -153,6 +160,22 @@ Features Index:
     entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl/sweep.rs, orchestrator/barrier.rs, orchestrator/mod.rs, orchestrator/nccl/]
     depends_on: [phase3_network]
     doc: docs/features/barrier_skew.md
+  nccl_env:
+    description: >
+      `[nccl] env` passthrough (proto v9 / schema v10): a validated
+      name -> value map restricted to `^NCCL_[A-Z0-9_]+$` keys (no
+      LD_PRELOAD / CUDA_VISIBLE_DEVICES smuggling), non-empty NUL-free
+      values; `socket_ifname` stays typed and folds in as
+      NCCL_SOCKET_IFNAME (setting both is a ConfigError). The orchestrator
+      puts the resolved map, single-quoted, on the `env` command line of
+      every agent spawn (HostSession), so every NCCL communicator — fleet
+      sweep/barrier, fleet overlap, intra-node overlap — starts under it
+      without the multi-threaded agent mutating its environment. Recorded
+      run-level in `RunResults.nccl_env`; the viewer's diff mode lists
+      drift against the baseline.
+    entry_points: [nccl_env.rs, config.rs, orchestrator/session.rs, report/nccl_env.rs]
+    depends_on: [phase3_network, overlap_phase]
+    doc: docs/features/nccl_env.md
   overlap_phase:
     description: >
       Combined-load straggler tests, run last. Node-local step: sustained
@@ -200,7 +223,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew]
+    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
     doc: docs/features/reporting.md
   viewer:
     description: >

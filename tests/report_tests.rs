@@ -1054,6 +1054,83 @@ fn rooflines_reduce_over_per_subject_medians() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// NCCL env in the results document (schema v10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn results_record_the_resolved_nccl_env() {
+    let config = FleetConfig::from_toml_str(
+        r#"
+        hosts = ["a", "b"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_DEBUG = "WARN" }
+        "#,
+        std::path::Path::new("inline.toml"),
+    )
+    .expect("config");
+    let results = report::build(&config, BTreeMap::new(), 1, 2);
+    assert_eq!(results.schema_version, report::SCHEMA_VERSION);
+    let expected: BTreeMap<String, String> = [
+        ("NCCL_DEBUG", "WARN"),
+        ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+        ("NCCL_SOCKET_IFNAME", "bond0"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    assert_eq!(results.nccl_env.as_ref(), Some(&expected));
+    assert_eq!(
+        results.nccl_env,
+        Some(config.nccl_env().expect("validated").to_string_map())
+    );
+
+    // The document round-trips, and the table names the tuning up front.
+    let json = serde_json::to_string(&results).expect("serialize");
+    let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.nccl_env, Some(expected));
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let rendered = String::from_utf8(rendered).expect("utf8");
+    assert!(
+        rendered.contains(
+            "nccl env: NCCL_DEBUG=WARN NCCL_IB_HCA=mlx5_0,mlx5_1 NCCL_SOCKET_IFNAME=bond0"
+        ),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn untuned_runs_record_an_empty_env_and_pre_v8_documents_none() {
+    let results = report::build(&config_for(&["a"]), BTreeMap::new(), 1, 2);
+    assert_eq!(results.nccl_env, Some(BTreeMap::new()));
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (none)")
+    );
+
+    // A v7 document has no nccl_env field at all.
+    let mut value = serde_json::to_value(&results).expect("to value");
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("nccl_env")
+        .expect("field present in v8");
+    let old: report::RunResults = serde_json::from_value(value).expect("pre-v10 decodes");
+    assert_eq!(old.nccl_env, None, "absent means not recorded, not untuned");
+    let mut rendered = Vec::new();
+    report::render_table(&old, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (not recorded)")
+    );
+}
+
 /// One node's completed intra-node sweep, as the agent emits it: per size
 /// elapsed/msg/bus for both collectives, then the per-collective headline
 /// and communicator size.

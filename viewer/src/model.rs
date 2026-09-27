@@ -118,6 +118,10 @@ pub struct ViewModel {
     pub verdict: Verdict,
     /// The producing orchestrator/agent was an unoptimized build.
     pub debug_build: bool,
+    /// The run's resolved NCCL environment: `None` = not recorded (pre-v10
+    /// runs), `Some(empty)` = untuned. Diff mode compares it against the
+    /// baseline's.
+    pub nccl_env: Option<BTreeMap<String, String>>,
     /// `RunResults.schema_version` of the run: diffs across versions
     /// compare metrics whose meaning may have changed.
     pub schema_version: u32,
@@ -307,6 +311,7 @@ impl ViewModel {
         ViewModel {
             run_id: results.run_id.clone(),
             debug_build: results.debug_build,
+            nccl_env: results.nccl_env.clone(),
             schema_version: results.schema_version,
             wall_secs: results
                 .finished_epoch_secs

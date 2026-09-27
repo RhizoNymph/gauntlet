@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 
 use gauntlet::proto::Unit;
+use gauntlet::report::nccl_env::{NcclEnvChange, nccl_env_drift};
 
 use crate::model::{Attribution, Issue, MetricRow, Severity, ViewModel, attribute, format_value};
 
@@ -95,6 +96,11 @@ pub struct DiffView {
     pub node_issues: BTreeMap<String, Vec<Issue>>,
     pub edge_severity: BTreeMap<(String, String), Severity>,
     pub edge_issues: BTreeMap<(String, String), Vec<Issue>>,
+    /// NCCL tuning that differs from the baseline run. Non-empty means the
+    /// two runs' NCCL numbers were produced under different knobs, so
+    /// their deltas are not like-for-like. `None` when either run did not
+    /// record its env — nothing is shown rather than invented drift.
+    pub nccl_env_drift: Option<Vec<NcclEnvChange>>,
 }
 
 struct Finding {
@@ -194,6 +200,7 @@ impl DiffView {
             baseline_run_id: baseline.run_id.clone(),
             comparability: Comparability::between(current, baseline),
             rows,
+            nccl_env_drift: nccl_env_drift(baseline.nccl_env.as_ref(), current.nccl_env.as_ref()),
             ..DiffView::default()
         };
         for (host, findings) in node_findings {

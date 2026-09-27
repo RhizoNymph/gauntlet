@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use gauntlet::config::{ConfigError, FleetConfig};
+use gauntlet::nccl_env::{NcclEnvError, NcclEnvValueError};
 use gauntlet::proto::Phase;
 
 fn parse(text: &str) -> Result<FleetConfig, String> {
@@ -214,6 +215,258 @@ fn hot_sdc_knobs_default_on_and_flow_into_the_spec() {
     let spec = tuned.task_spec(&[Phase::CpuMem, Phase::Gpu]);
     assert_eq!(spec.cpu.sdc_hot_secs, 7);
     assert_eq!(spec.gpu.sdc_check_secs, 0);
+}
+
+// ---------------------------------------------------------------------------
+// [nccl] env passthrough
+// ---------------------------------------------------------------------------
+
+fn load_str(text: &str) -> Result<FleetConfig, ConfigError> {
+    FleetConfig::from_toml_str(text, Path::new("inline.toml"))
+}
+
+fn nccl_error(text: &str) -> NcclEnvError {
+    match load_str(text) {
+        Err(ConfigError::Nccl { source }) => source,
+        other => panic!("expected ConfigError::Nccl, got {other:?}"),
+    }
+}
+
+#[test]
+fn socket_ifname_only_config_still_loads() {
+    // The shape of every pre-passthrough config (deny_unknown_fields must
+    // keep accepting it).
+    let text = r#"
+        hosts = ["10.0.0.1", "10.0.0.2"]
+        [nccl]
+        socket_ifname = "bond0"
+    "#;
+    let config = load_str(text).expect("socket_ifname-only config loads");
+    assert_eq!(config.nccl.socket_ifname.as_deref(), Some("bond0"));
+    let env = config.nccl_env().expect("validated");
+    assert_eq!(
+        env.iter().collect::<Vec<_>>(),
+        vec![("NCCL_SOCKET_IFNAME", "bond0")]
+    );
+    // The serde + validate path agrees.
+    let parsed = parse(text).expect("parses");
+    assert_eq!(parsed.nccl_env().expect("validated"), env);
+}
+
+#[test]
+fn unknown_nccl_fields_are_still_rejected() {
+    let error = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifnam = "bond0"
+        "#,
+    )
+    .expect_err("typo'd [nccl] key must fail");
+    assert!(error.contains("socket_ifnam"), "got: {error}");
+}
+
+#[test]
+fn no_nccl_section_means_an_empty_env() {
+    let config = load_str(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert!(config.nccl_env().expect("validated").is_empty());
+    assert_eq!(config.nccl.socket_ifname, None);
+}
+
+#[test]
+fn nccl_env_map_parses_and_resolves_with_socket_ifname() {
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_DEBUG = "WARN", NCCL_IB_GID_INDEX = "3" }
+        "#,
+    )
+    .expect("env config loads");
+    let env = config.nccl_env().expect("validated");
+    assert_eq!(env.get("NCCL_IB_HCA"), Some("mlx5_0,mlx5_1"));
+    assert_eq!(env.get("NCCL_DEBUG"), Some("WARN"));
+    assert_eq!(env.get("NCCL_IB_GID_INDEX"), Some("3"));
+    assert_eq!(env.get("NCCL_SOCKET_IFNAME"), Some("bond0"));
+    assert_eq!(env.len(), 4);
+}
+
+#[test]
+fn nccl_env_accepts_table_syntax() {
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        [nccl.env]
+        NCCL_P2P_LEVEL = "NVL"
+        "#,
+    )
+    .expect("config");
+    let env = config.nccl_env().expect("validated");
+    assert_eq!(env.get("NCCL_P2P_LEVEL"), Some("NVL"));
+    assert_eq!(env.get("NCCL_SOCKET_IFNAME"), Some("bond0"));
+}
+
+#[test]
+fn integer_and_boolean_values_are_stringified() {
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        env = { NCCL_IB_GID_INDEX = 3, NCCL_IB_DISABLE = true, NCCL_CROSS_NIC = false, NCCL_NET_GDR_LEVEL = "PHB" }
+        "#,
+    )
+    .expect("scalar values load");
+    let env = config.nccl_env().expect("validated");
+    assert_eq!(env.get("NCCL_IB_GID_INDEX"), Some("3"));
+    assert_eq!(env.get("NCCL_IB_DISABLE"), Some("1"));
+    assert_eq!(env.get("NCCL_CROSS_NIC"), Some("0"));
+    assert_eq!(env.get("NCCL_NET_GDR_LEVEL"), Some("PHB"));
+}
+
+#[test]
+fn float_array_and_table_values_are_typed_config_errors() {
+    for (value, found) in [
+        ("1.5", "float"),
+        ("[0, 1]", "array"),
+        ("{ port = 1 }", "table"),
+    ] {
+        let text = format!(
+            r#"
+            hosts = ["10.0.0.1"]
+            [nccl.env]
+            NCCL_IB_GID_INDEX = {value}
+            "#
+        );
+        assert_eq!(
+            nccl_error(&text),
+            NcclEnvError::UnsupportedValueType {
+                key: "NCCL_IB_GID_INDEX".into(),
+                found
+            },
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn non_nccl_env_keys_are_typed_config_errors() {
+    for key in ["LD_PRELOAD", "CUDA_VISIBLE_DEVICES", "nccl_debug", "NCCL_"] {
+        let text = format!(
+            r#"
+            hosts = ["10.0.0.1"]
+            [nccl.env]
+            "{key}" = "x"
+            "#
+        );
+        assert_eq!(
+            nccl_error(&text),
+            NcclEnvError::InvalidKey { key: key.into() },
+            "{key}"
+        );
+        // The serde + validate path rejects it too.
+        let message = parse(&text).expect_err("serde path rejects");
+        assert!(message.contains(key), "{key}: got {message}");
+    }
+}
+
+#[test]
+fn socket_ifname_conflict_is_a_typed_config_error() {
+    let text = r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_SOCKET_IFNAME = "bond0" }
+    "#;
+    assert_eq!(nccl_error(text), NcclEnvError::SocketIfnameConflict);
+    assert!(parse(text).is_err());
+
+    // Through the map alone it is just another knob.
+    let config = load_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        env = { NCCL_SOCKET_IFNAME = "bond0" }
+        "#,
+    )
+    .expect("map-only ifname");
+    assert_eq!(
+        config
+            .nccl_env()
+            .expect("validated")
+            .get("NCCL_SOCKET_IFNAME"),
+        Some("bond0")
+    );
+    assert_eq!(config.nccl.socket_ifname, None);
+}
+
+#[test]
+fn empty_and_control_character_values_are_typed_config_errors() {
+    for (value, reason) in [
+        (r#""""#, NcclEnvValueError::Empty),
+        (r#""WA\u0000RN""#, NcclEnvValueError::ControlCharacter),
+        (r#""WA\nRN""#, NcclEnvValueError::ControlCharacter),
+        (r#""WA\tRN""#, NcclEnvValueError::ControlCharacter),
+        (r#""WA\u007fRN""#, NcclEnvValueError::ControlCharacter),
+    ] {
+        let text = format!(
+            r#"
+            hosts = ["10.0.0.1"]
+            [nccl.env]
+            NCCL_DEBUG = {value}
+            "#
+        );
+        assert_eq!(
+            nccl_error(&text),
+            NcclEnvError::InvalidValue {
+                key: "NCCL_DEBUG".into(),
+                reason
+            },
+            "{value}"
+        );
+    }
+    let error = nccl_error(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl]
+        socket_ifname = ""
+        "#,
+    );
+    assert_eq!(
+        error,
+        NcclEnvError::InvalidValue {
+            key: "NCCL_SOCKET_IFNAME".into(),
+            reason: NcclEnvValueError::Empty
+        }
+    );
+}
+
+#[test]
+fn syntax_errors_stay_parse_errors() {
+    let error = load_str("hosts = [").expect_err("broken TOML");
+    assert!(matches!(error, ConfigError::Parse { .. }), "got {error:?}");
+}
+
+#[test]
+fn an_unvalidated_config_still_never_yields_an_invalid_env() {
+    // Skipping validate() does not bypass the policy: the accessor resolves
+    // (and validates) on first use.
+    let config: FleetConfig = toml::from_str(
+        r#"
+        hosts = ["10.0.0.1"]
+        [nccl.env]
+        LD_PRELOAD = "/tmp/x.so"
+        "#,
+    )
+    .expect("shape is fine");
+    assert!(matches!(
+        config.nccl_env(),
+        Err(ConfigError::Nccl {
+            source: NcclEnvError::InvalidKey { .. }
+        })
+    ));
 }
 
 #[test]

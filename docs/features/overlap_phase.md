@@ -55,7 +55,11 @@ rounds × window cost for little extra attribution.
    - `execute`: `NodeComm::init` (`gpu/node_comm.rs`, shared with the
      intra-node NCCL sweep): one `CudaContext` per GPU; NCCL communicator
      via `Comm::from_devices` (`ncclCommInitAll`, single process, one rank
-     per GPU, each rank on its device's default stream). Warmup rounds, then
+     per GPU, each rank on its device's default stream). The init sees the
+     run's NCCL env because the orchestrator set it on the `agent run`
+     spawn command line (`agent run` executes on the multi-threaded tokio
+     runtime, so the agent never mutates its own env;
+     docs/features/nccl_env.md). Warmup rounds, then
      the **isolated baseline**: `timed_rounds` drives grouped all-reduces
      (`ncclGroupStart`/`End`, `ROUND_ITERS` per sync) for `baseline_secs`.
    - **Combined window**: one plain thread per GPU
@@ -105,7 +109,8 @@ local GPU carries both legs: its collective rank and a GEMM worker
 collective path contends with its own compute and the whole node's power
 and PCIe pressure — the "every GPU loaded, fabric busy" regime training
 actually runs in. Rendezvous reuses the `agent nccl` relay (the lead host
-mints the `NcclId`, the orchestrator relays it).
+mints the `NcclId`, the orchestrator relays it); the NCCL env arrives the
+same way as for the sweep, on the spawn command line.
 
 v6 ran one rank per node on GPU 0 only, so a degraded GPU↔NIC path
 behind any other GPU was invisible; that limitation is gone.

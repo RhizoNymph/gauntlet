@@ -205,6 +205,21 @@ outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
 
+## NCCL env (schema v10)
+
+`RunResults.nccl_env` records, once per run, the resolved NCCL
+environment every communicator was created under (`[nccl] env` plus
+`socket_ifname` as NCCL_SOCKET_IFNAME; see docs/features/nccl_env.md).
+It is run-level because it is fleet-uniform by construction: the
+orchestrator sends one map to every host. It is an
+`Option<BTreeMap<String, String>>` with a serde default. `None` means not
+recorded, which is how pre-v10 documents decode, so old history keeps
+loading. `Some(empty)` means an untuned run. The terminal table prints
+`nccl env: K=V ...`, `(none)` or `(not recorded)` under its header line.
+`report::nccl_env::nccl_env_drift` lists the keys added, removed or
+changed between two runs, and returns `None` if either run did not record
+its env. The viewer's diff mode uses it.
+
 ## Barrier stragglers (schema v6)
 
 The barrier-skew microbenchmark (docs/features/barrier_skew.md) emits

@@ -73,7 +73,7 @@ pub async fn barrier(args: BarrierArgs) -> Result<()> {
                 .await
                 .with_context(|| format!("binding barrier listener on 0.0.0.0:{port}"))?;
             let report = run_server(listener, world, iters).await?;
-            println!("{}", serde_json::to_string(&report)?);
+            crate::agent::channel::write_line(&serde_json::to_string(&report)?)?;
             Ok(())
         }
         BarrierCommand::Join {

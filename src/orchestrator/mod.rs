@@ -43,6 +43,7 @@ use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
+use crate::nccl_env::NcclEnv;
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit,
@@ -218,7 +219,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, &sink).await;
+    let sessions = connect_fleet(&config, config.nccl_env()?, &sink).await;
     let sessions = deploy_fleet(&config, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
@@ -349,19 +350,28 @@ fn epoch_secs() -> u64 {
 /// Open every session with `ssh.max_concurrent` establishments in flight.
 /// Established sessions are held for the whole run (the permit is only for
 /// the handshake). Order follows the config so host indices are stable.
-async fn connect_fleet(config: &FleetConfig, sink: &ObservationSink) -> Vec<Arc<HostSession>> {
+async fn connect_fleet(
+    config: &FleetConfig,
+    nccl_env: &NcclEnv,
+    sink: &ObservationSink,
+) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
+    // Set on every agent spawn's command line: the one path by which NCCL
+    // tuning reaches every communicator (sweep, barrier, both overlap
+    // steps) without the agent ever mutating its own environment.
+    let nccl_env = Arc::new(nccl_env.clone());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
         count += 1;
         let ssh = config.ssh.clone();
+        let nccl_env = Arc::clone(&nccl_env);
         let permits = Arc::clone(&permits);
         let sink = sink.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh).await {
+            match HostSession::connect(host, &ssh, &nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
                     sink.error(&addr, format!("ssh connect failed: {error:#}"));
@@ -1171,6 +1181,78 @@ mod tests {
             // regex does not match.
             let pkill = format!("pkill -f '{pattern}'");
             assert!(!pkill.contains(&effective), "{pkill}");
+        }
+    }
+
+    /// The NCCL env words sit before the binary on the remote command line.
+    /// `env` execs the binary, so the agent's own argv (what `pkill -f`
+    /// matches against) is still `<path> agent <args>`; and while the shell
+    /// or `env` itself is alive, its command line contains the same
+    /// contiguous text. Either way the kill pattern matches.
+    #[test]
+    fn kill_patterns_match_spawns_that_carry_an_nccl_env() {
+        use crate::nccl_env::NcclEnv;
+        use crate::orchestrator::session::{agent_env_words, agent_spawn_args};
+
+        let raw = [
+            ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+            ("NCCL_DEBUG", "INFO"),
+            ("NCCL_ALGO", "Ring tree $HOME 'q'"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env = NcclEnv::resolve(Some("bond0"), &raw).expect("valid env");
+        let remote_dir = "/scratch/gauntlet";
+        let agent = format!("{remote_dir}/{}", deploy::AGENT_RELPATH);
+        let words = agent_env_words(remote_dir, &env);
+
+        for args in [
+            vec!["nccl"],
+            vec!["run"],
+            vec!["peer", "serve", "--port", "29500"],
+            vec!["barrier", "serve", "--port", "29500"],
+        ] {
+            let joined = args.join(" ");
+            let effective = agent_kill_pattern(&joined).replacen("[g]", "g", 1);
+            let spawn = agent_spawn_args(&words, &agent, &args);
+            let remote = format!("env {}", spawn.join(" "));
+
+            // The remote shell parses the words; drop the leading
+            // assignments exactly as `env` does before exec.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {}", spawn.join(" ")))
+                .output()
+                .expect("run sh");
+            assert!(output.status.success(), "{remote}");
+            let argv: Vec<String> = String::from_utf8(output.stdout)
+                .expect("utf8")
+                .lines()
+                .map(str::to_string)
+                .skip_while(|word| word.contains('=') && !word.starts_with('/'))
+                .collect();
+            assert_eq!(argv[0], agent, "{remote}");
+            let agent_cmdline = argv.join(" ");
+            assert!(!agent_cmdline.contains("NCCL_"), "{agent_cmdline}");
+            assert!(
+                agent_cmdline.contains(&effective),
+                "{effective:?} vs agent argv {agent_cmdline:?}"
+            );
+            // The pre-exec `env` / shell command line matches too.
+            let shell_cmdline = String::from_utf8(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("printf '%s ' {}", spawn.join(" ")))
+                    .output()
+                    .expect("run sh")
+                    .stdout,
+            )
+            .expect("utf8");
+            assert!(
+                shell_cmdline.contains(&effective),
+                "{effective:?} vs {shell_cmdline:?}"
+            );
         }
     }
 

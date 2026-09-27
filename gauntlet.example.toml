@@ -56,3 +56,10 @@ barrier_slowest_frac = 0.5
 
 [nccl]
 # socket_ifname = "eth0"       # NCCL_SOCKET_IFNAME for multi-homed nodes
+# Extra NCCL knobs, set on the command line of every agent process (so
+# every communicator — fleet sweep, barrier, both overlap steps — sees
+# them) and recorded in the results. Keys must match ^NCCL_[A-Z0-9_]+$
+# (no LD_PRELOAD etc.). Values are strings, integers or booleans
+# (true/false -> 1/0), non-empty and single-line. Set NCCL_SOCKET_IFNAME
+# here or via socket_ifname, not both.
+# env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_IB_GID_INDEX = 3, NCCL_DEBUG = "WARN" }

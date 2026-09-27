@@ -123,6 +123,7 @@ fn results(run_id: &str, started: u64) -> RunResults {
         aggregates: Default::default(),
         finished_epoch_secs: started + 60,
         hosts: BTreeMap::new(),
+        nccl_env: None,
         fleet: FleetAnalysis::default(),
         calibration: Calibration::default(),
     }

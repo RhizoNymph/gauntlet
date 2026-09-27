@@ -7,6 +7,7 @@
 
 pub mod history;
 pub mod intranode;
+pub mod nccl_env;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -20,6 +21,7 @@ use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
+use crate::nccl_env::NcclEnv;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
@@ -56,7 +58,11 @@ use crate::proto::{
 // metric groups (per-size series plus the fleet-comparable
 // bus_gib_per_sec_peak_<n>gpu headline) and calibration.links classes
 // nccl_{allreduce,allgather}_intranode_<n>gpu. No field changed shape.
-pub const SCHEMA_VERSION: u32 = 9;
+// v10: run-level `nccl_env` — the resolved NCCL environment every agent
+// process (and so every NCCL communicator) in the run was started with.
+// Optional: pre-v10 documents decode with it absent ("not recorded"),
+// which suppresses drift display.
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -91,6 +97,16 @@ pub struct RunResults {
     #[serde(default)]
     pub debug_build: bool,
     pub hosts: BTreeMap<String, HostObservations>,
+    /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
+    /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
+    /// because it is fleet-uniform by construction; baseline comparisons
+    /// diff it (`nccl_env::nccl_env_drift`) since tuning drift makes NCCL
+    /// numbers incomparable. `None` = not recorded (pre-v10 documents, via
+    /// the serde default, so old history keeps loading); `Some(empty)` =
+    /// an untuned run. A plain string map so a document always decodes,
+    /// even under a future, different key policy.
+    #[serde(default)]
+    pub nccl_env: Option<BTreeMap<String, String>>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -392,6 +408,10 @@ pub fn build(
         finished_epoch_secs,
         debug_build: false,
         hosts: observations,
+        // `None` only for a config whose `[nccl]` never validated, which
+        // `FleetConfig::load` rules out; recorded as "not recorded" rather
+        // than guessed.
+        nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
         fleet,
         aggregates,
         calibration,
@@ -1023,6 +1043,11 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
             .finished_epoch_secs
             .saturating_sub(results.started_epoch_secs),
         verdict(results),
+    )?;
+    writeln!(
+        out,
+        "nccl env: {}",
+        nccl_env::format_nccl_env(results.nccl_env.as_ref())
     )?;
 
     render_hosts(results, out)?;

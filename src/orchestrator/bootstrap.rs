@@ -29,6 +29,7 @@ use super::deploy::ensure_agent;
 use super::session::HostSession;
 use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
+use crate::nccl_env::NcclEnv;
 use crate::proto::InventorySnapshot;
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
@@ -109,6 +110,8 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
         .with_context(|| format!("loading {}", args.config.display()))?;
     let hosts: Vec<HostConfig> = config.hosts().collect();
     let ssh = Arc::new(config.ssh.clone());
+    // Same spawn environment as `gauntlet run`, so probes see what runs see.
+    let nccl_env = Arc::new(config.nccl_env()?.clone());
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     info!(
         hosts = hosts.len(),
@@ -121,11 +124,12 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     let mut tasks = JoinSet::new();
     for (index, host) in hosts.iter().cloned().enumerate() {
         let ssh = Arc::clone(&ssh);
+        let nccl_env = Arc::clone(&nccl_env);
         let permits = Arc::clone(&permits);
         let tune = args.tune;
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
-            (index, prepare_host(host, &ssh, tune).await)
+            (index, prepare_host(host, &ssh, &nccl_env, tune).await)
         });
     }
 
@@ -183,11 +187,16 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
 
 /// Full per-host sequence. Never returns an error: a failure is a matrix
 /// cell, and one bad node must not abort the rest of the fleet.
-async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostReadiness {
+async fn prepare_host(
+    host: HostConfig,
+    ssh: &SshConfig,
+    nccl_env: &NcclEnv,
+    tune: bool,
+) -> HostReadiness {
     let addr = host.addr.clone();
     let mut checks = Vec::new();
 
-    let session = match HostSession::connect(host, ssh).await {
+    let session = match HostSession::connect(host, ssh, nccl_env).await {
         Ok(session) => {
             checks.push(ReadinessCheck::ok("connectivity", session.remote_dir()));
             session

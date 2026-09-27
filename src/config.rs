@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
     OverlapSpec, Phase,
@@ -33,6 +35,10 @@ pub enum ConfigError {
     BadBarrierFrac { got: f64 },
     #[error("unknown phase name: {name}")]
     UnknownPhase { name: String },
+    /// `[nccl]` violates the NCCL env policy (non-NCCL key, empty or
+    /// NUL-bearing value, NCCL_SOCKET_IFNAME set twice).
+    #[error("invalid [nccl] section: {source}")]
+    Nccl { source: NcclEnvError },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +53,11 @@ pub struct FleetConfig {
     pub thresholds: Thresholds,
     #[serde(default)]
     pub nccl: NcclConfig,
+    /// `nccl` resolved and validated, filled once by `validate` (or on
+    /// first access). Private and write-once: the only value it can ever
+    /// hold is one `NcclConfig::resolve` accepted.
+    #[serde(skip)]
+    resolved_nccl_env: OnceLock<NcclEnv>,
 }
 
 /// Hosts may be written as a bare address string or a full table.
@@ -213,11 +224,24 @@ pub struct Bound {
     pub max: Option<f64>,
 }
 
+/// `[nccl]` as written in the file. Resolved into the one `NcclEnv` by
+/// `FleetConfig::validate` (see `FleetConfig::nccl_env`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct NcclConfig {
     /// Value for NCCL_SOCKET_IFNAME on multi-homed nodes.
     pub socket_ifname: Option<String>,
+    /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`; string,
+    /// integer or boolean values).
+    pub env: BTreeMap<String, RawNcclEnvValue>,
+}
+
+impl NcclConfig {
+    /// Validate the section into the single resolved env: `env` stringified,
+    /// plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
+    pub fn resolve(&self) -> Result<NcclEnv, NcclEnvError> {
+        NcclEnv::resolve(self.socket_ifname.as_deref(), &stringify_raw(&self.env)?)
+    }
 }
 
 impl FleetConfig {
@@ -226,7 +250,12 @@ impl FleetConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        let config: FleetConfig = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        Self::from_toml_str(&text, path)
+    }
+
+    /// Parse and validate a config document; `path` only labels errors.
+    pub fn from_toml_str(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        let config: FleetConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source: Box::new(source),
         })?;
@@ -253,6 +282,7 @@ impl FleetConfig {
         if !(frac > 0.0 && frac <= 1.0) {
             return Err(ConfigError::BadBarrierFrac { got: frac });
         }
+        self.nccl_env()?;
         Ok(())
     }
 
@@ -299,6 +329,25 @@ impl FleetConfig {
             counters: None,
             nccl_intranode: self.intranode_sweep_spec(),
         }
+    }
+
+    /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
+    /// NCCL_SOCKET_IFNAME). Every agent spawn carries it on its remote
+    /// command line (`HostSession`), and the results record it.
+    ///
+    /// Resolved once — by `validate`, which `load` always runs — and cached.
+    /// On a config that skipped validation the first call resolves; either
+    /// way every `NcclEnv` handed out passed `NcclConfig::resolve`, so an
+    /// invalid env can never be observed. After `load` this cannot fail.
+    pub fn nccl_env(&self) -> Result<&NcclEnv, ConfigError> {
+        if let Some(env) = self.resolved_nccl_env.get() {
+            return Ok(env);
+        }
+        let env = self
+            .nccl
+            .resolve()
+            .map_err(|source| ConfigError::Nccl { source })?;
+        Ok(self.resolved_nccl_env.get_or_init(|| env))
     }
 
     /// The intra-node sweep parameters, or `None` when the sweep is
