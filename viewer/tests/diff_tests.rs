@@ -355,10 +355,12 @@ fn single_sample_sides_skip_the_noise_gate() {
 }
 
 fn with_env(mut model: ViewModel, entries: &[(&str, &str)]) -> ViewModel {
-    model.nccl_env = entries
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect();
+    model.nccl_env = Some(
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+    );
     model
 }
 
@@ -376,11 +378,11 @@ fn nccl_env_drift_against_the_baseline_is_surfaced() {
     let diff = DiffView::new(&current, &baseline);
     assert_eq!(
         diff.nccl_env_drift,
-        vec![NcclEnvChange::Changed {
+        Some(vec![NcclEnvChange::Changed {
             key: "NCCL_ALGO".into(),
             from: "Ring".into(),
             to: "Tree".into()
-        }]
+        }])
     );
     // Drift is tuning context, never a per-node regression.
     assert!(diff.node_severity.is_empty());
@@ -391,5 +393,20 @@ fn identical_tuning_has_no_nccl_env_drift() {
     let env = [("NCCL_SOCKET_IFNAME", "bond0")];
     let baseline = with_env(vm("base", &["a"], Vec::new()), &env);
     let current = with_env(vm("cur", &["a"], Vec::new()), &env);
-    assert!(DiffView::new(&current, &baseline).nccl_env_drift.is_empty());
+    assert_eq!(
+        DiffView::new(&current, &baseline).nccl_env_drift,
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn an_unrecorded_baseline_env_shows_no_drift() {
+    // A pre-v8 baseline (nccl_env: None) must not produce invented
+    // "+NCCL_SOCKET_IFNAME" drift against a tuned current run.
+    let baseline = vm("base", &["a"], Vec::new());
+    let current = with_env(
+        vm("cur", &["a"], Vec::new()),
+        &[("NCCL_SOCKET_IFNAME", "bond0")],
+    );
+    assert_eq!(DiffView::new(&current, &baseline).nccl_env_drift, None);
 }

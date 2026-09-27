@@ -58,8 +58,9 @@ pub struct DiffView {
     pub edge_issues: BTreeMap<(String, String), Vec<Issue>>,
     /// NCCL tuning that differs from the baseline run. Non-empty means the
     /// two runs' NCCL numbers were produced under different knobs, so
-    /// their deltas are not like-for-like.
-    pub nccl_env_drift: Vec<NcclEnvChange>,
+    /// their deltas are not like-for-like. `None` when either run did not
+    /// record its env — nothing is shown rather than invented drift.
+    pub nccl_env_drift: Option<Vec<NcclEnvChange>>,
 }
 
 struct Finding {
@@ -158,7 +159,7 @@ impl DiffView {
         let mut view = DiffView {
             baseline_run_id: baseline.run_id.clone(),
             rows,
-            nccl_env_drift: nccl_env_drift(&baseline.nccl_env, &current.nccl_env),
+            nccl_env_drift: nccl_env_drift(baseline.nccl_env.as_ref(), current.nccl_env.as_ref()),
             ..DiffView::default()
         };
         for (host, findings) in node_findings {

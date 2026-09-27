@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::nccl_env::{NcclEnv, NcclEnvError};
+use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, OverlapSpec,
     Phase,
@@ -52,6 +53,11 @@ pub struct FleetConfig {
     pub thresholds: Thresholds,
     #[serde(default)]
     pub nccl: NcclConfig,
+    /// `nccl` resolved and validated, filled once by `validate` (or on
+    /// first access). Private and write-once: the only value it can ever
+    /// hold is one `NcclConfig::resolve` accepted.
+    #[serde(skip)]
+    resolved_nccl_env: OnceLock<NcclEnv>,
 }
 
 /// Hosts may be written as a bare address string or a full table.
@@ -213,72 +219,24 @@ pub struct Bound {
     pub max: Option<f64>,
 }
 
-/// `[nccl]` as written in the file. Only ever an intermediate: the config
-/// holds the validated `NcclConfig` built from it.
+/// `[nccl]` as written in the file. Resolved into the one `NcclEnv` by
+/// `FleetConfig::validate` (see `FleetConfig::nccl_env`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct RawNcclConfig {
+pub struct NcclConfig {
     /// Value for NCCL_SOCKET_IFNAME on multi-homed nodes.
     pub socket_ifname: Option<String>,
-    /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`).
-    pub env: BTreeMap<String, String>,
-}
-
-/// Validated `[nccl]` section. The only way to build one is from a
-/// `RawNcclConfig` that passes the NCCL env policy (deserialization goes
-/// through the same `TryFrom`), so a `FleetConfig` can never hold an env
-/// that would be refused on the wire.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(try_from = "RawNcclConfig", into = "RawNcclConfig")]
-pub struct NcclConfig {
-    /// The section as written, kept for serialization and accessors.
-    raw: RawNcclConfig,
-    /// `raw.env` with `raw.socket_ifname` folded in as NCCL_SOCKET_IFNAME.
-    resolved: NcclEnv,
+    /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`; string,
+    /// integer or boolean values).
+    pub env: BTreeMap<String, RawNcclEnvValue>,
 }
 
 impl NcclConfig {
-    /// The typed first-class interface pin (NCCL_SOCKET_IFNAME), if set
-    /// through `socket_ifname` rather than through `env`.
-    pub fn socket_ifname(&self) -> Option<&str> {
-        self.raw.socket_ifname.as_deref()
+    /// Validate the section into the single resolved env: `env` stringified,
+    /// plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
+    pub fn resolve(&self) -> Result<NcclEnv, NcclEnvError> {
+        NcclEnv::resolve(self.socket_ifname.as_deref(), &stringify_raw(&self.env)?)
     }
-
-    /// The single resolved NCCL env every NCCL-creating invocation carries.
-    pub fn resolved_env(&self) -> &NcclEnv {
-        &self.resolved
-    }
-}
-
-impl TryFrom<RawNcclConfig> for NcclConfig {
-    type Error = NcclEnvError;
-
-    fn try_from(raw: RawNcclConfig) -> Result<Self, Self::Error> {
-        let resolved = NcclEnv::resolve(raw.socket_ifname.as_deref(), &raw.env)?;
-        Ok(Self { raw, resolved })
-    }
-}
-
-impl From<NcclConfig> for RawNcclConfig {
-    fn from(config: NcclConfig) -> Self {
-        config.raw
-    }
-}
-
-/// Just enough of the document to reach `[nccl]`, leniently: everything
-/// else is the full parse's business.
-#[derive(Deserialize)]
-struct NcclSectionProbe {
-    #[serde(default)]
-    nccl: Option<RawNcclConfig>,
-}
-
-/// The NCCL env policy violation in `text`, if its `[nccl]` section is
-/// well-formed but disallowed. Shape and syntax problems return `None` and
-/// are left to the full parse, which reports them as `ConfigError::Parse`.
-fn nccl_policy_error(text: &str) -> Option<NcclEnvError> {
-    let probe: NcclSectionProbe = toml::from_str(text).ok()?;
-    NcclConfig::try_from(probe.nccl?).err()
 }
 
 impl FleetConfig {
@@ -292,12 +250,6 @@ impl FleetConfig {
 
     /// Parse and validate a config document; `path` only labels errors.
     pub fn from_toml_str(text: &str, path: &Path) -> Result<Self, ConfigError> {
-        // `NcclConfig` validates during deserialization, where serde can only
-        // carry a message. Check the section first so a policy violation
-        // surfaces as a typed `ConfigError::Nccl` rather than a parse string.
-        if let Some(source) = nccl_policy_error(text) {
-            return Err(ConfigError::Nccl { source });
-        }
         let config: FleetConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source: Box::new(source),
@@ -325,6 +277,7 @@ impl FleetConfig {
         if !(frac > 0.0 && frac <= 1.0) {
             return Err(ConfigError::BadBarrierFrac { got: frac });
         }
+        self.nccl_env()?;
         Ok(())
     }
 
@@ -375,8 +328,20 @@ impl FleetConfig {
     /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
     /// NCCL_SOCKET_IFNAME). Every agent spawn carries it on its remote
     /// command line (`HostSession`), and the results record it.
-    pub fn nccl_env(&self) -> NcclEnv {
-        self.nccl.resolved_env().clone()
+    ///
+    /// Resolved once — by `validate`, which `load` always runs — and cached.
+    /// On a config that skipped validation the first call resolves; either
+    /// way every `NcclEnv` handed out passed `NcclConfig::resolve`, so an
+    /// invalid env can never be observed. After `load` this cannot fail.
+    pub fn nccl_env(&self) -> Result<&NcclEnv, ConfigError> {
+        if let Some(env) = self.resolved_nccl_env.get() {
+            return Ok(env);
+        }
+        let env = self
+            .nccl
+            .resolve()
+            .map_err(|source| ConfigError::Nccl { source })?;
+        Ok(self.resolved_nccl_env.get_or_init(|| env))
     }
 
     /// The overlap-step parameters, shared verbatim by the node-local

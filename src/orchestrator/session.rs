@@ -631,8 +631,6 @@ mod tests {
             "*",
             "~",
             "back\\slash",
-            "line\nbreak",
-            "tab\there",
             "=mlx5_0:1",
             "-x",
             "^docker0,lo",
@@ -652,6 +650,28 @@ mod tests {
                 stdout.strip_suffix('\n'),
                 Some(value),
                 "value mangled by the shell: {script}"
+            );
+        }
+    }
+
+    /// Control characters never reach a command line: single quoting only
+    /// holds across login shells (csh/tcsh break on a quoted newline) for
+    /// one-line values, so `NcclEnv` refuses them up front.
+    #[test]
+    fn control_character_values_are_rejected_before_quoting() {
+        for value in ["line\nbreak", "tab\there", "cr\r", "nul\0", "del\u{7f}"] {
+            let raw = [("NCCL_TEST_VALUE".to_string(), value.to_string())]
+                .into_iter()
+                .collect();
+            assert!(
+                matches!(
+                    NcclEnv::from_map(&raw),
+                    Err(crate::nccl_env::NcclEnvError::InvalidValue {
+                        reason: crate::nccl_env::NcclEnvValueError::ControlCharacter,
+                        ..
+                    })
+                ),
+                "{value:?} must be rejected"
             );
         }
     }

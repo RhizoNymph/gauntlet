@@ -49,8 +49,17 @@ impl NcclEnvChange {
 }
 
 /// Every key that differs between `baseline` and `current`, in key order.
-/// Empty means the two runs used identical NCCL tuning.
+/// `Some(empty)` means the two runs used identical NCCL tuning. `None` when
+/// either run did not record its env (pre-v8 documents): comparing against
+/// an unknown would invent drift, so there is nothing to say.
 pub fn nccl_env_drift(
+    baseline: Option<&BTreeMap<String, String>>,
+    current: Option<&BTreeMap<String, String>>,
+) -> Option<Vec<NcclEnvChange>> {
+    Some(env_drift(baseline?, current?))
+}
+
+fn env_drift(
     baseline: &BTreeMap<String, String>,
     current: &BTreeMap<String, String>,
 ) -> Vec<NcclEnvChange> {
@@ -77,8 +86,12 @@ pub fn nccl_env_drift(
         .collect()
 }
 
-/// "K=v K=v" in key order, or "(none)" for an untuned run.
-pub fn format_nccl_env(env: &BTreeMap<String, String>) -> String {
+/// "K=v K=v" in key order, "(none)" for an untuned run, or
+/// "(not recorded)" for a document that predates the field.
+pub fn format_nccl_env(env: Option<&BTreeMap<String, String>>) -> String {
+    let Some(env) = env else {
+        return "(not recorded)".to_string();
+    };
     if env.is_empty() {
         return "(none)".to_string();
     }
@@ -102,8 +115,9 @@ mod tests {
     #[test]
     fn identical_envs_have_no_drift() {
         let tuned = env(&[("NCCL_DEBUG", "WARN"), ("NCCL_SOCKET_IFNAME", "bond0")]);
-        assert!(nccl_env_drift(&tuned, &tuned).is_empty());
-        assert!(nccl_env_drift(&BTreeMap::new(), &BTreeMap::new()).is_empty());
+        assert_eq!(nccl_env_drift(Some(&tuned), Some(&tuned)), Some(vec![]));
+        let untuned = BTreeMap::new();
+        assert_eq!(nccl_env_drift(Some(&untuned), Some(&untuned)), Some(vec![]));
     }
 
     #[test]
@@ -118,7 +132,7 @@ mod tests {
             ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
             ("NCCL_SOCKET_IFNAME", "bond0"),
         ]);
-        let drift = nccl_env_drift(&baseline, &current);
+        let drift = nccl_env_drift(Some(&baseline), Some(&current)).expect("both recorded");
         assert_eq!(
             drift,
             vec![
@@ -150,27 +164,40 @@ mod tests {
     }
 
     #[test]
-    fn pre_v8_baselines_read_as_untuned() {
-        // Documents from before the field existed decode with an empty map;
-        // any tuning in the current run shows up as additions.
-        let drift = nccl_env_drift(&BTreeMap::new(), &env(&[("NCCL_SOCKET_IFNAME", "bond0")]));
+    fn unrecorded_envs_report_no_drift_at_all() {
+        // A pre-v8 baseline says nothing about its tuning: no invented
+        // "+NCCL_SOCKET_IFNAME" against it, in either direction.
+        let tuned = env(&[("NCCL_SOCKET_IFNAME", "bond0")]);
+        assert_eq!(nccl_env_drift(None, Some(&tuned)), None);
+        assert_eq!(nccl_env_drift(Some(&tuned), None), None);
+        assert_eq!(nccl_env_drift(None, None), None);
+    }
+
+    #[test]
+    fn an_untuned_baseline_is_real_drift() {
+        // Some(empty) is a recorded, untuned run: tuning added since is drift.
+        let drift = nccl_env_drift(
+            Some(&BTreeMap::new()),
+            Some(&env(&[("NCCL_SOCKET_IFNAME", "bond0")])),
+        );
         assert_eq!(
             drift,
-            vec![NcclEnvChange::Added {
+            Some(vec![NcclEnvChange::Added {
                 key: "NCCL_SOCKET_IFNAME".into(),
                 value: "bond0".into()
-            }]
+            }])
         );
     }
 
     #[test]
     fn formatting_is_key_ordered_and_marks_untuned_runs() {
-        assert_eq!(format_nccl_env(&BTreeMap::new()), "(none)");
+        assert_eq!(format_nccl_env(None), "(not recorded)");
+        assert_eq!(format_nccl_env(Some(&BTreeMap::new())), "(none)");
         assert_eq!(
-            format_nccl_env(&env(&[
+            format_nccl_env(Some(&env(&[
                 ("NCCL_SOCKET_IFNAME", "bond0"),
                 ("NCCL_DEBUG", "WARN")
-            ])),
+            ]))),
             "NCCL_DEBUG=WARN NCCL_SOCKET_IFNAME=bond0"
         );
     }

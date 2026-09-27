@@ -111,7 +111,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     let hosts: Vec<HostConfig> = config.hosts().collect();
     let ssh = Arc::new(config.ssh.clone());
     // Same spawn environment as `gauntlet run`, so probes see what runs see.
-    let nccl_env = Arc::new(config.nccl_env());
+    let nccl_env = Arc::new(config.nccl_env()?.clone());
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     info!(
         hosts = hosts.len(),

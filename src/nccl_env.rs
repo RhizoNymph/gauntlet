@@ -16,9 +16,16 @@
 //! results document cannot show, so they are rejected rather than passed
 //! through. Values must be non-empty (an empty value is almost always a
 //! templating mistake, and NCCL treats "set but empty" inconsistently
-//! across knobs) and NUL-free (an environment string cannot carry an
-//! interior NUL). The key charset also means a key is a literal shell word;
-//! values are quoted by the command-line builder.
+//! across knobs) and free of ASCII control characters: an environment string
+//! cannot carry a NUL, and the command-line builder's single quoting is only
+//! portable across login shells (csh/tcsh break on a quoted newline) when
+//! values stay on one line. The key charset makes a key a literal shell
+//! word; values are quoted by the command-line builder.
+//!
+//! TOML integers and booleans are accepted and stringified (booleans as
+//! `1`/`0`, NCCL's convention), so `NCCL_IB_GID_INDEX = 3` works as well
+//! as `"3"`. Floats, arrays and tables are rejected (a TOML datetime
+//! reaches serde as its string form and is passed through verbatim).
 //!
 //! Every constructor validates, so an unvalidated map cannot reach a
 //! command line.
@@ -27,6 +34,7 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// The one NCCL knob that also has a first-class config field
@@ -40,8 +48,10 @@ const KEY_PREFIX: &str = "NCCL_";
 pub enum NcclEnvValueError {
     #[error("value is empty")]
     Empty,
-    #[error("value contains a NUL byte")]
-    ContainsNul,
+    /// NUL, newline, tab, DEL, ...: not representable in an environment
+    /// string (NUL) or not portably quotable on a remote login shell.
+    #[error("value contains an ASCII control character")]
+    ControlCharacter,
 }
 
 /// Why an NCCL env entry (or the config section producing it) was rejected.
@@ -58,6 +68,8 @@ pub enum NcclEnvError {
         "NCCL_SOCKET_IFNAME is set by both [nccl] socket_ifname and [nccl] env; set it in one place"
     )]
     SocketIfnameConflict,
+    #[error("NCCL env value for {key} is a TOML {found}; use a string, integer or boolean")]
+    UnsupportedValueType { key: String, found: &'static str },
 }
 
 /// An environment variable name NCCL owns: `^NCCL_[A-Z0-9_]+$`.
@@ -100,7 +112,7 @@ impl fmt::Display for NcclEnvKey {
     }
 }
 
-/// A non-empty, NUL-free environment value.
+/// A non-empty environment value free of ASCII control characters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NcclEnvValue(String);
 
@@ -108,8 +120,8 @@ impl NcclEnvValue {
     pub fn parse(value: &str) -> Result<Self, NcclEnvValueError> {
         if value.is_empty() {
             Err(NcclEnvValueError::Empty)
-        } else if value.contains('\0') {
-            Err(NcclEnvValueError::ContainsNul)
+        } else if value.chars().any(|ch| ch.is_ascii_control()) {
+            Err(NcclEnvValueError::ControlCharacter)
         } else {
             Ok(Self(value.to_string()))
         }
@@ -118,6 +130,44 @@ impl NcclEnvValue {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// One `[nccl] env` value as written in TOML. Untagged, so the file keeps
+/// plain TOML syntax; everything that is not a string, integer or boolean
+/// lands in `Unsupported` and is rejected with a typed error naming the key
+/// (rather than an anonymous serde "did not match any variant").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RawNcclEnvValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    Unsupported(toml::Value),
+}
+
+impl RawNcclEnvValue {
+    /// The environment string for this value: strings verbatim, integers in
+    /// decimal, booleans as `1` / `0`.
+    pub fn to_env_string(&self, key: &str) -> Result<String, NcclEnvError> {
+        match self {
+            RawNcclEnvValue::String(value) => Ok(value.clone()),
+            RawNcclEnvValue::Integer(value) => Ok(value.to_string()),
+            RawNcclEnvValue::Boolean(value) => Ok(if *value { "1" } else { "0" }.to_string()),
+            RawNcclEnvValue::Unsupported(value) => Err(NcclEnvError::UnsupportedValueType {
+                key: key.to_string(),
+                found: value.type_str(),
+            }),
+        }
+    }
+}
+
+/// Stringify a raw `[nccl] env` table (see `RawNcclEnvValue::to_env_string`).
+pub fn stringify_raw(
+    raw: &BTreeMap<String, RawNcclEnvValue>,
+) -> Result<BTreeMap<String, String>, NcclEnvError> {
+    raw.iter()
+        .map(|(key, value)| Ok((key.clone(), value.to_env_string(key)?)))
+        .collect()
 }
 
 /// A validated NCCL environment: what every agent process is started with.
@@ -252,12 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn values_must_be_non_empty_and_nul_free() {
+    fn values_must_be_non_empty_and_control_free() {
         assert_eq!(NcclEnvValue::parse(""), Err(NcclEnvValueError::Empty));
-        assert_eq!(
-            NcclEnvValue::parse("mlx5_0\0mlx5_1"),
-            Err(NcclEnvValueError::ContainsNul)
-        );
+        for bad in [
+            "mlx5_0\0mlx5_1",
+            "line\nbreak",
+            "cr\rhere",
+            "tab\there",
+            "bell\u{7}",
+            "del\u{7f}",
+            "esc\u{1b}[31m",
+        ] {
+            assert_eq!(
+                NcclEnvValue::parse(bad),
+                Err(NcclEnvValueError::ControlCharacter),
+                "{bad:?}"
+            );
+        }
         // Anything else is NCCL's business: commas, carets, spaces, '='.
         for value in ["mlx5_0,mlx5_1", "^docker0,lo", "=mlx5_0:1", "INFO", "a b"] {
             assert_eq!(
@@ -338,9 +399,53 @@ mod tests {
             NcclEnv::resolve(Some("bo\0nd0"), &BTreeMap::new()),
             Err(NcclEnvError::InvalidValue {
                 key: SOCKET_IFNAME.into(),
-                reason: NcclEnvValueError::ContainsNul,
+                reason: NcclEnvValueError::ControlCharacter,
             })
         );
+    }
+
+    #[test]
+    fn toml_scalars_stringify_and_other_types_are_rejected() {
+        let table: toml::Table = toml::from_str(
+            r#"
+            NCCL_A = "mlx5_0"
+            NCCL_B = 3
+            NCCL_C = -1
+            NCCL_D = true
+            NCCL_E = false
+            "#,
+        )
+        .expect("toml");
+        let raw: BTreeMap<String, RawNcclEnvValue> =
+            toml::Value::Table(table).try_into().expect("raw values");
+        assert_eq!(
+            stringify_raw(&raw).expect("scalars"),
+            map(&[
+                ("NCCL_A", "mlx5_0"),
+                ("NCCL_B", "3"),
+                ("NCCL_C", "-1"),
+                ("NCCL_D", "1"),
+                ("NCCL_E", "0"),
+            ])
+        );
+
+        for (text, found) in [
+            ("NCCL_X = 1.5", "float"),
+            ("NCCL_X = [1, 2]", "array"),
+            ("NCCL_X = { a = 1 }", "table"),
+        ] {
+            let table: toml::Table = toml::from_str(text).expect("toml");
+            let raw: BTreeMap<String, RawNcclEnvValue> =
+                toml::Value::Table(table).try_into().expect("raw values");
+            assert_eq!(
+                stringify_raw(&raw),
+                Err(NcclEnvError::UnsupportedValueType {
+                    key: "NCCL_X".into(),
+                    found
+                }),
+                "{text}"
+            );
+        }
     }
 
     #[test]

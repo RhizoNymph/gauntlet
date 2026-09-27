@@ -99,6 +99,7 @@ impl RootView {
             };
             let (warned, failed) = (count(Severity::Warn), count(Severity::Bad));
             let regressed_links = diff.edge_severity.len();
+            let drift = diff.nccl_env_drift.as_ref();
             card = card
                 .child(title(format!("diff vs {}", diff.baseline_run_id)))
                 .child(
@@ -123,15 +124,15 @@ impl RootView {
                                 ),
                             ))
                         })
-                        .when(!diff.nccl_env_drift.is_empty(), |row| {
+                        .when(drift.is_some_and(|d| !d.is_empty()), |row| {
                             row.child(chip(WARN, "nccl env drift".into()))
                         }),
                 );
             // Tuning drift explains (or invalidates) NCCL deltas, so it is
             // spelled out, not just flagged.
-            if !diff.nccl_env_drift.is_empty() {
+            if let Some(changes) = drift.filter(|d| !d.is_empty()) {
                 let mut drift = div().flex().flex_col().gap_1();
-                for change in &diff.nccl_env_drift {
+                for change in changes {
                     drift = drift.child(
                         div()
                             .text_size(px(11.0))
@@ -194,7 +195,10 @@ impl RootView {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(MUTED))
-                    .child(format!("nccl env: {}", format_nccl_env(&vm.nccl_env))),
+                    .child(format!(
+                        "nccl env: {}",
+                        format_nccl_env(vm.nccl_env.as_ref())
+                    )),
             );
         }
 

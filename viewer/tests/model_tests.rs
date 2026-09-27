@@ -554,19 +554,17 @@ fn view_model_carries_the_run_nccl_env() {
         "#,
     );
     let vm = ViewModel::new(&results(&tuned, BTreeMap::new()));
+    let env = vm.nccl_env.expect("recorded");
     assert_eq!(
-        vm.nccl_env.get("NCCL_SOCKET_IFNAME").map(String::as_str),
+        env.get("NCCL_SOCKET_IFNAME").map(String::as_str),
         Some("bond0")
     );
-    assert_eq!(
-        vm.nccl_env.get("NCCL_DEBUG").map(String::as_str),
-        Some("WARN")
-    );
+    assert_eq!(env.get("NCCL_DEBUG").map(String::as_str), Some("WARN"));
 
     let untuned = config(r#"hosts = ["a", "b"]"#);
-    assert!(
-        ViewModel::new(&results(&untuned, BTreeMap::new()))
-            .nccl_env
-            .is_empty()
+    assert_eq!(
+        ViewModel::new(&results(&untuned, BTreeMap::new())).nccl_env,
+        Some(BTreeMap::new()),
+        "untuned is recorded as empty, not as unknown"
     );
 }

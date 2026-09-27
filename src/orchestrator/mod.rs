@@ -40,6 +40,7 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::analysis::skew::BarrierSkew;
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
+use crate::nccl_env::NcclEnv;
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit,
@@ -215,7 +216,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, &sink).await;
+    let sessions = connect_fleet(&config, config.nccl_env()?, &sink).await;
     let sessions = deploy_fleet(&config, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
@@ -346,12 +347,16 @@ fn epoch_secs() -> u64 {
 /// Open every session with `ssh.max_concurrent` establishments in flight.
 /// Established sessions are held for the whole run (the permit is only for
 /// the handshake). Order follows the config so host indices are stable.
-async fn connect_fleet(config: &FleetConfig, sink: &ObservationSink) -> Vec<Arc<HostSession>> {
+async fn connect_fleet(
+    config: &FleetConfig,
+    nccl_env: &NcclEnv,
+    sink: &ObservationSink,
+) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     // Set on every agent spawn's command line: the one path by which NCCL
     // tuning reaches every communicator (sweep, barrier, both overlap
     // steps) without the agent ever mutating its own environment.
-    let nccl_env = Arc::new(config.nccl_env());
+    let nccl_env = Arc::new(nccl_env.clone());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {

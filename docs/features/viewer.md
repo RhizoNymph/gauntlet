@@ -52,8 +52,9 @@ connected fleet graph plus a quantitative metric table.
 - NCCL tuning drift (schema v8 `nccl_env`): diff mode shows an "nccl env
   drift" chip and one line per added/removed/changed NCCL_* key vs the
   baseline (`DiffView.nccl_env_drift`, via
-  `gauntlet::report::nccl_env::nccl_env_drift`); the overview shows the
+  `gauntlet::report::nccl_env::nccl_env_drift`). The overview shows the
   run's env. Drift is context for NCCL deltas, never a node regression.
+  If either run predates the field (`nccl_env: None`), no drift is shown.
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report

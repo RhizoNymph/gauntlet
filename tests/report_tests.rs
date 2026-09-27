@@ -1079,13 +1079,16 @@ fn results_record_the_resolved_nccl_env() {
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
     .collect();
-    assert_eq!(results.nccl_env, expected);
-    assert_eq!(results.nccl_env, config.nccl_env().to_string_map());
+    assert_eq!(results.nccl_env.as_ref(), Some(&expected));
+    assert_eq!(
+        results.nccl_env,
+        Some(config.nccl_env().expect("validated").to_string_map())
+    );
 
     // The document round-trips, and the table names the tuning up front.
     let json = serde_json::to_string(&results).expect("serialize");
     let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back.nccl_env, expected);
+    assert_eq!(back.nccl_env, Some(expected));
     let mut rendered = Vec::new();
     report::render_table(&results, &mut rendered).expect("render");
     let rendered = String::from_utf8(rendered).expect("utf8");
@@ -1098,9 +1101,9 @@ fn results_record_the_resolved_nccl_env() {
 }
 
 #[test]
-fn untuned_runs_and_pre_v8_documents_carry_an_empty_nccl_env() {
+fn untuned_runs_record_an_empty_env_and_pre_v8_documents_none() {
     let results = report::build(&config_for(&["a"]), BTreeMap::new(), 1, 2);
-    assert!(results.nccl_env.is_empty());
+    assert_eq!(results.nccl_env, Some(BTreeMap::new()));
     let mut rendered = Vec::new();
     report::render_table(&results, &mut rendered).expect("render");
     assert!(
@@ -1117,5 +1120,12 @@ fn untuned_runs_and_pre_v8_documents_carry_an_empty_nccl_env() {
         .remove("nccl_env")
         .expect("field present in v8");
     let old: report::RunResults = serde_json::from_value(value).expect("pre-v8 decodes");
-    assert!(old.nccl_env.is_empty());
+    assert_eq!(old.nccl_env, None, "absent means not recorded, not untuned");
+    let mut rendered = Vec::new();
+    report::render_table(&old, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (not recorded)")
+    );
 }

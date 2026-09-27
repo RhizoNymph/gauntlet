@@ -20,6 +20,7 @@ use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
+use crate::nccl_env::NcclEnv;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
@@ -42,8 +43,8 @@ use crate::proto::{
 // overlap_retention.fleet_all_reduce records. No field changed shape, so
 // pre-v7 documents decode unchanged (they simply lack the new groups).
 // v8: run-level `nccl_env` — the resolved NCCL environment every NCCL
-// communicator in the run was created under. Defaults to empty, so pre-v8
-// documents decode as untuned runs.
+// communicator in the run was created under. Optional: pre-v8 documents
+// decode with it absent ("not recorded"), which suppresses drift display.
 pub const SCHEMA_VERSION: u32 = 8;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
@@ -80,14 +81,15 @@ pub struct RunResults {
     pub debug_build: bool,
     pub hosts: BTreeMap<String, HostObservations>,
     /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
-    /// NCCL_SOCKET_IFNAME) sent to every host and every NCCL-creating
-    /// invocation. Run-level because it is fleet-uniform by construction;
-    /// baseline comparisons diff it (`nccl_env::nccl_env_drift`) since
-    /// tuning drift makes NCCL numbers incomparable. A plain string map
-    /// (not the validated wire type) so a document always decodes, even
-    /// under a future, different key policy.
+    /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
+    /// because it is fleet-uniform by construction; baseline comparisons
+    /// diff it (`nccl_env::nccl_env_drift`) since tuning drift makes NCCL
+    /// numbers incomparable. `None` = not recorded (pre-v8 documents, via
+    /// the serde default, so old history keeps loading); `Some(empty)` =
+    /// an untuned run. A plain string map so a document always decodes,
+    /// even under a future, different key policy.
     #[serde(default)]
-    pub nccl_env: BTreeMap<String, String>,
+    pub nccl_env: Option<BTreeMap<String, String>>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -383,7 +385,10 @@ pub fn build(
         finished_epoch_secs,
         debug_build: false,
         hosts: observations,
-        nccl_env: config.nccl_env().to_string_map(),
+        // `None` only for a config whose `[nccl]` never validated, which
+        // `FleetConfig::load` rules out; recorded as "not recorded" rather
+        // than guessed.
+        nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
         fleet,
         aggregates,
         calibration,
@@ -1002,7 +1007,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     writeln!(
         out,
         "nccl env: {}",
-        nccl_env::format_nccl_env(&results.nccl_env)
+        nccl_env::format_nccl_env(results.nccl_env.as_ref())
     )?;
 
     render_hosts(results, out)?;
