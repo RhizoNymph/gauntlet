@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use super::attribution::Attribution;
 use crate::proto::{
     GemmDtype, MetricRecord, OverlapFleetReport, OverlapGemmLeg, RankBlock, Scope, TestId,
     TestOutcome, Unit, overlap_metric,
@@ -20,39 +21,48 @@ pub(super) type OutcomeRecord = (TestId, Scope, TestOutcome);
 const NO_REPORT: &str = "rank produced no fleet overlap report";
 
 /// Everything the results document gets for one host of the fleet-overlap
-/// world, given the reports (keyed by global rank) and the host's failure
-/// from the driver, if any.
+/// world, given the reports (keyed by global rank, already checked for
+/// ownership) and the host's attributed failure from the driver, if any.
 ///
 /// - No report from any rank of the block: the whole node's participation
-///   failed (grouped init, process death, timeout) — node-scope Failed
-///   outcomes for both fleet tests, as before rank-per-GPU.
+///   failed (grouped init, process death, timeout, or an abort caused by
+///   another host) — node-scope outcomes for both fleet tests: Failed when
+///   this host is to blame (or nobody identifiable is), Skipped when
+///   another host's failure aborted the step.
 /// - Some ranks reported: each reporting GPU gets its metrics and
-///   outcomes; each silent GPU gets per-GPU Failed outcomes, so one lost
-///   rank never hides its siblings.
+///   outcomes; each silent GPU gets the same kind of outcome at GPU scope,
+///   so one lost rank never hides its siblings.
 pub(super) fn host_overlap_records(
     block: RankBlock,
     reports: &BTreeMap<u32, OverlapFleetReport>,
     dtype: GemmDtype,
-    host_failure: Option<&str>,
+    host_failure: Option<&Attribution>,
 ) -> (Vec<MetricRecord>, Vec<OutcomeRecord>) {
-    let reason = host_failure.unwrap_or(NO_REPORT);
+    let silent = |scope: Scope| match host_failure {
+        Some(Attribution::Skipped { reason }) => {
+            outcomes_with(scope, |r| TestOutcome::Skipped { reason: r }, reason)
+        }
+        Some(Attribution::Failed { reason }) => step_outcomes(scope, reason),
+        None => step_outcomes(scope, NO_REPORT),
+    };
     let reported = block.ranks().any(|rank| reports.contains_key(&rank));
     if !reported {
-        return (Vec::new(), step_outcomes(Scope::Node, reason));
+        return (Vec::new(), silent(Scope::Node));
     }
     let mut metrics = Vec::new();
     let mut outcomes = Vec::new();
-    for (local, rank) in block.ranks().enumerate() {
-        let gpu = Scope::Gpu {
-            index: local as u32,
+    for rank in block.ranks() {
+        let Some(index) = block.local_index(rank) else {
+            continue;
         };
+        let gpu = Scope::Gpu { index };
         match reports.get(&rank) {
             Some(report) => {
                 let (m, o) = rank_records(report, gpu, dtype);
                 metrics.extend(m);
                 outcomes.extend(o);
             }
-            None => outcomes.extend(step_outcomes(gpu, reason)),
+            None => outcomes.extend(silent(gpu)),
         }
     }
     (metrics, outcomes)
@@ -259,12 +269,11 @@ mod tests {
     #[test]
     fn a_block_with_no_reports_is_a_node_level_failure() {
         let block = RankBlock::new(8, 8).expect("block");
-        let (metrics, outcomes) = host_overlap_records(
-            block,
-            &BTreeMap::new(),
-            GemmDtype::Bf16,
-            Some("nccl ranks 8..16 timed out after 600s"),
-        );
+        let failure = Attribution::Failed {
+            reason: "nccl ranks 8..16 timed out after 600s".into(),
+        };
+        let (metrics, outcomes) =
+            host_overlap_records(block, &BTreeMap::new(), GemmDtype::Bf16, Some(&failure));
         assert!(metrics.is_empty());
         assert_eq!(
             outcomes,
@@ -285,5 +294,24 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_host_aborted_by_another_hosts_failure_is_skipped_not_failed() {
+        let block = RankBlock::new(0, 2).expect("block");
+        let aborted = Attribution::Skipped {
+            reason: "fleet overlap aborted: rank failure on 10.1.1.68 (killed)".into(),
+        };
+        let (metrics, outcomes) =
+            host_overlap_records(block, &BTreeMap::new(), GemmDtype::Bf16, Some(&aborted));
+        assert!(metrics.is_empty());
+        assert_eq!(outcomes.len(), 2);
+        for (_, scope, outcome) in &outcomes {
+            assert_eq!(*scope, Scope::Node);
+            assert!(
+                matches!(outcome, TestOutcome::Skipped { reason } if reason.contains("10.1.1.68")),
+                "{outcome:?}"
+            );
+        }
     }
 }

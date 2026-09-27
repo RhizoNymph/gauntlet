@@ -1,15 +1,23 @@
 //! One process, many ranks: the host's whole rank block of the fleet NCCL
 //! world, driven from a single thread (gpu feature only).
 //!
-//! Init follows NCCL's documented "multiple GPUs from one thread" pattern:
-//! every local device's communicator is created with `ncclCommInitRank`
-//! (cudarc `Comm::from_rank`, with that device's context bound so NCCL
-//! picks the right device) inside one `ncclGroupStart`/`ncclGroupEnd`, so
-//! the blocking per-rank inits complete together at group end instead of
-//! deadlocking each other. Every collective is then issued once per local
-//! rank inside a group per operation. Any failure during grouped init
-//! fails the whole node's participation — the world was sized for every
-//! local GPU, so a partial block cannot join.
+//! Two stages, so that nothing fallible except `ncclCommInitRank` itself
+//! runs inside the init group:
+//!
+//! 1. [`PreparedRanks::new`] — no NCCL calls. Checks the block against
+//!    CUDA's visible device count (`check_local_devices`), creates a
+//!    context per local GPU, proves each one binds to this thread, and
+//!    creates the per-rank completion events. Callers allocate their
+//!    collective buffers on [`PreparedRanks::streams`] before connecting.
+//! 2. [`PreparedRanks::connect`] — NCCL's documented "multiple GPUs from
+//!    one thread" pattern: every local device's `ncclCommInitRank` (cudarc
+//!    `Comm::from_rank`, with that device's context bound so NCCL picks the
+//!    right device) inside one `ncclGroupStart`/`ncclGroupEnd`, so the
+//!    blocking per-rank inits complete together at group end.
+//!
+//! Any failure fails the whole node's participation — the world was sized
+//! for every local GPU, so a partial block cannot join. Every collective is
+//! then issued once per local rank inside a group per operation.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,6 +29,7 @@ use cudarc::driver::{CudaContext, CudaEvent, CudaStream, DriverError, sys};
 use cudarc::nccl::result::{NcclError, NcclStatus};
 use cudarc::nccl::{Comm, Id, group_end, group_start};
 
+use super::check_local_devices;
 use super::completion::{Readiness, first_ready_times};
 use crate::proto::RankAssignment;
 
@@ -57,71 +66,142 @@ pub fn decode_id(encoded: &str) -> Result<Id> {
     Ok(Id::uninit(internal))
 }
 
-/// One local rank: global rank, its device's context, the default stream
-/// that carries its collectives, its communicator, and a completion
-/// marker for per-rank timing.
+/// One local rank before the communicator exists.
+struct PreparedRank {
+    global: u32,
+    ctx: Arc<CudaContext>,
+    done: CudaEvent,
+}
+
+/// Every rank of this host's block, validated and set up, not yet
+/// connected: stage 1.
+pub(super) struct PreparedRanks {
+    assignment: RankAssignment,
+    ranks: Vec<PreparedRank>,
+}
+
+impl PreparedRanks {
+    /// Every fallible non-NCCL step, for all local ranks, before any NCCL
+    /// call: device-count check, contexts, thread binding, events.
+    pub(super) fn new(assignment: RankAssignment) -> Result<Self> {
+        let block = assignment.block();
+        let visible = CudaContext::device_count().context("counting cuda devices")?;
+        check_local_devices(block.count(), visible)?;
+        let mut ranks = Vec::with_capacity(block.count() as usize);
+        for global in block.ranks() {
+            let local = global - block.base();
+            let ctx = CudaContext::new(local as usize)
+                .with_context(|| format!("creating cuda context for local gpu {local}"))?;
+            ctx.bind_to_thread()
+                .with_context(|| format!("binding local gpu {local} to the driver thread"))?;
+            let done = ctx
+                .new_event(None)
+                .with_context(|| format!("creating completion event for rank {global}"))?;
+            ranks.push(PreparedRank { global, ctx, done });
+        }
+        Ok(Self { assignment, ranks })
+    }
+
+    /// Each local rank's collective stream (its device's default stream),
+    /// local GPU order — the stream the communicator will be bound to.
+    pub(super) fn streams(&self) -> Vec<Arc<CudaStream>> {
+        self.ranks
+            .iter()
+            .map(|rank| rank.ctx.default_stream())
+            .collect()
+    }
+
+    /// Stage 2: create every communicator inside one NCCL group. The only
+    /// fallible calls inside the group are the binds (already proven in
+    /// stage 1) and `ncclCommInitRank`.
+    pub(super) fn connect(self, id: Id) -> Result<LocalRanks> {
+        let world_size = self.assignment.world_size() as usize;
+        group_start().map_err(|error| nccl_error("ncclGroupStart (init)", error))?;
+        let mut comms: Vec<Comm> = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let issued = rank
+                .ctx
+                .bind_to_thread()
+                .map_err(|error| anyhow!("binding gpu {}: {error}", rank.ctx.ordinal()))
+                .and_then(|()| {
+                    // ncclCommInitRank picks the *current* device.
+                    Comm::from_rank(
+                        rank.ctx.default_stream(),
+                        rank.global as usize,
+                        world_size,
+                        id,
+                    )
+                    .map_err(|error| nccl_error("ncclCommInitRank", error))
+                });
+            match issued {
+                Ok(comm) => comms.push(comm),
+                Err(error) => {
+                    abandon_partial_init(comms);
+                    return Err(error.context(format!("grouped init of rank {}", rank.global)));
+                }
+            }
+        }
+        if let Err(error) = group_end() {
+            abandon_partial_init(comms);
+            return Err(nccl_error("ncclGroupEnd (init)", error));
+        }
+        let ranks = self
+            .ranks
+            .into_iter()
+            .zip(comms)
+            .map(|(rank, comm)| LocalRank {
+                global: rank.global,
+                comm,
+                done: rank.done,
+            })
+            .collect();
+        Ok(LocalRanks {
+            assignment: self.assignment,
+            ranks,
+        })
+    }
+}
+
+/// Failure path of a grouped init. Deliberately does *not* end the group:
+/// `ncclGroupEnd` would execute the already-queued inits of the earlier
+/// local ranks, which then block until the whole world joins — which this
+/// host no longer will. Deliberately does *not* drop the half-built
+/// communicators either: cudarc's `Drop` calls
+/// `comm_abort(..).expect(..)`, which can panic on a communicator whose
+/// init never ran. The caller is about to fail the node and exit (the
+/// orchestrator then aborts the rest of the world), so leaking both is the
+/// correct cleanup; process exit reclaims them.
+fn abandon_partial_init(comms: Vec<Comm>) {
+    for comm in comms {
+        std::mem::forget(comm);
+    }
+}
+
+/// One connected local rank. The collective stream and the device context
+/// are the communicator's own (single source of truth).
 pub(super) struct LocalRank {
     pub global: u32,
-    pub ctx: Arc<CudaContext>,
-    pub stream: Arc<CudaStream>,
     pub comm: Comm,
     done: CudaEvent,
 }
 
-/// Every rank of this host's block, local GPU `i` at index `i`.
+impl LocalRank {
+    pub(super) fn stream(&self) -> Arc<CudaStream> {
+        self.comm.stream()
+    }
+
+    pub(super) fn ctx(&self) -> &Arc<CudaContext> {
+        self.comm.context()
+    }
+}
+
+/// Every rank of this host's block, local GPU `i` at index `i`, connected.
 pub(super) struct LocalRanks {
     assignment: RankAssignment,
     ranks: Vec<LocalRank>,
 }
 
 impl LocalRanks {
-    /// Create a context per local GPU, then every communicator in one NCCL
-    /// group. All-or-nothing: an error anywhere fails the node.
-    pub(super) fn init(assignment: RankAssignment, id: Id) -> Result<Self> {
-        let block = assignment.block();
-        let world_size = assignment.world_size() as usize;
-        let mut contexts = Vec::with_capacity(block.count() as usize);
-        for local in 0..block.count() {
-            contexts.push(
-                CudaContext::new(local as usize)
-                    .with_context(|| format!("creating cuda context for local gpu {local}"))?,
-            );
-        }
-
-        let mut comms: Vec<Comm> = Vec::with_capacity(contexts.len());
-        let issued = grouped("ncclGroupStart/ncclCommInitRank", || {
-            for (global, ctx) in block.ranks().zip(&contexts) {
-                // ncclCommInitRank picks the *current* device.
-                ctx.bind_to_thread()
-                    .map_err(|error| anyhow!("binding gpu {}: {error}", ctx.ordinal()))?;
-                let comm = Comm::from_rank(ctx.default_stream(), global as usize, world_size, id)
-                    .map_err(|error| nccl_error("ncclCommInitRank", error))?;
-                comms.push(comm);
-            }
-            Ok(())
-        });
-        issued.context("grouped communicator init")?;
-
-        let ranks = block
-            .ranks()
-            .zip(contexts)
-            .zip(comms)
-            .map(|((global, ctx), comm)| {
-                let done = ctx
-                    .new_event(None)
-                    .with_context(|| format!("creating completion event for rank {global}"))?;
-                Ok(LocalRank {
-                    global,
-                    stream: ctx.default_stream(),
-                    ctx,
-                    comm,
-                    done,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { assignment, ranks })
-    }
-
     pub(super) fn assignment(&self) -> RankAssignment {
         self.assignment
     }
@@ -137,7 +217,7 @@ impl LocalRanks {
     pub(super) fn contexts(&self) -> Vec<Arc<CudaContext>> {
         self.ranks
             .iter()
-            .map(|rank| Arc::clone(&rank.ctx))
+            .map(|rank| Arc::clone(rank.ctx()))
             .collect()
     }
 
@@ -158,7 +238,7 @@ impl LocalRanks {
 
     pub(super) fn sync_all(&self) -> Result<()> {
         for rank in &self.ranks {
-            rank.stream.synchronize()?;
+            rank.stream().synchronize()?;
         }
         Ok(())
     }
@@ -168,7 +248,7 @@ impl LocalRanks {
     /// `completion`). Leaves every stream drained.
     pub(super) fn completion_secs(&self, since: Instant) -> Result<Vec<f64>> {
         for rank in &self.ranks {
-            rank.done.record(&rank.stream)?;
+            rank.done.record(&rank.stream())?;
         }
         let secs = first_ready_times(
             self.ranks.len(),
@@ -189,9 +269,11 @@ fn query(event: &CudaEvent) -> Result<Readiness, DriverError> {
     }
 }
 
-/// Run `body` between `ncclGroupStart` and `ncclGroupEnd`. The group is
-/// always closed — even when `body` fails part-way — so NCCL's group depth
-/// never leaks into the next call; the body's error wins over the end's.
+/// Run a collective `body` between `ncclGroupStart` and `ncclGroupEnd`.
+/// The group is always closed — even when `body` fails part-way — so
+/// NCCL's group depth never leaks into the next call; the body's error
+/// wins over the end's. (Collectives only; grouped *init* has its own
+/// failure path, `abandon_partial_init`.)
 fn grouped(what: &str, body: impl FnOnce() -> Result<()>) -> Result<()> {
     group_start().map_err(|error| nccl_error(&format!("{what}: ncclGroupStart"), error))?;
     let issued = body();

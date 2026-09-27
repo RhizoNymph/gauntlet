@@ -128,31 +128,47 @@ fn a_bad_non_zero_gpu_path_is_a_per_gpu_fleet_retention_outlier() {
     assert_eq!(report::verdict(&results), Verdict::Stragglers);
 }
 
+fn node_record(test: TestId, name: &str, value: f64, unit: Unit) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope: Scope::Node,
+        name: name.into(),
+        value,
+        unit,
+        repeat: 0,
+    }
+}
+
 #[test]
-fn nccl_barrier_stragglers_are_keyed_per_gpu() {
-    // Four 2-GPU hosts; every rank of n2's block shares its host's
-    // late-arrival tally (grouped arrival analysis), so both of n2's GPUs
-    // are flagged and nobody else is.
+fn nccl_barrier_stragglers_are_one_row_per_host_with_per_gpu_percentiles() {
+    // Four 2-GPU hosts. A host's ranks share one arrival group, so the
+    // tally is emitted once per host (node scope) and a late host is one
+    // straggler row, not one per GPU; the percentiles stay per GPU.
     let names = ["n1", "n2", "n3", "n4"];
     let config = config_for(&names);
     let mut observations = BTreeMap::new();
     for name in names {
         let mut obs = HostObservations::default();
         let frac = if name == "n2" { 0.9 } else { 0.03 };
+        obs.metrics.push(node_record(
+            TestId::NcclBarrier,
+            "slowest_frac",
+            frac,
+            Unit::Ratio,
+        ));
+        obs.metrics.push(node_record(
+            TestId::NcclBarrier,
+            "slowest_considered",
+            1800.0,
+            Unit::Count,
+        ));
         for gpu in 0..2 {
             obs.metrics.push(gpu_record(
                 TestId::NcclBarrier,
                 gpu,
-                "slowest_frac",
-                frac,
-                Unit::Ratio,
-            ));
-            obs.metrics.push(gpu_record(
-                TestId::NcclBarrier,
-                gpu,
-                "slowest_considered",
-                1800.0,
-                Unit::Count,
+                "p50_us",
+                100.0,
+                Unit::Micros,
             ));
         }
         observations.insert(name.to_string(), obs);
@@ -162,8 +178,15 @@ fn nccl_barrier_stragglers_are_keyed_per_gpu() {
         .iter()
         .map(|straggler| straggler.key.as_str())
         .collect();
-    assert_eq!(flagged, ["n2:gpu0", "n2:gpu1"]);
+    assert_eq!(flagged, ["n2"]);
     assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    let p50 = &results.aggregates["nccl_barrier.p50_us"];
+    assert!(
+        p50.contains_key("n1:gpu0") && p50.contains_key("n1:gpu1"),
+        "{p50:?}"
+    );
+    let tally = &results.aggregates["nccl_barrier.slowest_frac"];
+    assert_eq!(tally.len(), 4, "one tally subject per host: {tally:?}");
 }
 
 #[test]

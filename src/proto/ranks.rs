@@ -106,11 +106,6 @@ impl RankBlock {
         self.contains(rank).then(|| rank - self.base)
     }
 
-    /// Global rank of a local GPU index inside this block.
-    pub fn global_rank(self, local: u32) -> Option<u32> {
-        (local < self.count.get()).then(|| self.base + local)
-    }
-
     /// Whether this block holds global rank 0 — the rendezvous lead and
     /// the only clock that closes a fleet-overlap window.
     pub fn holds_lead(self) -> bool {
@@ -198,11 +193,8 @@ mod tests {
         assert_eq!(block.ranks(), 8..12);
         assert_eq!(block.count(), 4);
         assert!(!block.holds_lead());
-        for local in 0..4 {
-            let rank = block.global_rank(local).expect("inside");
-            assert_eq!(block.local_index(rank), Some(local));
-        }
-        assert_eq!(block.global_rank(4), None);
+        let locals: Vec<Option<u32>> = block.ranks().map(|rank| block.local_index(rank)).collect();
+        assert_eq!(locals, [Some(0), Some(1), Some(2), Some(3)]);
         assert_eq!(block.local_index(7), None);
         assert_eq!(block.local_index(12), None);
         assert!(RankBlock::new(0, 1).expect("lead").holds_lead());

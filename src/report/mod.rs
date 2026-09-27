@@ -40,10 +40,16 @@ use crate::proto::{
 // groups and derived overlap_retention.fleet_gemm_<dtype> /
 // overlap_retention.fleet_all_reduce records. No field changed shape, so
 // pre-v7 documents decode unchanged (they simply lack the new groups).
-// v8: rank-per-GPU fleet NCCL world — nccl_barrier.* per-rank metrics and
-// overlap_fleet_all_reduce.* / overlap_retention.fleet_all_reduce move from
-// node granularity (`host`) to GPU granularity (`host:gpuN`); the barrier
-// fleet_span_* series and the sweep's node-scope metrics are unchanged. No
+// v8: rank-per-GPU fleet NCCL world. Granularity: nccl_barrier p50/p90/
+// p99/max_us and overlap_fleet_all_reduce.* / overlap_retention.
+// fleet_all_reduce move from `host` to `host:gpuN` (the barrier tally
+// slowest_frac/slowest_considered and fleet_span_* stay per host).
+// Meaning: the nccl_all_reduce/nccl_all_gather sweep series keep their
+// names and node scope but now measure a world of n = total GPUs whose
+// ring mixes NVLink with the fabric — not comparable with v7 numbers; the
+// fits were renamed nccl_{allreduce,allgather}_fleet ->
+// nccl_{allreduce,allgather}_rank_per_gpu so v7-vs-v8 baselines cannot
+// line up under one key. Inventory snapshots gain cuda_visible_gpus. No
 // field changed shape.
 pub const SCHEMA_VERSION: u32 = 8;
 
@@ -128,9 +134,9 @@ pub struct FleetAnalysis {
 /// One flagged subject from the barrier-skew slowest-rank tally.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarrierStraggler {
-    /// Sample key: `host` for the TCP barrier (one rank per host),
-    /// `host:gpuN` for the NCCL barrier (one rank per GPU; the ranks of a
-    /// host share its arrival tally, so a late host flags all its GPUs).
+    /// Sample key of the flagged *host* (both benchmarks): the tally is
+    /// per arrival group, and a host's NCCL ranks (one per GPU) form one
+    /// group, so the tally metrics are emitted once per host at node scope.
     pub key: String,
     /// Fraction of considered iterations in which this host arrived last.
     pub slowest_frac: f64,
@@ -162,7 +168,7 @@ pub struct Calibration {
     /// Per-host sustained capability numbers.
     pub rooflines: BTreeMap<String, NodeRoofline>,
     /// Alpha-beta fits keyed by link class ("tcp_pairwise",
-    /// "nccl_allreduce_fleet", "nccl_allreduce_pair", ...).
+    /// "nccl_allreduce_rank_per_gpu", "tcp_pairwise", ...).
     pub links: BTreeMap<String, AlphaBetaFit>,
 }
 
@@ -870,8 +876,12 @@ fn reduce(obs: &HostObservations, test: TestId, name: &str, how: Reduce) -> Opti
 fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<String, AlphaBetaFit> {
     let mut links = BTreeMap::new();
     for (test, key) in [
-        (TestId::NcclAllReduce, "nccl_allreduce_fleet"),
-        (TestId::NcclAllGather, "nccl_allgather_fleet"),
+        // "rank_per_gpu": the fleet world became one rank per GPU in
+        // schema v8 — n is total GPUs and the ring mixes NVLink with the
+        // fabric — so these fits are not the v7 per-node `*_fleet` fits
+        // and must not be compared against them under the same name.
+        (TestId::NcclAllReduce, "nccl_allreduce_rank_per_gpu"),
+        (TestId::NcclAllGather, "nccl_allgather_rank_per_gpu"),
     ] {
         let points = sweep_points(observations, test);
         if let Ok(fit) = fit_alpha_beta(&points) {
@@ -1496,7 +1506,7 @@ mod tests {
             vec![(1024, 30.0), (4096, 45.0)]
         );
         let links = link_fits(&observations);
-        assert!(links.contains_key("nccl_allreduce_fleet"));
+        assert!(links.contains_key("nccl_allreduce_rank_per_gpu"));
         assert!(!links.contains_key("tcp_pairwise"));
     }
 
@@ -1526,7 +1536,7 @@ mod tests {
             results
                 .calibration
                 .links
-                .contains_key("nccl_allreduce_fleet")
+                .contains_key("nccl_allreduce_rank_per_gpu")
         );
     }
 

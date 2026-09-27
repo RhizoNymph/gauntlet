@@ -35,8 +35,10 @@
 use std::io::BufRead;
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 
-use crate::proto::NcclDirective;
+use crate::agent::EventSink;
+use crate::proto::{AgentEvent, NcclDirective, PROTO_VERSION};
 
 // Pure; its only consumer is gpu-gated, but the tests run everywhere.
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
@@ -47,6 +49,8 @@ mod fleet_overlap;
 mod local;
 #[cfg(feature = "gpu")]
 mod sweep;
+#[cfg(feature = "gpu")]
+mod watchdog;
 
 const GIB: f64 = (1_u64 << 30) as f64;
 /// Collective payloads are f32 elements throughout.
@@ -64,37 +68,71 @@ pub(crate) fn message_elements(msg_bytes: u64) -> usize {
 }
 
 /// Read an `NcclDirective` JSON document from stdin and execute it.
+///
+/// `Hello` goes out first, before anything can fail — the directive parse,
+/// its validation, the rendezvous id decode, the device checks — and every
+/// failure after it is reported as a typed `Fatal` naming the real reason.
+/// (A failure before `Hello` would reach the orchestrator only as "first
+/// event was not hello".)
 pub fn run_from_stdin() -> Result<()> {
+    let sink = EventSink::stdout();
+    sink.emit(&AgentEvent::Hello {
+        proto_version: PROTO_VERSION,
+        hostname: crate::agent::hostname().unwrap_or_else(|_| "(unknown)".to_string()),
+    });
+    let outcome = read_directive().and_then(|directive| execute(&sink, &directive));
+    if let Err(error) = &outcome {
+        sink.emit(&AgentEvent::Fatal {
+            message: format!("{error:#}"),
+        });
+    }
+    outcome
+}
+
+fn read_directive() -> Result<NcclDirective> {
     let mut line = String::new();
     std::io::stdin()
         .lock()
         .read_line(&mut line)
         .context("reading NcclDirective from stdin")?;
-    let directive: NcclDirective =
-        serde_json::from_str(line.trim()).context("parsing NcclDirective")?;
-    execute(&directive)
+    serde_json::from_str(line.trim()).context("parsing NcclDirective")
 }
 
 #[cfg(feature = "gpu")]
-fn execute(directive: &NcclDirective) -> Result<()> {
+fn execute(sink: &EventSink, directive: &NcclDirective) -> Result<()> {
     // libcuda/libnccl are dlopened, and cudarc panics rather than erroring
     // when the library or a symbol is missing. The gpu phase's guard turns
     // that back into an ordinary error, so a node without the NCCL stack
     // fails this directive instead of aborting the process.
     use crate::agent::gpu::guard;
-    match directive {
-        NcclDirective::Lead { .. } => guard("nccl lead", || imp::lead(directive))
-            .map_err(|reason| anyhow::anyhow!("{reason}")),
-        NcclDirective::Participate { .. } => {
-            guard("nccl participate", || imp::participate(directive))
-                .map_err(|reason| anyhow::anyhow!("{reason}"))
-        }
-    }
+    guard("agent nccl", || imp::run(sink, directive)).map_err(|reason| anyhow::anyhow!(reason))
 }
 
 #[cfg(not(feature = "gpu"))]
-fn execute(_directive: &NcclDirective) -> Result<()> {
+fn execute(_sink: &EventSink, _directive: &NcclDirective) -> Result<()> {
     anyhow::bail!("built without gpu feature")
+}
+
+/// A host's rank block cannot run on the GPUs CUDA actually exposes.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub(crate) enum LocalDeviceError {
+    #[error(
+        "rank block needs {needed} local GPUs but CUDA sees {visible} \
+         (GPU off the bus, MIG enabled, or CUDA_VISIBLE_DEVICES set?)"
+    )]
+    TooFewDevices { needed: u32, visible: i32 },
+}
+
+/// Validate a rank block against CUDA's visible device count, before any
+/// NCCL call: a host that cannot open every rank of its block must fail
+/// fast (with the reason) rather than join grouped init and strand the
+/// world.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn check_local_devices(needed: u32, visible: i32) -> Result<(), LocalDeviceError> {
+    if i64::from(needed) > i64::from(visible) {
+        return Err(LocalDeviceError::TooFewDevices { needed, visible });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -154,71 +192,114 @@ pub mod imp {
     use anyhow::{Result, bail};
     use cudarc::nccl::Id;
 
-    use super::fleet_overlap::overlap_fleet;
-    use super::local::{LocalRanks, nccl_error};
-    use super::sweep::run_sweep;
+    use super::fleet_overlap::{OverlapBuffers, overlap_fleet};
+    use super::local::{PreparedRanks, nccl_error};
+    use super::sweep::{SweepBuffers, run_sweep};
+    use super::watchdog::{CascadeAbort, exit_cascade};
     use crate::agent::EventSink;
-    use crate::proto::{AgentEvent, NcclDirective, NcclWorkload, PROTO_VERSION, RankAssignment};
+    use crate::proto::{AgentEvent, NcclDirective, NcclWorkload};
 
     pub use super::local::{decode_id, encode_id};
 
-    /// The host holding global rank 0: mint the id in *this* process
-    /// (ncclGetUniqueId opens the bootstrap listen socket here, so the
-    /// process must stay alive through communicator init), announce it,
-    /// then drive every local rank through the workload.
-    pub fn lead(directive: &NcclDirective) -> Result<()> {
-        let NcclDirective::Lead {
-            assignment,
-            socket_ifname,
-            workload,
-        } = directive
-        else {
-            bail!("lead requires a Lead directive");
-        };
-        if !assignment.block().holds_lead() {
-            bail!(
-                "the Lead directive must hold global rank 0, got a block starting at {}",
-                assignment.block().base()
-            );
-        }
-        set_socket_ifname(socket_ifname);
-
-        let sink = EventSink::stdout();
-        sink.emit(&AgentEvent::Hello {
-            proto_version: PROTO_VERSION,
-            hostname: crate::agent::hostname()?,
-        });
-        let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
-        sink.emit(&AgentEvent::NcclId {
-            unique_id_b64: encode_id(&id),
-        });
-        run_block(&sink, id, *assignment, workload)
+    /// Where this host's rendezvous id comes from.
+    enum Rendezvous {
+        /// Holds global rank 0: mint the id in *this* process
+        /// (ncclGetUniqueId opens the bootstrap listen socket here, so the
+        /// process must stay alive through communicator init) and announce
+        /// it.
+        Mint,
+        /// Joins the lead's world with the relayed id.
+        Join(Id),
     }
 
-    /// Every other host: run the workload silently on every local rank,
-    /// but report per-rank barrier timings and fleet-overlap results —
-    /// per-rank local measurement is the whole point of those benchmarks.
-    pub fn participate(directive: &NcclDirective) -> Result<()> {
-        let NcclDirective::Participate {
-            unique_id_b64,
-            assignment,
-            socket_ifname,
-            workload,
-        } = directive
-        else {
-            bail!("participate requires a Participate directive");
-        };
-        if assignment.block().holds_lead() {
-            bail!("the block holding global rank 0 must run the Lead directive");
+    /// Validate the directive, then run it. A [`CascadeAbort`] — this host
+    /// stopped because the fleet did — leaves through a cascade exit
+    /// instead of an ordinary error, so the orchestrator attributes it to
+    /// the host that actually failed.
+    pub fn run(sink: &EventSink, directive: &NcclDirective) -> Result<()> {
+        let outcome = run_directive(sink, directive);
+        if let Err(error) = &outcome
+            && let Some(CascadeAbort(message)) = error.downcast_ref::<CascadeAbort>()
+        {
+            exit_cascade(sink, message);
         }
+        outcome
+    }
+
+    fn run_directive(sink: &EventSink, directive: &NcclDirective) -> Result<()> {
+        let (assignment, socket_ifname, workload, rendezvous) = match directive {
+            NcclDirective::Lead {
+                assignment,
+                socket_ifname,
+                workload,
+            } => {
+                if !assignment.block().holds_lead() {
+                    bail!(
+                        "the Lead directive must hold global rank 0, got a block starting at {}",
+                        assignment.block().base()
+                    );
+                }
+                (assignment, socket_ifname, workload, Rendezvous::Mint)
+            }
+            NcclDirective::Participate {
+                unique_id_b64,
+                assignment,
+                socket_ifname,
+                workload,
+            } => {
+                if assignment.block().holds_lead() {
+                    bail!("the block holding global rank 0 must run the Lead directive");
+                }
+                let id = decode_id(unique_id_b64)?;
+                (assignment, socket_ifname, workload, Rendezvous::Join(id))
+            }
+        };
         set_socket_ifname(socket_ifname);
-        let id = decode_id(unique_id_b64)?;
-        let sink = EventSink::stdout();
-        sink.emit(&AgentEvent::Hello {
-            proto_version: PROTO_VERSION,
-            hostname: crate::agent::hostname()?,
-        });
-        run_block(&sink, id, *assignment, workload)
+
+        // Stage 1, no NCCL: device check, contexts, binds, buffers. The
+        // lead finishes it before minting the id, so a lead that cannot
+        // run never recruits the followers.
+        let prepared = PreparedRanks::new(*assignment)?;
+        let buffers = match workload {
+            NcclWorkload::Sweep { sizes, .. } => {
+                Buffers::Sweep(SweepBuffers::alloc(&prepared, sizes)?)
+            }
+            NcclWorkload::Overlap(spec) => {
+                Buffers::Overlap(OverlapBuffers::alloc(&prepared, spec)?)
+            }
+        };
+        let id = match rendezvous {
+            Rendezvous::Join(id) => id,
+            Rendezvous::Mint => {
+                let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
+                sink.emit(&AgentEvent::NcclId {
+                    unique_id_b64: encode_id(&id),
+                });
+                id
+            }
+        };
+        // Stage 2: grouped communicator init.
+        let ranks = prepared.connect(id)?;
+        match (workload, buffers) {
+            (
+                NcclWorkload::Sweep {
+                    sizes,
+                    iters_per_size,
+                    barrier,
+                },
+                Buffers::Sweep(buffers),
+            ) => run_sweep(sink, &ranks, buffers, sizes, *iters_per_size, *barrier),
+            (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
+                overlap_fleet(sink, &ranks, buffers, spec)
+            }
+            _ => bail!("workload buffers do not match the workload"),
+        }
+    }
+
+    /// The workload's buffers, allocated in stage 1.
+    enum Buffers {
+        Sweep(SweepBuffers),
+        Overlap(OverlapBuffers),
     }
 
     fn set_socket_ifname(socket_ifname: &Option<String>) {
@@ -231,30 +312,33 @@ pub mod imp {
             unsafe { std::env::set_var("NCCL_SOCKET_IFNAME", ifname) };
         }
     }
-
-    /// Grouped init of every local rank, then the workload. An init
-    /// failure fails the whole block (the node's participation).
-    fn run_block(
-        sink: &EventSink,
-        id: Id,
-        assignment: RankAssignment,
-        workload: &NcclWorkload,
-    ) -> Result<()> {
-        let ranks = LocalRanks::init(assignment, id)?;
-        match workload {
-            NcclWorkload::Sweep {
-                sizes,
-                iters_per_size,
-                barrier,
-            } => run_sweep(sink, &ranks, sizes, *iters_per_size, *barrier),
-            NcclWorkload::Overlap(spec) => overlap_fleet(sink, &ranks, spec),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_larger_than_the_visible_devices_fails_fast() {
+        assert_eq!(check_local_devices(8, 8), Ok(()));
+        assert_eq!(check_local_devices(4, 8), Ok(()));
+        assert_eq!(
+            check_local_devices(8, 7),
+            Err(LocalDeviceError::TooFewDevices {
+                needed: 8,
+                visible: 7
+            })
+        );
+        // A negative count from the driver is never "enough".
+        assert!(check_local_devices(1, -1).is_err());
+        let message = check_local_devices(8, 0)
+            .expect_err("none visible")
+            .to_string();
+        assert!(
+            message.contains("needs 8") && message.contains("sees 0"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn message_elements_are_f32_sized_and_never_zero() {

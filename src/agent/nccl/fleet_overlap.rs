@@ -9,20 +9,30 @@
 //! lead's local siblings are followers like every remote rank. Each local
 //! rank keeps its own payload tally (its own completion stamps), and every
 //! rank reports its own `OverlapFleetReport` — one per GPU.
+//!
+//! Wedge protection: a rank that dies mid-window leaves every other rank
+//! blocked inside a collective. The whole protocol runs under a hard
+//! deadline (`window::hard_deadline_secs`, from the spec): GEMM workers
+//! stop on their own at it, and a watchdog terminates the process
+//! (cascade exit, `watchdog`) `WATCHDOG_GRACE_SECS` later. A follower whose
+//! lead never signals close also leaves through a cascade exit.
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use cudarc::driver::CudaSlice;
 use cudarc::nccl::ReduceOp;
 
-use super::local::LocalRanks;
+use super::local::{LocalRanks, PreparedRanks};
 use super::sweep::{Buffers, WARMUP_ITERS};
+use super::watchdog::{CascadeAbort, guarded};
 use super::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
 use crate::agent::EventSink;
 use crate::agent::gpu::gemm::sustained_gflops_value;
 use crate::agent::gpu::worker::GemmLoad;
-use crate::agent::window::{self, WindowRole, WindowTally, role_for_rank};
+use crate::agent::window::{
+    self, WATCHDOG_GRACE_SECS, WindowRole, WindowTally, hard_deadline_secs, role_for_rank,
+};
 use crate::proto::{AgentEvent, OverlapFleetReport, OverlapGemmLeg, OverlapSpec};
 
 /// Payload all-reduces between window-consensus steps: enough to amortize
@@ -36,7 +46,54 @@ struct Control {
     recv: Vec<CudaSlice<f32>>,
 }
 
-/// Fleet overlap protocol for this host's ranks.
+/// Payload and control buffers of the protocol, allocated before the
+/// communicators are created.
+pub(super) struct OverlapBuffers {
+    payload: Buffers,
+    control: Control,
+    elements: usize,
+}
+
+impl OverlapBuffers {
+    pub(super) fn alloc(prepared: &PreparedRanks, spec: &OverlapSpec) -> Result<Self> {
+        let elements = message_elements(spec.msg_bytes);
+        let streams = prepared.streams();
+        let payload = Buffers::alloc(&streams, elements)?;
+        let mut control = Control {
+            send: Vec::with_capacity(streams.len()),
+            recv: Vec::with_capacity(streams.len()),
+        };
+        for stream in &streams {
+            control.send.push(stream.alloc_zeros::<f32>(1)?);
+            control.recv.push(stream.alloc_zeros::<f32>(1)?);
+        }
+        Ok(Self {
+            payload,
+            control,
+            elements,
+        })
+    }
+}
+
+/// Fleet overlap protocol for this host's ranks, under the hard-deadline
+/// watchdog: GEMM workers stop at `hard_deadline_secs` from now, and the
+/// process terminates `WATCHDOG_GRACE_SECS` after that if the protocol is
+/// still wedged.
+pub(super) fn overlap_fleet(
+    sink: &EventSink,
+    ranks: &LocalRanks,
+    buffers: OverlapBuffers,
+    spec: &OverlapSpec,
+) -> Result<()> {
+    let hard = Duration::from_secs(hard_deadline_secs(spec.baseline_secs, spec.duration_secs));
+    let compute_deadline = Instant::now() + hard;
+    let watchdog_budget = hard + Duration::from_secs(WATCHDOG_GRACE_SECS);
+    guarded(sink, "fleet overlap", watchdog_budget, || {
+        run_protocol(sink, ranks, buffers, spec, compute_deadline)
+    })
+}
+
+/// The protocol proper.
 ///
 /// Ordering matters: every fallible piece of GEMM setup (operand upload,
 /// warm launch) happens *before* the communicators enter the first window.
@@ -44,27 +101,29 @@ struct Control {
 /// with zero compute load; it can never abort the ranks mid-protocol and
 /// strand the rest of the world in a blocking collective. Between the two
 /// windows the only action is the start-barrier release.
-pub(super) fn overlap_fleet(
+fn run_protocol(
     sink: &EventSink,
     ranks: &LocalRanks,
+    buffers: OverlapBuffers,
     spec: &OverlapSpec,
+    compute_deadline: Instant,
 ) -> Result<()> {
-    let elements = message_elements(spec.msg_bytes);
+    let OverlapBuffers {
+        payload: mut buffers,
+        mut control,
+        elements,
+    } = buffers;
     let message_bytes = (elements * F32_BYTES) as f64;
-    let mut buffers = Buffers::alloc(ranks, elements)?;
-    let mut control = Control {
-        send: Vec::with_capacity(ranks.ranks().len()),
-        recv: Vec::with_capacity(ranks.ranks().len()),
-    };
-    for rank in ranks.ranks() {
-        control.send.push(rank.stream.alloc_zeros::<f32>(1)?);
-        control.recv.push(rank.stream.alloc_zeros::<f32>(1)?);
-    }
 
     // GEMM load on every local GPU (one worker per rank's context).
     // `wait_ready` returns once every worker has set up — or failed — and
     // gone quiet, so the baseline below still measures quiet GPUs.
-    let mut load = GemmLoad::spawn(&ranks.contexts(), spec.gemm_dim, spec.gemm_dtype);
+    let mut load = GemmLoad::spawn(
+        &ranks.contexts(),
+        spec.gemm_dim,
+        spec.gemm_dtype,
+        compute_deadline,
+    );
     load.wait_ready();
 
     let windows = run_windows(ranks, &mut buffers, &mut control, elements, spec, &mut load);
@@ -179,7 +238,7 @@ fn consensus_window(
 
         let expired = Instant::now() >= deadline;
         for ((rank, role), ctrl) in ranks.ranks().iter().zip(&roles).zip(&mut control.send) {
-            rank.stream
+            rank.stream()
                 .memcpy_htod(&[window::contribution(*role, expired)], ctrl)?;
         }
         {
@@ -194,7 +253,7 @@ fn consensus_window(
         // from local rank 0.
         let word = match (ranks.ranks().first(), control.recv.first()) {
             (Some(rank0), Some(recv0)) => rank0
-                .stream
+                .stream()
                 .clone_dtoh(recv0)?
                 .first()
                 .copied()
@@ -217,9 +276,12 @@ fn consensus_window(
         if follower_host
             && window::failsafe_tripped(close_seen, started.elapsed().as_secs_f64(), failsafe_secs)
         {
-            bail!(
+            // Not a fault on this host: the lead (or the fleet) stopped.
+            // Surfaces as a cascade exit, attributed to whoever failed.
+            return Err(CascadeAbort(format!(
                 "fleet overlap window failsafe: no close signal from rank 0 within {failsafe_secs}s"
-            );
+            ))
+            .into());
         }
     }
 }

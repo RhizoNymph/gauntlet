@@ -22,6 +22,7 @@ fn sample_inventory() -> InventorySnapshot {
         ib_ports: vec![],
         xid_errors: vec![79],
         gpu_libs: std::collections::BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 

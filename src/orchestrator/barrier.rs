@@ -2,6 +2,8 @@
 //! GPU: `host:gpuN` subjects) and the TCP star barrier (one rank per host:
 //! node subjects).
 
+use std::collections::BTreeSet;
+
 use tracing::warn;
 
 use super::ObservationSink;
@@ -23,6 +25,15 @@ pub(super) struct RankSubject {
 /// mirroring how the NCCL sweeps attribute fleet-wide numbers to rank 0.
 /// A rank `locate` cannot place is logged and skipped.
 ///
+/// Granularity: the distribution metrics (`p50_us`..`max_us`) are per
+/// rank, under the rank's own subject scope (`host:gpuN` for NCCL, where
+/// each GPU's stream completes at its own time). The tally metrics
+/// (`slowest_frac`, `slowest_considered`) are per *host*, under
+/// `Scope::Node`, emitted once: a host's ranks form one arrival group and
+/// share one tally, so per-GPU copies would weight hosts by GPU count in
+/// the MAD analysis and turn one late host into N identical straggler
+/// rows.
+///
 /// Metric semantics differ by polarity — under `NcclBarrier` the per-rank
 /// values are local waits (a straggler is a *low* outlier), under
 /// `TcpBarrier` they are release-to-response times (a straggler is a *high*
@@ -36,34 +47,38 @@ pub(super) fn barrier_records(
     fleet_host: Option<&str>,
 ) -> Vec<(String, MetricRecord)> {
     let mut records = Vec::new();
+    let mut tallied_hosts: BTreeSet<String> = BTreeSet::new();
     for rank in &skew.per_rank {
         let Some(subject) = locate(rank.rank) else {
             warn!(rank = rank.rank, "barrier rank has no host");
             continue;
         };
-        for (name, value, unit) in [
-            ("p50_us", rank.p50_us, Unit::Micros),
-            ("p90_us", rank.p90_us, Unit::Micros),
-            ("p99_us", rank.p99_us, Unit::Micros),
-            ("max_us", rank.max_us, Unit::Micros),
-            ("slowest_frac", rank.slowest_frac, Unit::Ratio),
-            (
-                "slowest_considered",
-                skew.considered_iters as f64,
-                Unit::Count,
-            ),
+        for (name, value) in [
+            ("p50_us", rank.p50_us),
+            ("p90_us", rank.p90_us),
+            ("p99_us", rank.p99_us),
+            ("max_us", rank.max_us),
         ] {
             records.push((
                 subject.host.clone(),
-                MetricRecord {
-                    test,
-                    scope: subject.scope.clone(),
-                    name: name.to_string(),
-                    value,
-                    unit,
-                    repeat: 0,
-                },
+                record(test, subject.scope.clone(), name, value, Unit::Micros),
             ));
+        }
+        // Once per host: every rank of a host carries the same tally.
+        if tallied_hosts.insert(subject.host.clone()) {
+            for (name, value, unit) in [
+                ("slowest_frac", rank.slowest_frac, Unit::Ratio),
+                (
+                    "slowest_considered",
+                    skew.considered_iters as f64,
+                    Unit::Count,
+                ),
+            ] {
+                records.push((
+                    subject.host.clone(),
+                    record(test, Scope::Node, name, value, unit),
+                ));
+            }
         }
     }
     if let Some(host) = fleet_host {
@@ -87,6 +102,17 @@ pub(super) fn barrier_records(
         }
     }
     records
+}
+
+fn record(test: TestId, scope: Scope, name: &str, value: f64, unit: Unit) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope,
+        name: name.to_string(),
+        value,
+        unit,
+        repeat: 0,
+    }
 }
 
 pub(super) fn emit_barrier_metrics(
@@ -168,6 +194,37 @@ mod tests {
     }
 
     #[test]
+    fn tally_metrics_are_emitted_once_per_host_at_node_scope() {
+        let locate = |rank: u32| {
+            (rank < 4).then(|| RankSubject {
+                host: if rank < 2 { "n1" } else { "n2" }.to_string(),
+                scope: Scope::Gpu { index: rank % 2 },
+            })
+        };
+        let records = barrier_records(TestId::NcclBarrier, &skew(4), locate, None);
+        for name in ["slowest_frac", "slowest_considered"] {
+            let tally: Vec<(&str, &Scope)> = records
+                .iter()
+                .filter(|(_, record)| record.name == name)
+                .map(|(host, record)| (host.as_str(), &record.scope))
+                .collect();
+            assert_eq!(
+                tally,
+                [("n1", &Scope::Node), ("n2", &Scope::Node)],
+                "{name}"
+            );
+        }
+        // Distribution metrics stay one per GPU.
+        assert_eq!(
+            records
+                .iter()
+                .filter(|(_, record)| record.name == "p99_us")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
     fn unplaceable_ranks_are_skipped_not_misattributed() {
         let locate = |rank: u32| {
             (rank == 0).then(|| RankSubject {
@@ -176,7 +233,11 @@ mod tests {
             })
         };
         let records = barrier_records(TestId::TcpBarrier, &skew(2), locate, None);
-        assert_eq!(records.len(), 6, "rank 0's six per-rank metrics only");
+        assert_eq!(
+            records.len(),
+            6,
+            "rank 0's four percentiles plus its host tally"
+        );
         assert!(records.iter().all(|(host, _)| host == "n1"));
     }
 }

@@ -8,13 +8,14 @@
 //! barrier probe times every local rank separately and reports one
 //! `NcclBarrierTimings` per rank.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Result;
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::nccl::ReduceOp;
 
-use super::local::LocalRanks;
+use super::local::{LocalRanks, PreparedRanks};
 use super::{F32_BYTES, all_gather_bus_gib_per_sec, all_reduce_bus_gib_per_sec};
 use crate::agent::EventSink;
 use crate::proto::{AgentEvent, BarrierSpec, MetricRecord, Scope, TestId, Unit};
@@ -30,12 +31,15 @@ pub(super) struct Buffers {
 }
 
 impl Buffers {
-    pub(super) fn alloc(ranks: &LocalRanks, elements: usize) -> Result<Self> {
-        let mut send = Vec::with_capacity(ranks.ranks().len());
-        let mut recv = Vec::with_capacity(ranks.ranks().len());
-        for rank in ranks.ranks() {
-            send.push(rank.stream.alloc_zeros::<f32>(elements)?);
-            recv.push(rank.stream.alloc_zeros::<f32>(elements)?);
+    /// Allocate on each local rank's collective stream. Runs before the
+    /// communicators exist, so an allocation failure fails the node
+    /// before it ever enters the init group.
+    pub(super) fn alloc(streams: &[Arc<CudaStream>], elements: usize) -> Result<Self> {
+        let mut send = Vec::with_capacity(streams.len());
+        let mut recv = Vec::with_capacity(streams.len());
+        for stream in streams {
+            send.push(stream.alloc_zeros::<f32>(elements)?);
+            recv.push(stream.alloc_zeros::<f32>(elements)?);
         }
         Ok(Self { send, recv })
     }
@@ -60,23 +64,43 @@ impl Buffers {
     }
 }
 
+/// The sweep's buffers, sized for its largest message, allocated before
+/// the communicators are created.
+pub(super) struct SweepBuffers {
+    buffers: Buffers,
+    max_elements: usize,
+}
+
+impl SweepBuffers {
+    pub(super) fn alloc(prepared: &PreparedRanks, sizes: &[u64]) -> Result<Self> {
+        let max_elements = sizes
+            .iter()
+            .map(|size| *size as usize / F32_BYTES)
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        Ok(Self {
+            buffers: Buffers::alloc(&prepared.streams(), max_elements)?,
+            max_elements,
+        })
+    }
+}
+
 /// The message-size sweep (plus the optional barrier-skew probe).
 pub(super) fn run_sweep(
     sink: &EventSink,
     ranks: &LocalRanks,
+    buffers: SweepBuffers,
     sizes: &[u64],
     iters_per_size: u32,
     barrier: Option<BarrierSpec>,
 ) -> Result<()> {
     let emit_sweep = ranks.assignment().block().holds_lead();
     let world_size = ranks.world_size();
-    let max_elements = sizes
-        .iter()
-        .map(|size| *size as usize / F32_BYTES)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    let mut buffers = Buffers::alloc(ranks, max_elements)?;
+    let SweepBuffers {
+        mut buffers,
+        max_elements,
+    } = buffers;
 
     for _ in 0..WARMUP_ITERS {
         buffers.all_reduce(ranks, "warmup all_reduce", max_elements, &ReduceOp::Sum)?;
@@ -203,7 +227,7 @@ fn timed_on_rank0(
     }
     let elapsed = match ranks.ranks().first() {
         Some(rank0) => {
-            rank0.stream.synchronize()?;
+            rank0.stream().synchronize()?;
             start.elapsed().as_secs_f64()
         }
         None => 0.0,

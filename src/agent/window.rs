@@ -113,6 +113,33 @@ pub fn failsafe_tripped(close_seen: bool, elapsed_secs: f64, failsafe_secs: u64)
     !close_seen && elapsed_secs > failsafe_secs as f64
 }
 
+/// Slack on top of both windows' failsafe budgets in the hard deadline:
+/// warmup collectives, worker setup/teardown, report emission.
+pub const HARD_DEADLINE_SLACK_SECS: u64 = 120;
+
+/// Hard wall-clock budget, in seconds from protocol start, of a whole
+/// overlap step (isolated window + overlapped window). Past it the step is
+/// presumed wedged — typically every rank blocked inside a collective
+/// because some other rank died — and nothing the step started may keep
+/// running: GEMM workers stop on their own at this deadline (independent
+/// of the driver ever reaching `GemmLoad::finish`), and the fleet step's
+/// watchdog terminates the process shortly after.
+///
+/// Each window gets its follower failsafe budget (so the in-protocol
+/// failsafe always gets the first chance to end things cleanly) plus
+/// [`HARD_DEADLINE_SLACK_SECS`]. Saturating, so absurd specs cannot
+/// overflow into a tiny deadline.
+pub fn hard_deadline_secs(baseline_secs: u64, duration_secs: u64) -> u64 {
+    failsafe_secs(baseline_secs)
+        .saturating_add(failsafe_secs(duration_secs))
+        .saturating_add(HARD_DEADLINE_SLACK_SECS)
+}
+
+/// Grace between the hard deadline (GEMM workers stop) and the watchdog
+/// terminating the process, so a protocol that is merely finishing up can
+/// still exit through its normal path.
+pub const WATCHDOG_GRACE_SECS: u64 = 15;
+
 /// Payload-iteration accounting for one consensus window. Only payload
 /// batches are recorded (the control reduce and its synchronizations stay
 /// outside), so the per-iteration figure measures the collective, not the
@@ -260,6 +287,30 @@ mod tests {
         assert_eq!(failsafe_secs(0), FAILSAFE_FLOOR_SECS);
         // Absurd budgets must not overflow.
         assert_eq!(failsafe_secs(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn the_hard_deadline_covers_both_failsafes_plus_slack() {
+        // Defaults: 5s baseline, 30s overlapped window.
+        assert_eq!(
+            hard_deadline_secs(5, 30),
+            10 + 60 + HARD_DEADLINE_SLACK_SECS
+        );
+        // Tiny windows keep the failsafe floors.
+        assert_eq!(
+            hard_deadline_secs(0, 0),
+            2 * FAILSAFE_FLOOR_SECS + HARD_DEADLINE_SLACK_SECS
+        );
+        // Always strictly later than both in-protocol failsafes combined,
+        // so the clean path gets the first chance.
+        for (baseline, duration) in [(1, 1), (5, 30), (60, 600)] {
+            assert!(
+                hard_deadline_secs(baseline, duration)
+                    > failsafe_secs(baseline) + failsafe_secs(duration)
+            );
+        }
+        // Absurd specs saturate instead of wrapping to a tiny deadline.
+        assert_eq!(hard_deadline_secs(u64::MAX, 30), u64::MAX);
     }
 
     #[test]

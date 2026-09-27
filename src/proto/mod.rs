@@ -33,8 +33,19 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // v7: rank-per-GPU fleet NCCL world — the directives carry a validated
 // `RankAssignment` (the host's contiguous `RankBlock` plus world size)
 // instead of a single rank, one process drives every local rank, and each
-// `OverlapFleetReport` covers exactly one rank (= one GPU).
+// `OverlapFleetReport` covers exactly one rank (= one GPU); inventories
+// carry `cuda_visible_gpus` (rank blocks are sized from it), `agent nccl`
+// sends Hello before anything can fail, and exits with
+// `AGENT_EXIT_CASCADE` when it stopped because the fleet stopped.
 pub const PROTO_VERSION: u32 = 7;
+
+/// Exit status of an `agent nccl` process that stopped *itself* because
+/// the fleet stopped, not because of a fault on its own host: the fleet
+/// overlap hard-deadline watchdog, or a follower whose lead never signalled
+/// a window close. The orchestrator classifies it like a timeout — a
+/// secondary failure attributed to whichever host failed first. (124 is
+/// coreutils `timeout`'s status, for the same reason.)
+pub const AGENT_EXIT_CASCADE: i32 = 124;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -310,6 +321,35 @@ pub struct InventorySnapshot {
     /// actually experience, unlike ldconfig or nvidia-smi presence.
     #[serde(default)]
     pub gpu_libs: BTreeMap<String, bool>,
+    /// GPUs the CUDA driver can actually open (`cuDeviceGetCount` in the
+    /// agent), as opposed to the nvidia-smi listing in `gpus`. The fleet
+    /// NCCL world sizes each host's rank block from this; `None` when the
+    /// agent could not ask CUDA (no driver, or built without the gpu
+    /// feature). See [`gpu_visibility_mismatch`].
+    #[serde(default)]
+    pub cuda_visible_gpus: Option<u32>,
+}
+
+/// The per-host inventory finding for a GPU-visibility mismatch: nvidia-smi
+/// lists GPUs that CUDA does not expose (a GPU fell off the bus, MIG is on,
+/// or CUDA_VISIBLE_DEVICES is set in the agent's environment). Such a host
+/// runs fewer NCCL ranks than it has GPUs. `None` when the counts agree or
+/// the host lists no GPUs at all.
+pub fn gpu_visibility_mismatch(inventory: &InventorySnapshot) -> Option<String> {
+    let listed = inventory.gpus.len();
+    if listed == 0 {
+        return None;
+    }
+    match inventory.cuda_visible_gpus {
+        Some(visible) if visible as usize == listed => None,
+        Some(visible) => Some(format!(
+            "nvidia-smi lists {listed} GPUs but CUDA can open {visible} \
+             (GPU off the bus, MIG enabled, or CUDA_VISIBLE_DEVICES set?)"
+        )),
+        None => Some(format!(
+            "nvidia-smi lists {listed} GPUs but CUDA could not enumerate devices"
+        )),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -651,15 +691,6 @@ pub enum NcclDirective {
     },
 }
 
-impl NcclDirective {
-    pub fn assignment(&self) -> RankAssignment {
-        match self {
-            NcclDirective::Lead { assignment, .. }
-            | NcclDirective::Participate { assignment, .. } => *assignment,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Encoding / decoding
 // ---------------------------------------------------------------------------
@@ -764,14 +795,15 @@ mod tests {
             "socket_ifname":null,
             "workload":{"kind":"sweep","sizes":[1024],"iters_per_size":20}}"#;
         let directive: NcclDirective = serde_json::from_str(json).expect("decode sweep lead");
-        assert_eq!(directive.assignment(), assignment(0, 8, 16));
         let NcclDirective::Lead {
+            assignment: decoded,
             workload: NcclWorkload::Sweep { barrier, .. },
             ..
         } = directive
         else {
             panic!("expected a Lead sweep directive");
         };
+        assert_eq!(decoded, assignment(0, 8, 16));
         assert_eq!(barrier, None);
     }
 
@@ -850,6 +882,65 @@ mod tests {
             assert!(line.contains("overlap_fleet_report"), "{line}");
             assert_eq!(decode_event(&line).expect("decode"), event);
         }
+    }
+
+    fn inventory_with(listed: usize, visible: Option<u32>) -> InventorySnapshot {
+        let gpu = GpuInventory {
+            index: 0,
+            name: "H100".into(),
+            uuid: "u".into(),
+            vbios: "v".into(),
+            mem_total_bytes: 1,
+            ecc_volatile_errors: None,
+            remapped_rows_pending: None,
+            pcie_gen_current: None,
+            pcie_gen_max: None,
+            pcie_width_current: None,
+            pcie_width_max: None,
+            nvlinks_active: None,
+            persistence_mode: None,
+        };
+        InventorySnapshot {
+            hostname: "n1".into(),
+            kernel: "6.8".into(),
+            cpu_model: "x".into(),
+            logical_cores: 8,
+            numa_nodes: 1,
+            mem_total_bytes: 1,
+            cpu_governor: None,
+            clock_offset_ms: None,
+            nvidia_driver: None,
+            cuda_version: None,
+            gpus: vec![gpu; listed],
+            nics: vec![],
+            ib_ports: vec![],
+            xid_errors: vec![],
+            gpu_libs: BTreeMap::new(),
+            cuda_visible_gpus: visible,
+        }
+    }
+
+    #[test]
+    fn gpu_visibility_mismatches_are_findings() {
+        assert_eq!(gpu_visibility_mismatch(&inventory_with(8, Some(8))), None);
+        assert_eq!(gpu_visibility_mismatch(&inventory_with(0, None)), None);
+        let fewer = gpu_visibility_mismatch(&inventory_with(8, Some(7))).expect("finding");
+        assert!(
+            fewer.contains("lists 8") && fewer.contains("open 7"),
+            "{fewer}"
+        );
+        assert!(gpu_visibility_mismatch(&inventory_with(8, None)).is_some());
+    }
+
+    #[test]
+    fn inventories_without_a_cuda_count_still_decode() {
+        let mut value = serde_json::to_value(inventory_with(2, Some(2))).expect("to value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("cuda_visible_gpus");
+        let back: InventorySnapshot = serde_json::from_value(value).expect("decode");
+        assert_eq!(back.cuda_visible_gpus, None);
     }
 
     #[test]
