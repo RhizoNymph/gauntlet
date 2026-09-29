@@ -25,7 +25,8 @@ started, finished)`:
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any test outcome is Failed or any outliers/violations exist; else Clean.
+   any test outcome is Failed (including `gpu_idle`) or any
+   outliers/violations exist; else Clean.
    Exit codes 2/1/0.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
@@ -114,7 +115,7 @@ Per-host `NodeRoofline`:
 ## Rendering
 `render_table` (comfy-table, writer-injected for tests) emits a header line
 then sections: per-host summary (pass/fail/skip counts + key rooflines),
-outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
+silent data corruption, gpus in use (gpu_idle), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
 violations, inventory consistency dissenters, failed hosts, and the link
 alpha-beta digest. Empty sections either state "none" (outliers,
 consistency) or are omitted (violations, failures, links). `render_saved`
@@ -157,7 +158,8 @@ tail progress:
   missing directory yielding an empty list — the viewer's discovery call.
 
 ## Files
-`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history,intranode}.rs`,
+`src/analysis/{stats,fit,schedule}.rs`,
+`src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`).
 
@@ -204,6 +206,27 @@ Downstream effects: fleet outliers are flagged on per-subject *medians*
 outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
+
+## GPUs in use (schema v11)
+
+Inventory GPUs carry `occupancy` (memory used/total and the compute
+processes other than the reporting agent; stale gauntlet agents marked),
+and each host gains one `gpu_idle` outcome per GPU, derived
+orchestrator-side from the snapshot against
+`thresholds.gpu_idle_max_used_mib` (docs/features/phase0_inventory.md).
+A Failed `gpu_idle` feeds the verdict like any failed test (Stragglers).
+Both additions are serde-defaulted: a v10 document decodes with occupancy
+unknown and simply has no `gpu_idle` outcomes.
+
+The host table only counts failed outcomes, so `report/gpu_idle.rs` adds a
+"gpus in use (gpu_idle)" section right after the SDC section: one row per
+Failed `gpu_idle` outcome (`gpus_in_use(&RunResults) -> Vec<GpuInUse>`,
+host then GPU order) with `host:gpuN`, "used / total MiB", and one line
+per compute process ("VLLM::EngineCore (pid 2102873, 23232 MiB)", "stale
+gauntlet agent ..."). It is a projection: failed GPUs come from
+`hosts.*.outcomes`, the detail from the same host's inventory; with no
+process to name (memory over the threshold only, or an old document) the
+outcome reason stands in. Omitted when no GPU is busy.
 
 ## NCCL env (schema v10)
 

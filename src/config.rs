@@ -205,6 +205,12 @@ pub struct Thresholds {
     /// beyond-margin) late arriver in more than this fraction of the
     /// considered barrier iterations.
     pub barrier_slowest_frac: f64,
+    /// `gpu_idle`: a GPU with more than this much memory in use (MiB) at
+    /// inventory time fails the check even without a listed compute
+    /// process. The default leaves headroom for a desktop's graphics
+    /// clients and driver residue; any foreign compute process fails the
+    /// check regardless.
+    pub gpu_idle_max_used_mib: u64,
 }
 
 impl Default for Thresholds {
@@ -213,6 +219,7 @@ impl Default for Thresholds {
             mad_k: 4.0,
             absolute: BTreeMap::new(),
             barrier_slowest_frac: 0.5,
+            gpu_idle_max_used_mib: 1024,
         }
     }
 }

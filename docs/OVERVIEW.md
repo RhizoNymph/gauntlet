@@ -68,7 +68,8 @@ Features Index:
   bootstrap:
     description: >
       `gauntlet bootstrap`: connectivity check, arch check, agent deploy,
-      capability probe (agent probe -> InventorySnapshot), optional --tune
+      capability probe (agent probe -> InventorySnapshot, including the
+      gpu_idle column), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
       schema-versioned document (the GUI viewer's interface).
@@ -80,9 +81,27 @@ Features Index:
       Inventory and sanity: kernel/driver/CUDA/NIC-firmware/MTU/governor/NUMA
       inventory; fleet consistency check (flag nodes differing from majority);
       GPU health counters (ECC, row remaps, dmesg Xid, PCIe link gen/width,
-      NVLink status/errors); IB port state; clock sync offset.
-    entry_points: [agent/inventory.rs]
+      NVLink status/errors); IB port state; clock sync offset; per-GPU
+      occupancy (memory used/total, compute processes by bus id).
+    entry_points: [agent/inventory.rs, agent/gpu_occupancy.rs]
     depends_on: []
+    doc: docs/features/phase0_inventory.md
+  gpu_idle:
+    description: >
+      Pre-flight "is anyone else on this GPU" check (proto v10 / schema
+      v11). The agent records per-GPU GpuOccupancy (nvidia-smi memory.used/
+      total plus --query-compute-apps joined by PCI bus id; graphics-only
+      clients excluded by construction; its own process lineage dropped;
+      any other gauntlet-agent kept as StaleGauntletAgent). The
+      orchestrator derives one TestId::GpuIdle outcome per GPU as the
+      inventory arrives (proto::assess_gpu_idle against
+      thresholds.gpu_idle_max_used_mib, default 1024): Failed names each
+      process, pid and MiB and makes the verdict Stragglers; unknown is
+      Skipped. Bootstrap shows the same policy as its gpu_idle column
+      (warn); the report adds a "gpus in use" section. Detection only: no
+      phase is auto-skipped.
+    entry_points: [agent/gpu_occupancy.rs, proto/occupancy.rs, orchestrator/mod.rs, orchestrator/bootstrap/gpu_idle.rs, report/gpu_idle.rs]
+    depends_on: [phase0_inventory]
     doc: docs/features/phase0_inventory.md
   phase1_cpu_mem_disk:
     description: >
@@ -223,7 +242,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
     doc: docs/features/reporting.md
   viewer:
     description: >
