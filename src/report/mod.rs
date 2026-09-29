@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::fit::{AlphaBetaFit, fit_alpha_beta};
+use crate::analysis::fit::{AlphaBetaFit, FitBound, fit_alpha_beta};
 use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
@@ -62,7 +62,12 @@ use crate::proto::{
 // process (and so every NCCL communicator) in the run was started with.
 // Optional: pre-v10 documents decode with it absent ("not recorded"),
 // which suppresses drift display.
-pub const SCHEMA_VERSION: u32 = 10;
+// v11: link fits are least squares constrained to alpha >= 0, beta >= 0
+// (a sweep that plain OLS fitted with a negative alpha now fits through
+// the origin), and `calibration.links.*.bound` records which constraint
+// was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
+// is plain OLS). Serde-defaulted: pre-v11 documents decode with it null.
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -970,6 +975,9 @@ fn tcp_pairwise_fit(observations: &BTreeMap<String, HostObservations>) -> Option
         alpha_us,
         beta_us_per_byte: MICROS_PER_SEC / (gib_per_sec * BYTES_PER_GIB),
         r_squared: 1.0,
+        // Both parameters are measured directly (a median RTT and a
+        // positive bandwidth), never solved for, so no constraint applies.
+        bound: None,
     })
 }
 
@@ -1299,7 +1307,14 @@ fn render_links(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     if results.calibration.links.is_empty() {
         return Ok(());
     }
-    let mut table = new_table(&["link class", "alpha (us)", "beta (us/B)", "gib/s", "r^2"]);
+    let mut table = new_table(&[
+        "link class",
+        "alpha (us)",
+        "beta (us/B)",
+        "gib/s",
+        "r^2",
+        "bound",
+    ]);
     for (class, fit) in &results.calibration.links {
         table.add_row(vec![
             class.clone(),
@@ -1307,6 +1322,7 @@ fn render_links(results: &RunResults, out: &mut dyn Write) -> Result<()> {
             format!("{:.3e}", fit.beta_us_per_byte),
             format!("{:.2}", fit.bandwidth_gib_per_sec()),
             format!("{:.4}", fit.r_squared),
+            fit.bound.map_or("-", FitBound::label).to_string(),
         ]);
     }
     section(out, "calibration: link alpha-beta", &table)
@@ -1572,6 +1588,48 @@ mod tests {
                 .links
                 .contains_key("nccl_allreduce_rank_per_gpu")
         );
+    }
+
+    #[test]
+    fn bound_link_fits_are_flagged_in_the_table() {
+        // Host 10.1.0.67's nccl_all_reduce sweep from a real 3-node run,
+        // which plain OLS fitted with alpha = -46.59 us.
+        let sweep = [
+            (1_024.0, 4335.8636),
+            (4_096.0, 215.2416),
+            (16_384.0, 318.9848),
+            (65_536.0, 434.0656),
+            (262_144.0, 635.3548),
+            (1_048_576.0, 1364.9492),
+            (4_194_304.0, 6854.3758),
+            (16_777_216.0, 26436.7038),
+            (67_108_864.0, 119_698.324),
+            (268_435_456.0, 484_280.647_2),
+        ];
+        let mut obs = HostObservations::default();
+        for (bytes, us) in sweep {
+            obs.metrics.push(metric(
+                TestId::NcclAllReduce,
+                Scope::Node,
+                "msg_bytes",
+                bytes,
+            ));
+            obs.metrics
+                .push(metric(TestId::NcclAllReduce, Scope::Node, "elapsed_us", us));
+        }
+        let config: FleetConfig = toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+        let observations = BTreeMap::from([("n1".to_string(), obs)]);
+        let results = build(&config, observations, 1, 2);
+
+        let fit = results.calibration.links["nccl_allreduce_rank_per_gpu"];
+        assert_eq!(fit.alpha_us, 0.0, "{fit:?}");
+        assert_eq!(fit.bound, Some(FitBound::AlphaZero));
+
+        let mut out = Vec::new();
+        render_table(&results, &mut out).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("bound"), "{text}");
+        assert!(text.contains("alpha=0"), "{text}");
     }
 
     /// Fleet where `straggler` was the late arriver in `frac` of

@@ -88,7 +88,8 @@ runs/<run_id>.json
             ├─ rows:   metric groups keyed "<test>.<metric>"; groups with
             │          repeated sample keys (NCCL sweeps) are excluded and
             │          surface as calibration link fits instead.
-            └─ links:  calibration.links (alpha µs, GiB/s, r²).
+            └─ links:  calibration.links (alpha µs, GiB/s, r², and the
+                       bound label when a fit hit alpha/beta >= 0).
        └─ ui::RootView (gpui)
             ├─ graph pane: canvas paints edges (PathBuilder stroke); node
             │   chips are absolutely positioned clickable divs. The canvas

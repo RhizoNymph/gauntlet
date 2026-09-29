@@ -221,6 +221,7 @@ impl RootView {
                         .gap_2()
                         .text_size(px(11.0))
                         .child(cell_grow(link.class.clone()).text_color(rgb(TEXT)))
+                        .when_some(link.bound, |row, b| row.child(cell_num(b.label())))
                         .child(cell_num(format!("{:.1}", link.alpha_us)))
                         .child(cell_num(format!("{:.2}", link.gib_per_sec)))
                         .child(cell_num(format!("{:.4}", link.r_squared))),

@@ -128,7 +128,9 @@ Features Index:
       via agent peer mode, tournament-scheduled full mesh. Then the fleet
       NCCL sweep. Both NCCL sweep levels share one per-size timing loop
       (agent/sweep.rs); each level supplies only its launch and timer. Fits
-      t = alpha + beta*size per link class for simulator calibration. The
+      t = alpha + beta*size per link class for simulator calibration
+      (least squares constrained to alpha, beta >= 0, the active bound
+      recorded per fit; schema v11). The
       fleet NCCL world is one rank per GPU (proto v7): each NCCL-capable host
       owns a contiguous, validated rank block (RankBlock/RankAssignment,
       laid out by RankLayout from the CUDA-visible GPU counts in the
