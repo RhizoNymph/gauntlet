@@ -70,6 +70,7 @@ fn derived_quantities() {
         alpha_us: 10.0,
         beta_us_per_byte: 0.001,
         r_squared: 1.0,
+        bound: None,
     };
     assert!((fit.predict_us(1_000_000) - 1010.0).abs() < 1e-9);
     // 0.001 us/B == 1e9 B/s ~= 0.9313 GiB/s.

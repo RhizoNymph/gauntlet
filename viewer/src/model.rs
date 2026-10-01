@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use gauntlet::analysis::fit::FitBound;
 use gauntlet::analysis::stats;
 use gauntlet::proto::{Scope, TestOutcome, Unit};
 use gauntlet::report::{
@@ -109,6 +110,8 @@ pub struct LinkRow {
     pub alpha_us: f64,
     pub gib_per_sec: f64,
     pub r_squared: f64,
+    /// Non-negativity constraint active in the fit, if any.
+    pub bound: Option<FitBound>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,6 +308,7 @@ impl ViewModel {
                 alpha_us: fit.alpha_us,
                 gib_per_sec: fit.bandwidth_gib_per_sec(),
                 r_squared: fit.r_squared,
+                bound: fit.bound,
             })
             .collect();
 

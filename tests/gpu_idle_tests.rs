@@ -245,7 +245,8 @@ fn stale_agents_and_memory_only_findings_render_readably() {
 #[test]
 fn results_with_occupancy_round_trip() {
     let results = report::build(&config(""), fleet(vllm_busy()), 100, 110);
-    assert_eq!(results.schema_version, 11);
+    // Occupancy arrived in schema v11; later versions keep it.
+    assert!(results.schema_version >= 11);
     let json = serde_json::to_string(&results).expect("serialize");
     let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(back, results);

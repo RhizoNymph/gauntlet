@@ -74,10 +74,36 @@ are only compared within their own topology (the same keying as the
   non-finite samples never become outliers.
 
 ## Fit contract (fit.rs)
-OLS over all (bytes, us) points, accumulated about the mean for numerical
-stability across a sweep spanning several decades; `TooFewPoints` unless
-≥2 distinct sizes; `NonFinite` on bad input; r_squared ∈ [0,1] (clamped;
-1.0 when every timing is identical).
+Least squares over all (bytes, us) points, constrained to alpha ≥ 0 and
+beta ≥ 0 (schema v12), because a negative latency or inverse bandwidth
+would have a simulator predict negative time. Plain OLS on a real
+rank-per-GPU all-reduce sweep gave alpha = -46.59 us: small messages are
+latency-bound, large ones bandwidth-bound, and the large sizes dominate the
+line. Closed form, exact for two parameters:
+1. OLS, accumulated about the mean for numerical stability across a sweep
+   spanning several decades. If alpha ≥ 0 and beta ≥ 0, that is the fit
+   (`bound: None`).
+2. Otherwise the optimum lies on the boundary of the feasible quadrant (RSS
+   is strictly convex, so an interior optimum would be the infeasible OLS
+   point). Both boundary rays are evaluated: through the origin
+   (alpha = 0, beta = max(0, Σxy/Σx²), `AlphaZero`) and horizontal
+   (beta = 0, alpha = max(0, mean y), `BetaZero`). A ray whose parameter
+   also clamps collapses to the origin (`BothZero`, only possible with
+   non-positive timings). The ray with the lower RSS wins. The proof is
+   the doc comment on `fit_alpha_beta`.
+3. r_squared is recomputed for the chosen parameters (it can only fall
+   relative to OLS) and clamped to [0,1]; 1.0 when every timing is
+   identical.
+
+`TooFewPoints` unless ≥2 distinct sizes; `NonFinite` on bad input; both
+are checked before fitting, exactly as before the constraint.
+
+`AlphaBetaFit.bound: Option<FitBound>` (`alpha_zero` / `beta_zero` /
+`both_zero` in JSON, `null` for a clean fit) records which constraint was
+active. It is serde-defaulted, so pre-v12 documents load with it `None`,
+which on those documents means "not recorded", not "clean". Invariant:
+`AlphaZero` ⇒ alpha_us == 0, `BetaZero` ⇒ beta_us_per_byte == 0 (so
+`bandwidth_gib_per_sec` is infinite), `BothZero` ⇒ both.
 
 ## Calibration extraction
 Per-host `NodeRoofline`:
@@ -97,7 +123,12 @@ Per-host `NodeRoofline`:
   meaning, see below): within each host's
   metric list the sweep emits `msg_bytes` and `elapsed_us` as parallel
   metrics, one of each per size, so they are joined by emission order and
-  fitted with `fit_alpha_beta` over the whole fleet's points.
+  fitted with `fit_alpha_beta` over the whole fleet's points. These are
+  the fits most likely to bind: an all-reduce sweep over sizes from 1 KiB
+  to 256 MiB is not linear, and OLS through its large sizes undershoots
+  zero at the origin. Such a fit comes out with alpha = 0 and
+  `bound: alpha_zero`; a simulator that needs the small-message latency
+  should treat that alpha as unknown rather than zero.
 - `nccl_allreduce_intranode_<n>gpu` / `nccl_allgather_intranode_<n>gpu`
   (schema v9, `report/intranode.rs`): the intra-node sweep's
   `nccl_intra_all_*` series, joined by emission order within each (host,
@@ -110,14 +141,16 @@ Per-host `NodeRoofline`:
   sweep. `alpha_us` = median `net_latency.rtt_p50`, `beta_us_per_byte` =
   1e6 / (median `net_bandwidth.gib_per_sec` × 2^30), `r_squared` = 1.0 by
   construction (not evidence of fit quality). Emitted only when both
-  medians exist and the bandwidth is positive.
+  medians exist and the bandwidth is positive. `bound` is always `None`:
+  both parameters are measured, never solved for.
 
 ## Rendering
 `render_table` (comfy-table, writer-injected for tests) emits a header line
 then sections: per-host summary (pass/fail/skip counts + key rooflines),
 silent data corruption, gpus in use (gpu_idle), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
 violations, inventory consistency dissenters, failed hosts, and the link
-alpha-beta digest. Empty sections either state "none" (outliers,
+alpha-beta digest (whose `bound` column shows the active constraint's
+label, e.g. `alpha=0`, or `-` for a clean fit). Empty sections either state "none" (outliers,
 consistency) or are omitted (violations, failures, links). `render_saved`
 loads via `history::load` and prints the table, or pretty JSON with
 `--json`.
@@ -174,6 +207,9 @@ tail progress:
   no snapshot error is ever fatal.
 - The table is a projection of the JSON; no analysis happens at render
   time.
+- Every `calibration.links` fit has alpha_us ≥ 0 and beta_us_per_byte ≥ 0
+  (schema v12+); `bound` is `Some` exactly when a constraint changed the
+  result away from OLS.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
@@ -227,6 +263,14 @@ gauntlet agent ..."). It is a projection: failed GPUs come from
 `hosts.*.outcomes`, the detail from the same host's inventory; with no
 process to name (memory over the threshold only, or an old document) the
 outcome reason stands in. Omitted when no GPU is busy.
+
+## Non-negative link fits (schema v12)
+
+`fit_alpha_beta` became a bounded least-squares fit (alpha ≥ 0, beta ≥ 0;
+see Fit contract) and `calibration.links.*.bound` records which constraint
+was active. Numbers change only for fits OLS would have made non-physical;
+every other fit is bit-for-bit the OLS result it was before. The viewer's
+link card shows the bound label next to the link class.
 
 ## NCCL env (schema v10)
 

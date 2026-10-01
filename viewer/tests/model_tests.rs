@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use gauntlet::analysis::fit::FitBound;
 use gauntlet::config::FleetConfig;
 use gauntlet::orchestrator::collect::HostObservations;
 use gauntlet::proto::{InventorySnapshot, MetricRecord, Scope, TestId, TestOutcome, Unit};
@@ -331,6 +332,37 @@ fn sweep_series_are_excluded_from_rows_but_links_survive() {
         .expect("fleet fit present");
     assert!(link.gib_per_sec > 0.0);
     assert!(link.alpha_us >= 0.0);
+}
+
+#[test]
+fn bound_link_fits_carry_their_constraint() {
+    let config = config(r#"hosts = ["a"]"#);
+    let mut obs = HostObservations::default();
+    // Plain OLS puts the intercept below zero here.
+    for (bytes, us) in [(1_000.0, 1.0), (2_000.0, 50.0), (3_000.0, 100.0)] {
+        obs.metrics.push(metric(
+            TestId::NcclAllReduce,
+            Scope::Node,
+            "msg_bytes",
+            bytes,
+            Unit::Bytes,
+        ));
+        obs.metrics.push(metric(
+            TestId::NcclAllReduce,
+            Scope::Node,
+            "elapsed_us",
+            us,
+            Unit::Micros,
+        ));
+    }
+    let vm = ViewModel::new(&results(&config, BTreeMap::from([("a".to_string(), obs)])));
+    let link = vm
+        .links
+        .iter()
+        .find(|l| l.class == "nccl_allreduce_rank_per_gpu")
+        .expect("fleet fit present");
+    assert_eq!(link.alpha_us, 0.0);
+    assert_eq!(link.bound, Some(FitBound::AlphaZero));
 }
 
 #[test]
