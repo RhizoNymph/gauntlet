@@ -12,8 +12,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod occupancy;
 mod ranks;
 
+pub use occupancy::{
+    GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
+    gpu_idle_outcomes,
+};
 pub use ranks::{RankAssignment, RankBlock, RankError};
 
 // v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
@@ -43,7 +48,12 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // (now `deny_unknown_fields`). The resolved NCCL env (socket_ifname folded
 // in as NCCL_SOCKET_IFNAME) is set on the remote `env` command line at
 // spawn, never on the wire.
-pub const PROTO_VERSION: u32 = 9;
+// v10: GPU occupancy — every `GpuInventory` carries a `GpuOccupancy`
+// (memory used/total plus the compute processes other than the reporting
+// agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
+// rides the wire. Serde-defaulted, so older inventories decode as
+// "occupancy unknown".
+pub const PROTO_VERSION: u32 = 10;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -193,6 +203,12 @@ pub enum LogLevel {
 #[serde(rename_all = "snake_case")]
 pub enum TestId {
     Inventory,
+    /// Per-GPU occupancy check derived from the inventory: Failed when a
+    /// foreign compute process holds the GPU or memory use exceeds
+    /// `thresholds.gpu_idle_max_used_mib`. Derived orchestrator-side from
+    /// the snapshot (the threshold is orchestrator config); agents never
+    /// emit this test id.
+    GpuIdle,
     CpuCorrectness,
     CpuGflops,
     /// Correctness screen re-run while every core burns power: silent data
@@ -379,6 +395,10 @@ pub struct GpuInventory {
     pub pcie_width_max: Option<u32>,
     pub nvlinks_active: Option<u32>,
     pub persistence_mode: Option<bool>,
+    /// Who else is on this GPU at probe time (proto v10). Defaults to
+    /// "nothing known" for older inventories.
+    #[serde(default)]
+    pub occupancy: GpuOccupancy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -977,6 +997,7 @@ mod tests {
             pcie_width_max: None,
             nvlinks_active: None,
             persistence_mode: None,
+            occupancy: GpuOccupancy::default(),
         };
         InventorySnapshot {
             hostname: "n1".into(),

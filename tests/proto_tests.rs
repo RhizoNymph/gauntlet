@@ -445,6 +445,7 @@ fn consistency_includes_gpu_libs_only_on_gpu_hosts() {
         pcie_width_max: None,
         nvlinks_active: None,
         persistence_mode: None,
+        occupancy: Default::default(),
     });
     let fields = consistency_fields(&inv);
     assert_eq!(fields.get("lib:nccl").map(String::as_str), Some("absent"));

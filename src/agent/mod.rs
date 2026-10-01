@@ -14,6 +14,7 @@ pub mod channel;
 pub mod counters;
 pub mod cpu;
 pub mod disk;
+pub mod gpu_occupancy;
 pub mod intranode;
 pub mod inventory;
 pub mod mem;

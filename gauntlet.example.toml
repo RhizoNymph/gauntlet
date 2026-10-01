@@ -50,6 +50,10 @@ mad_k = 4.0
 # Flag a host as a barrier straggler when it was the late arriver in more
 # than this fraction of the margin-passing iterations.
 barrier_slowest_frac = 0.5
+# gpu_idle (inventory): fail a GPU whose memory use exceeds this many MiB
+# before the run starts. Any foreign compute process fails it regardless;
+# the headroom covers graphics clients (Xorg etc.) and driver residue.
+gpu_idle_max_used_mib = 1024
 # Optional absolute floors/ceilings, keyed "<test>.<metric>":
 # [thresholds.absolute."gpu_gemm_perf.gflops_bf16"]
 # min = 500000.0
