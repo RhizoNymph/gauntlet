@@ -53,7 +53,7 @@ pub struct AlphaBetaFit {
     /// Coefficient of determination of the chosen parameters, in [0, 1].
     pub r_squared: f64,
     /// The constraint that bound, or `None` for a plain OLS fit. Absent in
-    /// documents before schema v11, which decode as `None`.
+    /// documents before schema v12, which decode as `None`.
     #[serde(default)]
     pub bound: Option<FitBound>,
 }

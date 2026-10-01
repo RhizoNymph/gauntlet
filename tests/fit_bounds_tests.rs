@@ -218,7 +218,7 @@ fn bound_round_trips_and_defaults_when_absent() {
     assert!((back.beta_us_per_byte - fit.beta_us_per_byte).abs() < 1e-18);
     assert!((back.r_squared - fit.r_squared).abs() < 1e-15);
 
-    // A pre-v11 document has no `bound` field: it decodes as unbound.
+    // A pre-v12 document has no `bound` field: it decodes as unbound.
     let old = r#"{"alpha_us":-46.5,"beta_us_per_byte":0.0018,"r_squared":0.99}"#;
     let back: AlphaBetaFit = serde_json::from_str(old).expect("decode old");
     assert_eq!(back.bound, None);

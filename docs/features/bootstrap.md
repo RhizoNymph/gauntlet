@@ -11,8 +11,8 @@ ssh key distribution (the operator must already be able to ssh in).
 2. Per host: connect (`HostSession::connect`) → arch check (`uname -m` must
    equal orchestrator arch, else Fail) → `deploy::ensure_agent` (sha256
    compare, upload on mismatch) → run `agent probe`, parse
-   `InventorySnapshot` into readiness checks (gpu_driver, clock_sync,
-   ib_ports, governor, persistence_mode) → with `--tune`, apply
+   `InventorySnapshot` into readiness checks (gpu_driver, gpu_libs,
+   gpu_idle, clock_sync, ib_ports, governor, persistence_mode) → with `--tune`, apply
    `nvidia-smi -pm 1` and set the performance governor (sudo-gated; refusal
    is a Warn, never fatal).
    The first four steps are also matrix columns (`connectivity`, `arch`,
@@ -43,7 +43,18 @@ errors since boot), `gpu_libs` (dlopen probe: any of libcuda/libcublas/
 libnccl not loadable on a GPU-bearing node warns — nccl-only absence calls
 out that the NCCL sweep is unavailable; n/a without GPUs), `governor` (anything but `performance`),
 `persistence_mode` (off on any GPU; reported `ok`/n-a when the node has no
-GPUs), and both `tune_*` steps.
+GPUs), `gpu_idle` (see below), and both `tune_*` steps.
+
+`gpu_idle` (`src/orchestrator/bootstrap/gpu_idle.rs`) applies the run's
+`gpu_idle` policy (`proto::assess_gpu_idle`, same
+`thresholds.gpu_idle_max_used_mib`) to the probe's per-GPU occupancy:
+`ok` "<n> idle gpu(s)" (or n/a without GPUs); `warn` naming each busy GPU
+and its processes, e.g. "gpu0: in use by VLLM::EngineCore (pid 2102873,
+23232 MiB)"; `warn` "occupancy unknown on gpu <list>" when nvidia-smi did
+not say. Advisory rather than Fail: a busy GPU does not stop a run from
+starting (bootstrap's Fail set is "the run cannot proceed"), it makes its
+GPU numbers meaningless — which the run itself reports as a Failed
+`gpu_idle` outcome. See docs/features/phase0_inventory.md.
 
 ## Tuning (`--tune`)
 Both steps use `sudo -n` so a node without passwordless sudo reports a Warn
@@ -55,6 +66,7 @@ writes `performance` into every `cpufreq/scaling_governor` via
 ## Files
 - `src/orchestrator/bootstrap.rs` — `run`, `CheckStatus`, `HostReadiness`,
   `ReadinessCheck`.
+- `src/orchestrator/bootstrap/gpu_idle.rs` — `gpu_idle_check`.
 - `src/orchestrator/deploy.rs` — `ensure_agent`, `local_sha256`,
   `AGENT_RELPATH`.
 - `src/orchestrator/session.rs` — `HostSession` (connect/exec/upload).
@@ -79,7 +91,9 @@ writes `performance` into every `cpufreq/scaling_governor` via
 instead of the table: `{ schema_version, finished_epoch_secs, hosts:
 [HostReadiness] }`, where each `HostReadiness` carries the ordered
 `ReadinessCheck` list (`name`, `status`: ok|warn|fail, one-line `detail`)
-plus the probed `InventorySnapshot` when available. The exit code contract
+plus the probed `InventorySnapshot` when available (including each GPU's
+`occupancy` since proto v10; additive and serde-defaulted, so
+`BOOTSTRAP_SCHEMA_VERSION` stays 1). The exit code contract
 is unchanged (non-zero when any host's worst status is fail). The GUI
 viewer runs bootstrap through this interface and renders the same matrix;
 `BOOTSTRAP_SCHEMA_VERSION` bumps on field renames.

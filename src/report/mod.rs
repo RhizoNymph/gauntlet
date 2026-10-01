@@ -5,6 +5,7 @@
 //! bump SCHEMA_VERSION. The terminal table is a projection of it, never a
 //! second source of truth.
 
+pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
 pub mod nccl_env;
@@ -62,12 +63,17 @@ use crate::proto::{
 // process (and so every NCCL communicator) in the run was started with.
 // Optional: pre-v10 documents decode with it absent ("not recorded"),
 // which suppresses drift display.
-// v11: link fits are least squares constrained to alpha >= 0, beta >= 0
+// v11: GPU occupancy — inventory GPUs carry `occupancy` (memory used/total,
+// foreign compute processes, stale gauntlet agents) and hosts gain one
+// `gpu_idle` outcome per GPU (Failed feeds the verdict as Stragglers).
+// Serde-defaulted: pre-v11 documents decode with occupancy unknown and no
+// gpu_idle outcomes.
+// v12: link fits are least squares constrained to alpha >= 0, beta >= 0
 // (a sweep that plain OLS fitted with a negative alpha now fits through
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
-// is plain OLS). Serde-defaulted: pre-v11 documents decode with it null.
-pub const SCHEMA_VERSION: u32 = 11;
+// is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -241,6 +247,7 @@ impl Verdict {
 pub fn test_display_name(test: TestId) -> &'static str {
     match test {
         TestId::Inventory => "inventory",
+        TestId::GpuIdle => "gpu_idle",
         TestId::CpuCorrectness => "cpu_correctness",
         TestId::CpuGflops => "cpu_gflops",
         TestId::CpuSdcHot => "cpu_sdc_hot",
@@ -1060,6 +1067,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
 
     render_hosts(results, out)?;
     render_sdc(results, out)?;
+    gpu_idle::render(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
     render_barrier_stragglers(results, out)?;

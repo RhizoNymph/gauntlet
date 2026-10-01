@@ -25,7 +25,8 @@ started, finished)`:
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any test outcome is Failed or any outliers/violations exist; else Clean.
+   any test outcome is Failed (including `gpu_idle`) or any
+   outliers/violations exist; else Clean.
    Exit codes 2/1/0.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
@@ -74,7 +75,7 @@ are only compared within their own topology (the same keying as the
 
 ## Fit contract (fit.rs)
 Least squares over all (bytes, us) points, constrained to alpha ≥ 0 and
-beta ≥ 0 (schema v11), because a negative latency or inverse bandwidth
+beta ≥ 0 (schema v12), because a negative latency or inverse bandwidth
 would have a simulator predict negative time. Plain OLS on a real
 rank-per-GPU all-reduce sweep gave alpha = -46.59 us: small messages are
 latency-bound, large ones bandwidth-bound, and the large sizes dominate the
@@ -99,7 +100,7 @@ are checked before fitting, exactly as before the constraint.
 
 `AlphaBetaFit.bound: Option<FitBound>` (`alpha_zero` / `beta_zero` /
 `both_zero` in JSON, `null` for a clean fit) records which constraint was
-active. It is serde-defaulted, so pre-v11 documents load with it `None`,
+active. It is serde-defaulted, so pre-v12 documents load with it `None`,
 which on those documents means "not recorded", not "clean". Invariant:
 `AlphaZero` ⇒ alpha_us == 0, `BetaZero` ⇒ beta_us_per_byte == 0 (so
 `bandwidth_gib_per_sec` is infinite), `BothZero` ⇒ both.
@@ -146,7 +147,7 @@ Per-host `NodeRoofline`:
 ## Rendering
 `render_table` (comfy-table, writer-injected for tests) emits a header line
 then sections: per-host summary (pass/fail/skip counts + key rooflines),
-outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
+silent data corruption, gpus in use (gpu_idle), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
 violations, inventory consistency dissenters, failed hosts, and the link
 alpha-beta digest (whose `bound` column shows the active constraint's
 label, e.g. `alpha=0`, or `-` for a clean fit). Empty sections either state "none" (outliers,
@@ -190,7 +191,8 @@ tail progress:
   missing directory yielding an empty list — the viewer's discovery call.
 
 ## Files
-`src/analysis/{stats,fit,schedule}.rs`, `src/report/{mod,history,intranode}.rs`,
+`src/analysis/{stats,fit,schedule}.rs`,
+`src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`).
 
@@ -206,7 +208,7 @@ tail progress:
 - The table is a projection of the JSON; no analysis happens at render
   time.
 - Every `calibration.links` fit has alpha_us ≥ 0 and beta_us_per_byte ≥ 0
-  (schema v11+); `bound` is `Some` exactly when a constraint changed the
+  (schema v12+); `bound` is `Some` exactly when a constraint changed the
   result away from OLS.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
@@ -241,7 +243,28 @@ outlier (informational, not part of the verdict); absolute thresholds
 check the median (sweep series keep per-value semantics); rooflines reduce
 over per-subject medians. Everything degrades gracefully at n = 1.
 
-## Non-negative link fits (schema v11)
+## GPUs in use (schema v11)
+
+Inventory GPUs carry `occupancy` (memory used/total and the compute
+processes other than the reporting agent; stale gauntlet agents marked),
+and each host gains one `gpu_idle` outcome per GPU, derived
+orchestrator-side from the snapshot against
+`thresholds.gpu_idle_max_used_mib` (docs/features/phase0_inventory.md).
+A Failed `gpu_idle` feeds the verdict like any failed test (Stragglers).
+Both additions are serde-defaulted: a v10 document decodes with occupancy
+unknown and simply has no `gpu_idle` outcomes.
+
+The host table only counts failed outcomes, so `report/gpu_idle.rs` adds a
+"gpus in use (gpu_idle)" section right after the SDC section: one row per
+Failed `gpu_idle` outcome (`gpus_in_use(&RunResults) -> Vec<GpuInUse>`,
+host then GPU order) with `host:gpuN`, "used / total MiB", and one line
+per compute process ("VLLM::EngineCore (pid 2102873, 23232 MiB)", "stale
+gauntlet agent ..."). It is a projection: failed GPUs come from
+`hosts.*.outcomes`, the detail from the same host's inventory; with no
+process to name (memory over the threshold only, or an old document) the
+outcome reason stands in. Omitted when no GPU is busy.
+
+## Non-negative link fits (schema v12)
 
 `fit_alpha_beta` became a bounded least-squares fit (alpha ≥ 0, beta ≥ 0;
 see Fit contract) and `calibration.links.*.bound` records which constraint

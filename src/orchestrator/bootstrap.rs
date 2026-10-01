@@ -5,7 +5,8 @@
 //!   2. arch check — `uname -m` must match the orchestrator's;
 //!   3. deploy — `deploy::ensure_agent`;
 //!   4. probe — run `agent probe`, parse the InventorySnapshot: GPU count,
-//!      driver present, CUDA libs resolvable, IB ports up, clock sync;
+//!      driver present, CUDA libs resolvable, IB ports up, clock sync, GPUs
+//!      idle (no foreign compute process, memory within threshold);
 //!   5. tuning (only with --tune; each step is sudo-gated and a refusal is
 //!      reported, not fatal): `nvidia-smi -pm 1` (persistence mode),
 //!      cpu governor -> performance.
@@ -25,6 +26,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
+mod gpu_idle;
+
+use self::gpu_idle::gpu_idle_check;
 use super::deploy::ensure_agent;
 use super::session::HostSession;
 use crate::cli::BootstrapArgs;
@@ -112,6 +116,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     let ssh = Arc::new(config.ssh.clone());
     // Same spawn environment as `gauntlet run`, so probes see what runs see.
     let nccl_env = Arc::new(config.nccl_env()?.clone());
+    let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     info!(
         hosts = hosts.len(),
@@ -129,7 +134,10 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
         let tune = args.tune;
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
-            (index, prepare_host(host, &ssh, &nccl_env, tune).await)
+            (
+                index,
+                prepare_host(host, &ssh, &nccl_env, tune, gpu_idle_max_used_mib).await,
+            )
         });
     }
 
@@ -192,6 +200,7 @@ async fn prepare_host(
     ssh: &SshConfig,
     nccl_env: &NcclEnv,
     tune: bool,
+    gpu_idle_max_used_mib: u64,
 ) -> HostReadiness {
     let addr = host.addr.clone();
     let mut checks = Vec::new();
@@ -279,7 +288,7 @@ async fn prepare_host(
         (inventory, None) => inventory,
     };
 
-    checks.extend(readiness_checks(&inventory));
+    checks.extend(readiness_checks(&inventory, gpu_idle_max_used_mib));
     if tune {
         checks.extend(apply_tuning(&session, &inventory).await);
     }
@@ -397,10 +406,14 @@ fn arch_check(uname_machine: &str, local_arch: &str) -> ReadinessCheck {
 
 /// The readiness checks derivable from a probe: pure, so the policy is
 /// testable without a fleet.
-fn readiness_checks(inventory: &InventorySnapshot) -> Vec<ReadinessCheck> {
+fn readiness_checks(
+    inventory: &InventorySnapshot,
+    gpu_idle_max_used_mib: u64,
+) -> Vec<ReadinessCheck> {
     vec![
         gpu_driver_check(inventory),
         gpu_libs_check(inventory),
+        gpu_idle_check(inventory, gpu_idle_max_used_mib),
         clock_sync_check(inventory),
         ib_ports_check(inventory),
         governor_check(inventory),
@@ -691,7 +704,9 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{GpuInventory, IbPortInventory};
+    use crate::proto::{GpuInventory, GpuOccupancy, GpuProcess, IbPortInventory, ProcessOwner};
+
+    const GPU_IDLE_MAX: u64 = 1024;
 
     fn inventory() -> InventorySnapshot {
         InventorySnapshot {
@@ -738,6 +753,11 @@ mod tests {
             pcie_width_max: Some(16),
             nvlinks_active: Some(18),
             persistence_mode: persistence,
+            occupancy: GpuOccupancy {
+                memory_used_mib: Some(4),
+                memory_total_mib: Some(81_559),
+                compute_processes: Some(Vec::new()),
+            },
         }
     }
 
@@ -770,7 +790,7 @@ mod tests {
 
     #[test]
     fn a_healthy_node_passes_every_derived_check() {
-        let checks = readiness_checks(&inventory());
+        let checks = readiness_checks(&inventory(), GPU_IDLE_MAX);
         assert!(
             checks.iter().all(|check| check.status == CheckStatus::Ok),
             "{checks:?}"
@@ -782,7 +802,7 @@ mod tests {
         let mut inv = inventory();
         inv.nvidia_driver = None;
         inv.gpus.clear();
-        let checks = readiness_checks(&inv);
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
         assert_eq!(status(&checks, "gpu_driver"), CheckStatus::Warn);
         assert_eq!(status(&checks, "persistence_mode"), CheckStatus::Ok);
     }
@@ -822,7 +842,7 @@ mod tests {
         let mut inv = inventory();
         inv.gpus.push(gpu(1, Some(false)));
         inv.cpu_governor = Some("powersave".into());
-        let checks = readiness_checks(&inv);
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
         assert_eq!(status(&checks, "persistence_mode"), CheckStatus::Warn);
         assert_eq!(status(&checks, "governor"), CheckStatus::Warn);
     }
@@ -975,6 +995,55 @@ mod tests {
             !script.contains("{lib_dir}"),
             "all placeholders substituted"
         );
+    }
+
+    #[test]
+    fn gpu_idle_names_the_foreign_process() {
+        let mut inv = inventory();
+        inv.gpus.push(gpu(1, Some(true)));
+        inv.gpus[1].occupancy = GpuOccupancy {
+            memory_used_mib: Some(23_264),
+            memory_total_mib: Some(24_576),
+            compute_processes: Some(vec![GpuProcess {
+                pid: 2_102_873,
+                name: "VLLM::EngineCore".into(),
+                used_mib: Some(23_232),
+                owner: ProcessOwner::Foreign,
+            }]),
+        };
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
+        let check = checks
+            .iter()
+            .find(|check| check.name == "gpu_idle")
+            .expect("gpu_idle column");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(
+            check.detail,
+            "gpu1: in use by VLLM::EngineCore (pid 2102873, 23232 MiB); \
+             23264/24576 MiB used (> 1024 MiB threshold)"
+        );
+        // The matrix cell carries the same detail.
+        let rows = vec![HostReadiness {
+            host: "node1".into(),
+            checks,
+            inventory: Some(inv),
+        }];
+        let mut rendered = Vec::new();
+        render_matrix(&rows, &mut rendered).expect("render");
+        let rendered = String::from_utf8(rendered).expect("utf8");
+        assert!(rendered.contains("gpu_idle"), "{rendered}");
+        assert!(rendered.contains("VLLM::EngineCore"), "{rendered}");
+        // `--json` carries the column and the probed occupancy.
+        let report = BootstrapReport {
+            schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            finished_epoch_secs: 1,
+            hosts: rows,
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains(r#""name":"gpu_idle""#), "{json}");
+        assert!(json.contains(r#""compute_processes""#), "{json}");
+        let back: BootstrapReport = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, report);
     }
 
     #[test]

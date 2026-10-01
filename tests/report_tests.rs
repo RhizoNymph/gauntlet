@@ -292,6 +292,7 @@ fn rooflines_take_the_worst_gpu() {
             pcie_width_max: Some(16),
             nvlinks_active: Some(18),
             persistence_mode: Some(true),
+            occupancy: Default::default(),
         }];
         obs.inventory = Some(inv);
         for (gpu, gflops) in [(0u32, 900_000.0), (1u32, 850_000.0)] {

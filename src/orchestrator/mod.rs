@@ -46,7 +46,7 @@ use crate::config::FleetConfig;
 use crate::nccl_env::NcclEnv;
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
-    TestId, Unit,
+    TestId, Unit, gpu_idle_outcomes,
 };
 use crate::report;
 
@@ -460,6 +460,7 @@ async fn node_phase(
         }
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
+    let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
 
     let mut tasks = JoinSet::new();
     for session in sessions {
@@ -472,10 +473,28 @@ async fn node_phase(
             let outcome = tokio::time::timeout(
                 timeout,
                 session.run_agent(&["run"], Some(document), |event| {
-                    if let AgentEvent::Inventory { snapshot } = &event {
-                        inventory = Some(snapshot.clone());
-                    }
+                    // gpu_idle is derived here, as the snapshot arrives: the
+                    // threshold is orchestrator config, the agent reports
+                    // facts only. One outcome per GPU, right behind the
+                    // inventory it judges.
+                    let gpu_idle = match &event {
+                        AgentEvent::Inventory { snapshot } => {
+                            inventory = Some(snapshot.clone());
+                            gpu_idle_outcomes(snapshot, gpu_idle_max_used_mib)
+                        }
+                        _ => Vec::new(),
+                    };
                     sink.event(&addr, event);
+                    for (scope, outcome) in gpu_idle {
+                        sink.event(
+                            &addr,
+                            AgentEvent::Outcome {
+                                test: TestId::GpuIdle,
+                                scope,
+                                outcome,
+                            },
+                        );
+                    }
                 }),
             )
             .await;
