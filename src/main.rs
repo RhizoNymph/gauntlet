@@ -2,11 +2,21 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
-use gauntlet::cli::{AgentCommand, Cli, Command};
+use gauntlet::cli::{AgentCommand, Cli, Command, parse_failure_exit_code};
 use gauntlet::report::EXIT_ERROR;
 
 fn main() -> ExitCode {
-    match run() {
+    // clap's own exit would use 2 for a usage error, which is the
+    // host-failures verdict; map it onto EXIT_ERROR instead.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            // Help/version go to stdout, usage errors to stderr.
+            let _ = error.print();
+            return ExitCode::from(parse_failure_exit_code(&error));
+        }
+    };
+    match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Not a verdict: gauntlet itself could not do its job (bad
@@ -18,8 +28,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+fn run(cli: Cli) -> Result<()> {
     gauntlet::init_tracing(cli.verbose);
     if matches!(cli.command, Command::Agent(_)) {
         // Before the runtime exists (its workers start at build time): move

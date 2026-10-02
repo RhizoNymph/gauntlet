@@ -24,6 +24,17 @@ fn net_steps_help() -> String {
     )
 }
 
+/// Process exit code for a failed `Cli::try_parse`: 0 when clap is only
+/// displaying `--help` / `--version`, `report::EXIT_ERROR` for a usage
+/// error. clap's default (2) would read as the host-failures verdict.
+pub fn parse_failure_exit_code(error: &clap::Error) -> u8 {
+    if error.use_stderr() {
+        crate::report::EXIT_ERROR
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "gauntlet",
