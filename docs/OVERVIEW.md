@@ -3,8 +3,9 @@
 ```yaml
 Overview:
   description: >
-    Rust CLI that reads a fleet of hosts from a TOML config, deploys itself to
-    each node over ssh, and runs a phased suite of correctness and performance
+    Rust CLI that reads a fleet of hosts from a TOML config (or, in srun
+    launch mode, from the Slurm allocation it runs in), deploys itself to
+    each node over ssh or as srun job steps, and runs a phased suite of correctness and performance
     tests (CPU, DRAM, disk, GPU, intra/inter-node network, NCCL collectives).
     Output is a schema-versioned JSON document plus a human table, with
     fleet-relative outlier detection (median + MAD) as the primary straggler
@@ -13,12 +14,18 @@ Overview:
     network fits per link class.
   subsystems:
     orchestrator: >
-      Runs on the operator's machine (`gauntlet run`). Tokio task per host,
-      persistent ssh sessions via the `openssh` crate (native-mux
-      ControlMaster multiplexing, respects ~/.ssh/config). Deploys the agent
-      (sftp upload of the running binary, staged then renamed, skipped when
-      the remote sha256 matches), drives the phase schedule, aggregates
-      results over an mpsc channel into a single lock-free collector task.
+      Runs on the operator's machine (`gauntlet run`), or on a node inside
+      a Slurm allocation in srun launch mode. Tokio task per host; every
+      node operation goes through a `HostSession` over one transport
+      (orchestrator/transport): persistent ssh sessions via the `openssh`
+      crate (native-mux ControlMaster multiplexing, respects ~/.ssh/config),
+      or `srun` job steps of the current allocation (`--overlap`, one step
+      per agent process, killed with `scancel` of the named step). Deploys
+      the agent (ssh: sftp upload of the running binary; srun: one sbcast to
+      every allocated node then a per-node install; staged then renamed,
+      skipped when the remote sha256 matches), drives the phase schedule,
+      aggregates results over an mpsc channel into a single lock-free
+      collector task.
     agent: >
       Same binary in `gauntlet agent` mode, executed on each node. At
       startup, before any thread exists, the agent moves its protocol
@@ -50,13 +57,18 @@ Overview:
       flight also republishes itself every 2s as runs/<run_id>.partial.json so
       viewers can tail progress.
   data_flow: >
-    config.toml -> orchestrator -> (scp agent, spawn `gauntlet agent` per
-    host/pair/NCCL rank) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
-    mpsc -> collector -> outlier analysis -> report.json + terminal table.
-    The resolved `[nccl]` env (validated NCCL_* map) is set on the remote
-    `env ... gauntlet agent ...` command line of every agent spawn — never
-    on the wire, never via set_var in the agent — and recorded run-level
-    in RunResults.nccl_env.
+    config.toml (+ Slurm allocation in srun mode: SLURM_JOB_ID,
+    `scontrol show hostnames $SLURM_JOB_NODELIST`) -> launcher resolution
+    -> orchestrator -> (deploy agent, spawn `gauntlet agent` per
+    host/pair/NCCL rank over ssh or as an srun step) -> agent JSON-lines on
+    stdout (srun forwards the task's stdio unchanged) -> per-host tokio
+    task decodes -> mpsc -> collector -> outlier analysis -> report.json +
+    terminal table. The resolved `[nccl]` env (validated NCCL_* map) is the
+    environment of every agent spawn — on the remote `env ... gauntlet
+    agent ...` command line over ssh, on the local srun process (exported
+    with --export=ALL) over srun; never on the wire, never via set_var in
+    the agent — and recorded run-level in RunResults.nccl_env, next to
+    RunResults.launch (ssh, or srun + job id).
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -65,16 +77,42 @@ Overview:
     runs/<run_id>.json lands.
 
 Features Index:
+  slurm_launch:
+    description: >
+      `[launch] mode = "srun"` / `--launch srun` (schema v13): agents start
+      as srun job steps of the allocation the orchestrator runs in
+      (`srun <flags> --nodes=1 --ntasks=1 --nodelist=<host>
+      --job-name=gauntlet:<host>:<args> --export=ALL <agent> agent ...`;
+      default flags --overlap, --cpu-bind=none, --kill-on-bad-exit=1,
+      typed and config-overridable; managed, stdio-changing and
+      signal-changing options rejected in every getopt spelling). Hosts
+      default to the allocation (`scontrol show hostnames`, pure parser)
+      or must be a subset of it, keyed by NodeName with NodeAddr (one
+      `scontrol --oneliner show node`) as data_addr; no SLURM_JOB_ID is a
+      typed error. NCCL env via the srun process env (orchestrator NCCL_*
+      and GPU-visibility vars stripped); `<dir>/lib` prepended to
+      LD_LIBRARY_PATH inside the step so srun keeps its own. Deploy by a
+      step-scoped sbcast (carrier step on the stale nodes, per-node
+      fallback) to /tmp/gauntlet-$USER (or a shared path), staging
+      cleaned everywhere. Every step named; kill = batched squeue lookup
+      + scancel --signal=KILL of the printed ids (array/het jobs work);
+      a dropped srun gets SIGTERM so it cancels its step. Behind a
+      transport enum (Ssh | Srun) so nothing above HostSession changes.
+    entry_points: [launch/, orchestrator/transport/, orchestrator/session.rs, orchestrator/deploy.rs, orchestrator/fanout.rs, config.rs, cli.rs]
+    depends_on: [bootstrap, nccl_env, phase3_network]
+    doc: docs/features/slurm_launch.md
   bootstrap:
     description: >
-      `gauntlet bootstrap`: connectivity check, arch check, agent deploy,
+      `gauntlet bootstrap`: connectivity check, arch check, agent deploy
+      (fleet-wide step: per-host sftp, or one sbcast in srun mode),
       capability probe (agent probe -> InventorySnapshot, including the
       gpu_idle column), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
-      schema-versioned document (the GUI viewer's interface).
+      schema-versioned document (the GUI viewer's interface). `--launch`
+      selects ssh or srun (connectivity cell names the Slurm job).
     entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
-    depends_on: []
+    depends_on: [slurm_launch]
     doc: docs/features/bootstrap.md
   phase0_inventory:
     description: >
@@ -244,7 +282,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, slurm_launch]
     doc: docs/features/reporting.md
   viewer:
     description: >

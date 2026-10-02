@@ -522,3 +522,160 @@ fn the_example_config_enables_the_intranode_sweep() {
     let config = FleetConfig::load(&path).expect("example config must stay valid");
     assert!(config.tests.nccl_intranode);
 }
+
+// ---------------------------------------------------------------------------
+// [launch]
+// ---------------------------------------------------------------------------
+
+#[test]
+fn launch_defaults_to_ssh_with_default_srun_flags() {
+    use gauntlet::launch::{LaunchMode, SrunDeploy, srun::DEFAULT_FLAGS};
+    let config = parse(r#"hosts = ["n0"]"#).expect("minimal");
+    assert_eq!(config.launch.mode, LaunchMode::Ssh);
+    let flags: Vec<&str> = config
+        .launch
+        .srun
+        .flags
+        .iter()
+        .map(|f| f.as_str())
+        .collect();
+    assert_eq!(flags, DEFAULT_FLAGS);
+    assert!(config.launch.srun.extra_flags.is_empty());
+    assert_eq!(config.launch.srun.dir, None);
+    assert_eq!(config.launch.srun.deploy, SrunDeploy::Sbcast);
+}
+
+#[test]
+fn srun_mode_may_omit_hosts() {
+    use gauntlet::launch::{LaunchMode, SrunDeploy};
+    let config = parse(
+        r#"
+        [launch]
+        mode = "srun"
+        [launch.srun]
+        flags = ["--overlap"]
+        extra_flags = ["--gres=gpu:8", "--mem=0"]
+        dir = "/scratch/gauntlet-alice/"
+        deploy = "shared"
+        "#,
+    )
+    .expect("srun config without hosts");
+    assert_eq!(config.launch.mode, LaunchMode::Srun);
+    assert_eq!(config.hosts().count(), 0);
+    let all: Vec<&str> = config.launch.srun.all_flags().map(|f| f.as_str()).collect();
+    assert_eq!(all, ["--overlap", "--gres=gpu:8", "--mem=0"]);
+    assert_eq!(
+        config.launch.srun.dir.as_ref().map(|dir| dir.as_str()),
+        Some("/scratch/gauntlet-alice")
+    );
+    assert_eq!(config.launch.srun.deploy, SrunDeploy::Shared);
+}
+
+#[test]
+fn hosts_are_required_outside_srun_mode() {
+    use gauntlet::launch::LaunchMode;
+    let error = parse("[launch]\nmode = \"ssh\"\n").expect_err("ssh needs hosts");
+    assert!(error.contains("no hosts"), "{error}");
+    let error = parse("").expect_err("default mode needs hosts");
+    assert!(error.contains("no hosts"), "{error}");
+
+    // A config valid for srun still fails when the effective mode is ssh.
+    let config = parse("[launch]\nmode = \"srun\"\n").expect("srun");
+    assert!(matches!(
+        config.require_hosts_for(LaunchMode::Ssh),
+        Err(ConfigError::NoHosts {
+            mode: LaunchMode::Ssh
+        })
+    ));
+    assert!(config.require_hosts_for(LaunchMode::Srun).is_ok());
+}
+
+#[test]
+fn invalid_srun_settings_are_rejected_at_parse_time() {
+    for (body, needle) in [
+        ("flags = [\"--nodelist=n9\"]", "managed by gauntlet"),
+        ("extra_flags = [\"-N2\"]", "managed by gauntlet"),
+        ("extra_flags = [\"--gres gpu:8\"]", "single word"),
+        ("extra_flags = [\"overlap\"]", "must start with '-'"),
+        ("dir = \"~/.gauntlet\"", "absolute path"),
+        ("dir = \"relative\"", "absolute path"),
+        ("deploy = \"scp\"", "unknown variant"),
+        ("flagz = []", "flagz"),
+    ] {
+        let text = format!("[launch]\nmode = \"srun\"\n[launch.srun]\n{body}\n");
+        let error = parse(&text).expect_err(body);
+        assert!(error.contains(needle), "{body}: {error}");
+    }
+    let error = parse("hosts = [\"n0\"]\n[launch]\nmode = \"pbs\"\n").expect_err("mode");
+    assert!(error.contains("unknown variant"), "{error}");
+}
+
+#[test]
+fn with_hosts_fills_and_revalidates_the_fleet() {
+    use gauntlet::config::HostConfig;
+    let config = parse("[launch]\nmode = \"srun\"\n").expect("srun");
+    let host = |addr: &str| HostConfig {
+        addr: addr.into(),
+        data_addr: None,
+        labels: Default::default(),
+    };
+    let filled = config
+        .with_hosts(vec![host("n1"), host("n0")])
+        .expect("filled");
+    let addrs: Vec<String> = filled.hosts().map(|host| host.addr).collect();
+    assert_eq!(addrs, ["n1", "n0"]);
+    // The rest of the config is untouched.
+    assert_eq!(filled.launch, config.launch);
+    assert_eq!(filled.tests, config.tests);
+
+    assert!(matches!(
+        config.with_hosts(vec![host("n0"), host("n0")]),
+        Err(ConfigError::DuplicateHost { .. })
+    ));
+    assert!(matches!(
+        config.with_hosts(Vec::new()),
+        Err(ConfigError::NoHosts { .. })
+    ));
+}
+
+#[test]
+fn load_for_validates_against_the_cli_launch_override() {
+    use gauntlet::launch::LaunchMode;
+    let path = std::env::temp_dir().join(format!(
+        "gauntlet-load-for-{}-{}.toml",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    // No hosts, default (ssh) mode: only `--launch srun` makes it loadable.
+    std::fs::write(&path, "[tests]\nphases = [\"inventory\"]\n").expect("write");
+    assert!(matches!(
+        FleetConfig::load(&path),
+        Err(ConfigError::NoHosts { .. })
+    ));
+    assert!(matches!(
+        FleetConfig::load_for(&path, Some(LaunchMode::Ssh)),
+        Err(ConfigError::NoHosts { .. })
+    ));
+    let config = FleetConfig::load_for(&path, Some(LaunchMode::Srun)).expect("srun override");
+    assert_eq!(config.hosts().count(), 0);
+    // Other validation still applies under the override.
+    std::fs::write(&path, "[thresholds]\nmad_k = 0.0\n").expect("write");
+    assert!(matches!(
+        FleetConfig::load_for(&path, Some(LaunchMode::Srun)),
+        Err(ConfigError::BadMadK { .. })
+    ));
+    std::fs::remove_file(&path).expect("cleanup");
+}
+
+#[test]
+fn example_config_documents_the_launch_section() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("gauntlet.example.toml");
+    let text = std::fs::read_to_string(&path).expect("example");
+    assert!(text.contains("[launch]"), "{text}");
+    assert!(text.contains("[launch.srun]"), "{text}");
+    let config = FleetConfig::load(&path).expect("example config must stay valid");
+    assert_eq!(config.launch.mode, gauntlet::launch::LaunchMode::Ssh);
+}

@@ -1,7 +1,9 @@
 //! Operator-side driver for `gauntlet run` and `gauntlet bootstrap`.
 //!
 //! Control flow of a run:
-//!   load config -> open sessions (bounded concurrency, then held open) ->
+//!   load config -> resolve the launcher (`transport::resolve_launch`: ssh,
+//!   or srun steps inside the current Slurm allocation, whose nodes then
+//!   are the fleet) -> open sessions (bounded concurrency, then held open) ->
 //!   ensure agent deployed (hash check) -> per-phase:
 //!     phases 0-2: spawn `agent run` on every host simultaneously, decode
 //!       event streams into the collector;
@@ -19,9 +21,11 @@ mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+mod fanout;
 mod intranode;
 mod nccl;
 pub mod session;
+pub mod transport;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -37,12 +41,16 @@ use tracing::{debug, info, warn};
 
 use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
-use self::session::{HostSession, single_quote};
+use self::session::HostSession;
+#[cfg(test)]
+use self::session::agent_kill_pattern;
+use self::transport::{AgentChild, Launcher, resolve_launch};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
+use crate::launch::LaunchRecord;
 use crate::nccl_env::NcclEnv;
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
@@ -140,6 +148,7 @@ struct PartialWriter {
     run_id: String,
     config: FleetConfig,
     started_epoch_secs: u64,
+    launch: LaunchRecord,
 }
 
 impl PartialWriter {
@@ -154,6 +163,7 @@ impl PartialWriter {
             epoch_secs(),
         );
         results.run_id = self.run_id.clone();
+        results.launch = Some(self.launch);
         let dir = Path::new(report::history::DEFAULT_DIR);
         match report::history::save_partial(&results, dir) {
             Ok(path) => {
@@ -169,8 +179,10 @@ impl PartialWriter {
 // ---------------------------------------------------------------------------
 
 pub async fn run(args: RunArgs) -> Result<()> {
-    let config = FleetConfig::load(&args.config)
+    let config = FleetConfig::load_for(&args.config, args.launch)
         .with_context(|| format!("loading {}", args.config.display()))?;
+    // srun mode: hosts come from (or are checked against) the allocation.
+    let (config, launcher) = resolve_launch(&config, args.launch).await?;
     let phases = config.resolve_phases(&args.phases)?;
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
@@ -189,6 +201,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         run_id: run_id.clone(),
         config: config.clone(),
         started_epoch_secs,
+        launch: launcher.record(),
     });
     let collector = tokio::spawn(async move {
         let mut collector = Collector::new();
@@ -219,8 +232,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, config.nccl_env()?, &sink).await;
-    let sessions = deploy_fleet(&config, sessions, &sink).await;
+    let sessions = connect_fleet(&config, &launcher, config.nccl_env()?, &sink).await;
+    let sessions = deploy_fleet(&config, &launcher, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
     }
@@ -304,6 +317,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // document lands where onlookers were already watching.
     results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
+    results.launch = Some(launcher.record());
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -352,6 +366,7 @@ fn epoch_secs() -> u64 {
 /// the handshake). Order follows the config so host indices are stable.
 async fn connect_fleet(
     config: &FleetConfig,
+    launcher: &Launcher,
     nccl_env: &NcclEnv,
     sink: &ObservationSink,
 ) -> Vec<Arc<HostSession>> {
@@ -364,17 +379,20 @@ async fn connect_fleet(
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
         count += 1;
-        let ssh = config.ssh.clone();
+        let launcher = launcher.clone();
         let nccl_env = Arc::clone(&nccl_env);
         let permits = Arc::clone(&permits);
         let sink = sink.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh, &nccl_env).await {
+            match launcher.connect(host, &nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
-                    sink.error(&addr, format!("ssh connect failed: {error:#}"));
+                    sink.error(
+                        &addr,
+                        format!("{} connect failed: {error:#}", launcher.mode()),
+                    );
                     (index, None)
                 }
             }
@@ -391,52 +409,33 @@ async fn connect_fleet(
     slots.into_iter().flatten().collect()
 }
 
-/// Hash-compare and upload the agent everywhere, dropping hosts that cannot
-/// take it. Bounded by the same concurrency limit as connects: uploads are
-/// the heavy part of bootstrap.
+/// Hash-compare and install the agent everywhere (per host over ssh, one
+/// broadcast over srun), dropping hosts that cannot take it. Bounded by the
+/// same concurrency limit as connects: uploads are the heavy part of
+/// bootstrap.
 async fn deploy_fleet(
     config: &FleetConfig,
+    launcher: &Launcher,
     sessions: Vec<Arc<HostSession>>,
     sink: &ObservationSink,
 ) -> Vec<Arc<HostSession>> {
-    let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
-    let mut tasks = JoinSet::new();
-    let count = sessions.len();
-    for (index, session) in sessions.into_iter().enumerate() {
-        let permits = Arc::clone(&permits);
-        let sink = sink.clone();
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            let addr = session.addr().to_string();
-            match tokio::time::timeout(timeout, deploy::ensure_agent(&session)).await {
-                Ok(Ok(uploaded)) => {
-                    debug!(host = %addr, uploaded, "agent ready");
-                    (index, Some(session))
-                }
-                Ok(Err(error)) => {
-                    sink.error(&addr, format!("agent deploy failed: {error:#}"));
-                    (index, None)
-                }
-                Err(_) => {
-                    sink.error(
-                        &addr,
-                        format!("agent deploy timed out after {}s", timeout.as_secs()),
-                    );
-                    (index, None)
-                }
+    let outcomes =
+        deploy::ensure_fleet(launcher, &sessions, config.ssh.max_concurrent, timeout).await;
+    sessions
+        .into_iter()
+        .zip(outcomes)
+        .filter_map(|(session, outcome)| match outcome {
+            Ok(outcome) => {
+                debug!(host = %session.addr(), %outcome, "agent ready");
+                Some(session)
             }
-        });
-    }
-
-    let mut slots: Vec<Option<Arc<HostSession>>> = vec![None; count];
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, session)) => slots[index] = session,
-            Err(error) => warn!(%error, "deploy task did not complete"),
-        }
-    }
-    slots.into_iter().flatten().collect()
+            Err(error) => {
+                sink.error(session.addr(), format!("agent deploy failed: {error:#}"));
+                None
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -830,38 +829,17 @@ async fn probe_pair(
     Ok((latency, bandwidth))
 }
 
-/// `pkill -f` pattern for a deployed agent running `agent <args>`. The
-/// remote command line is `<remote_dir>/bin/gauntlet-agent agent <args>`
-/// (`HostSession::run_agent`); the bracket keeps the pattern from matching
-/// the `pkill` invocation itself.
-fn agent_kill_pattern(args: &str) -> String {
-    format!("[g]auntlet-agent agent {args}")
-}
-
-/// Kill a remote agent process by its command line. Dropping the ssh
-/// future on a timeout does not stop the remote process — it can sit
-/// blocked (a collective, a socket) and never write to stdout again, so it
-/// never even dies of SIGPIPE — so every timeout that abandons an agent
-/// ends here. Best effort: a failed cleanup command is logged, not raised.
+/// Kill a remote agent running `agent <args...>` on `session`'s host,
+/// whatever the transport (`HostSession::kill_agent`: `pkill -f` over ssh,
+/// `scancel` of the matching step over srun). Every timeout that abandons
+/// an agent ends here. Best effort: a failed cleanup is logged, not raised.
 async fn kill_remote_agent(session: &HostSession, args: &str) {
-    let pattern = agent_kill_pattern(args);
-    match session
-        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-        .await
-    {
-        Ok(_) => debug!(host = %session.addr(), pattern, "remote agent cleanup sent"),
-        Err(error) => warn!(host = %session.addr(), %error, "remote agent cleanup failed"),
-    }
+    session.kill_agent(args).await;
 }
 
-/// Graceful shutdown frame first; a remote `pkill` as the backstop for
+/// Graceful shutdown frame first; a remote kill as the backstop for
 /// fleets where the operator cannot reach the peer port directly.
-async fn stop_peer(
-    server: &HostSession,
-    target: &str,
-    port: u16,
-    child: openssh::Child<Arc<openssh::Session>>,
-) {
+async fn stop_peer(server: &HostSession, target: &str, port: u16, child: AgentChild) {
     match tokio::time::timeout(
         PEER_SHUTDOWN_TIMEOUT,
         crate::agent::net::shutdown_peer(target),

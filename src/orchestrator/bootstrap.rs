@@ -1,9 +1,11 @@
 //! `gauntlet bootstrap`: make every node ready without manual setup.
 //!
-//! Steps per host (bounded-concurrency fan-out):
-//!   1. connectivity — open the ssh session, fail fast with a clear reason;
+//! Steps per host (bounded-concurrency fan-out; the transport — ssh or
+//! srun steps inside a Slurm allocation — comes from `resolve_launch`):
+//!   1. connectivity — open the session, fail fast with a clear reason;
 //!   2. arch check — `uname -m` must match the orchestrator's;
-//!   3. deploy — `deploy::ensure_agent`;
+//!   3. deploy — `deploy::ensure_fleet`, fleet-wide (srun's sbcast reaches
+//!      every node at once);
 //!   4. probe — run `agent probe`, parse the InventorySnapshot: GPU count,
 //!      driver present, CUDA libs resolvable, IB ports up, clock sync, GPUs
 //!      idle (no foreign compute process, memory within threshold);
@@ -22,17 +24,18 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::info;
 
 mod gpu_idle;
 
 use self::gpu_idle::gpu_idle_check;
-use super::deploy::ensure_agent;
+use super::deploy::{self, DeployOutcome};
+use super::fanout::fan_out;
 use super::session::HostSession;
+use super::transport::{Launcher, resolve_launch};
 use crate::cli::BootstrapArgs;
-use crate::config::{FleetConfig, HostConfig, SshConfig};
+use crate::config::{FleetConfig, HostConfig};
+use crate::launch::LaunchRecord;
 use crate::nccl_env::NcclEnv;
 use crate::proto::InventorySnapshot;
 
@@ -110,44 +113,76 @@ const CLOCK_WARN_MS: f64 = 100.0;
 const CLOCK_FAIL_MS: f64 = 1_000.0;
 
 pub async fn run(args: BootstrapArgs) -> Result<()> {
-    let config = FleetConfig::load(&args.config)
+    let config = FleetConfig::load_for(&args.config, args.launch)
         .with_context(|| format!("loading {}", args.config.display()))?;
+    // Same launcher (and in srun mode the same allocation-derived fleet) as
+    // `gauntlet run`, so the matrix checks what a run will use.
+    let (config, launcher) = resolve_launch(&config, args.launch).await?;
     let hosts: Vec<HostConfig> = config.hosts().collect();
-    let ssh = Arc::new(config.ssh.clone());
     // Same spawn environment as `gauntlet run`, so probes see what runs see.
     let nccl_env = Arc::new(config.nccl_env()?.clone());
     let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
-    let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
+    let max_concurrent = config.ssh.max_concurrent.max(1);
     info!(
         hosts = hosts.len(),
-        max_concurrent = config.ssh.max_concurrent,
+        launch = %launcher.record(),
+        max_concurrent,
         tune = args.tune,
         "bootstrapping fleet"
     );
     warn_if_debug_build();
 
-    let mut tasks = JoinSet::new();
-    for (index, host) in hosts.iter().cloned().enumerate() {
-        let ssh = Arc::clone(&ssh);
+    // 1. connectivity + arch, per host.
+    let connected = fan_out(hosts.to_vec(), max_concurrent, {
+        let launcher = launcher.clone();
         let nccl_env = Arc::clone(&nccl_env);
-        let permits = Arc::clone(&permits);
-        let tune = args.tune;
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            (
-                index,
-                prepare_host(host, &ssh, &nccl_env, tune, gpu_idle_max_used_mib).await,
-            )
-        });
-    }
+        move |host| {
+            let launcher = launcher.clone();
+            let nccl_env = Arc::clone(&nccl_env);
+            async move { connect_host(&launcher, host, &nccl_env).await }
+        }
+    })
+    .await;
 
-    let mut slots: Vec<Option<HostReadiness>> = vec![None; hosts.len()];
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, readiness)) => slots[index] = Some(readiness),
-            Err(error) => debug!(%error, "bootstrap task did not complete"),
+    // 2. deploy, fleet-wide: srun broadcasts the binary once with sbcast,
+    //    so it cannot be a per-host step.
+    let mut stages: Vec<Option<Stage>> = connected;
+    let ready: Vec<(usize, Arc<HostSession>)> = stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stage)| match stage {
+            Some(Stage::Ready { session, .. }) => Some((index, Arc::clone(session))),
+            _ => None,
+        })
+        .collect();
+    let ready_sessions: Vec<Arc<HostSession>> = ready
+        .iter()
+        .map(|(_, session)| Arc::clone(session))
+        .collect();
+    let deploy_timeout = std::time::Duration::from_secs(config.tests.phase_timeout_secs.max(1));
+    let outcomes =
+        deploy::ensure_fleet(&launcher, &ready_sessions, max_concurrent, deploy_timeout).await;
+    for ((index, _), outcome) in ready.into_iter().zip(outcomes) {
+        if let Some(stage) = stages[index].take() {
+            stages[index] = Some(stage.after_deploy(outcome));
         }
     }
+
+    // 3. probe, shim, derived checks, tuning: per host.
+    let tune = args.tune;
+    let slots = fan_out(stages, max_concurrent, move |stage| async move {
+        match stage {
+            Some(Stage::Ready { session, checks }) => {
+                Some(finish_host(&session, checks, tune, gpu_idle_max_used_mib).await)
+            }
+            Some(Stage::Done(readiness)) => Some(*readiness),
+            None => None,
+        }
+    })
+    .await
+    .into_iter()
+    .map(Option::flatten)
+    .collect::<Vec<Option<HostReadiness>>>();
 
     // Invariant: every configured host appears exactly once, in config order.
     let rows: Vec<HostReadiness> = slots
@@ -193,30 +228,63 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     Ok(())
 }
 
-/// Full per-host sequence. Never returns an error: a failure is a matrix
-/// cell, and one bad node must not abort the rest of the fleet.
-async fn prepare_host(
-    host: HostConfig,
-    ssh: &SshConfig,
-    nccl_env: &NcclEnv,
-    tune: bool,
-    gpu_idle_max_used_mib: u64,
-) -> HostReadiness {
+/// A host between bootstrap steps: still going (session open, checks so
+/// far), or finished with its final row (a short-circuiting Fail).
+enum Stage {
+    Ready {
+        session: Arc<HostSession>,
+        checks: Vec<ReadinessCheck>,
+    },
+    Done(Box<HostReadiness>),
+}
+
+impl Stage {
+    fn done(host: &str, checks: Vec<ReadinessCheck>) -> Self {
+        Stage::Done(Box::new(HostReadiness {
+            host: host.to_string(),
+            checks,
+            inventory: None,
+        }))
+    }
+
+    /// Record the deploy column; a failed deploy finishes the host.
+    fn after_deploy(self, outcome: Result<DeployOutcome>) -> Self {
+        match self {
+            Stage::Ready {
+                session,
+                mut checks,
+            } => match outcome {
+                Ok(outcome) => {
+                    checks.push(ReadinessCheck::ok("deploy", outcome.to_string()));
+                    Stage::Ready { session, checks }
+                }
+                Err(error) => {
+                    checks.push(ReadinessCheck::fail("deploy", format!("{error:#}")));
+                    Stage::done(session.addr(), checks)
+                }
+            },
+            done @ Stage::Done(_) => done,
+        }
+    }
+}
+
+/// `connectivity` and `arch`. Never returns an error: a failure is a
+/// matrix cell, and one bad node must not abort the rest of the fleet.
+async fn connect_host(launcher: &Launcher, host: HostConfig, nccl_env: &NcclEnv) -> Stage {
     let addr = host.addr.clone();
     let mut checks = Vec::new();
 
-    let session = match HostSession::connect(host, ssh, nccl_env).await {
+    let session = match launcher.connect(host, nccl_env).await {
         Ok(session) => {
-            checks.push(ReadinessCheck::ok("connectivity", session.remote_dir()));
-            session
+            checks.push(ReadinessCheck::ok(
+                "connectivity",
+                connectivity_detail(launcher.record(), session.remote_dir()),
+            ));
+            Arc::new(session)
         }
         Err(error) => {
             checks.push(ReadinessCheck::fail("connectivity", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
+            return Stage::done(&addr, checks);
         }
     };
 
@@ -228,37 +296,36 @@ async fn prepare_host(
             checks.push(check);
             if fatal {
                 // Deploying a binary the node cannot execute helps nobody.
-                return HostReadiness {
-                    host: addr,
-                    checks,
-                    inventory: None,
-                };
+                return Stage::done(&addr, checks);
             }
         }
         Err(error) => {
             checks.push(ReadinessCheck::fail("arch", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
+            return Stage::done(&addr, checks);
         }
     }
+    Stage::Ready { session, checks }
+}
 
-    match ensure_agent(&session).await {
-        Ok(true) => checks.push(ReadinessCheck::ok("deploy", "uploaded")),
-        Ok(false) => checks.push(ReadinessCheck::ok("deploy", "up to date")),
-        Err(error) => {
-            checks.push(ReadinessCheck::fail("deploy", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
-        }
+/// The `connectivity` cell: over ssh the resolved agent dir (as always);
+/// over srun, that a step reached the node inside which job.
+fn connectivity_detail(launch: LaunchRecord, remote_dir: &str) -> String {
+    match launch {
+        LaunchRecord::Ssh => remote_dir.to_string(),
+        LaunchRecord::Srun { job_id } => format!("srun step in job {job_id}: {remote_dir}"),
     }
+}
 
-    let inventory = match probe(&session).await {
+/// Everything after deploy: probe, NCCL shim, derived checks, tuning.
+async fn finish_host(
+    session: &HostSession,
+    mut checks: Vec<ReadinessCheck>,
+    tune: bool,
+    gpu_idle_max_used_mib: u64,
+) -> HostReadiness {
+    let addr = session.addr().to_string();
+
+    let inventory = match probe(session).await {
         Ok(inventory) => {
             checks.push(ReadinessCheck::ok(
                 "probe",
@@ -280,7 +347,7 @@ async fn prepare_host(
         }
     };
 
-    let inventory = match maybe_build_nccl_shim(&session, inventory).await {
+    let inventory = match maybe_build_nccl_shim(session, inventory).await {
         (inventory, Some(shim_check)) => {
             checks.push(shim_check);
             inventory
@@ -290,7 +357,7 @@ async fn prepare_host(
 
     checks.extend(readiness_checks(&inventory, gpu_idle_max_used_mib));
     if tune {
-        checks.extend(apply_tuning(&session, &inventory).await);
+        checks.extend(apply_tuning(session, &inventory).await);
     }
 
     HostReadiness {

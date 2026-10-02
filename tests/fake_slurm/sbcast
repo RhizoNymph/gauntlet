@@ -1,0 +1,51 @@
+#!/bin/sh
+# Fake sbcast. `--jobid=<job>.<step>` transmits to that step's nodes only;
+# a bare `--jobid=<job>` to every node of the allocation. A target listed
+# in <root>/bad_nodes fails the whole transfer, as one failing node fails
+# a real sbcast. Every fake node shares this machine's filesystem, so one
+# atomic copy is the broadcast. Refuses to overwrite without --force.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+printf '%s\n' "$*" >> "$state/sbcast.log"
+
+force=0
+jobid=""
+source=""
+dest=""
+for arg in "$@"; do
+    case "$arg" in
+        --force | -f) force=1 ;;
+        --jobid=*) jobid=${arg#--jobid=} ;;
+        -*) ;;
+        *) if [ -z "$source" ]; then source=$arg; else dest=$arg; fi ;;
+    esac
+done
+case "$jobid" in
+    "$job")
+        targets=$(cat "$root/nodes")
+        ;;
+    "$job".*)
+        step=${jobid#"$job".}
+        targets=$(cat "$state/steps/$step.nodes" 2>/dev/null)
+        if [ -z "$targets" ]; then
+            echo "sbcast: error: Slurm job $jobid lookup error: Invalid job id specified" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        echo "sbcast: error: invalid job id $jobid" >&2
+        exit 1
+        ;;
+esac
+for node in $targets; do
+    if [ -f "$root/bad_nodes" ] && grep -qx -- "$node" "$root/bad_nodes"; then
+        echo "sbcast: error: REQUEST_FILE_BCAST($node): Permission denied" >&2
+        exit 1
+    fi
+done
+if [ -e "$dest" ] && [ "$force" != 1 ]; then
+    echo "sbcast: $dest exists" >&2
+    exit 1
+fi
+cp "$source" "$dest.fake.$$" && mv -f "$dest.fake.$$" "$dest"

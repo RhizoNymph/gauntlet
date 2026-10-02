@@ -14,7 +14,31 @@ hosts = [
 # key = "~/.ssh/id_ed25519"
 remote_dir = "~/.gauntlet"
 connect_timeout_secs = 10
-max_concurrent = 32
+max_concurrent = 32            # also bounds concurrent srun setup/deploy steps
+
+# How agents start. "ssh" (default): the sessions above. "srun": every agent
+# is a job step of the Slurm allocation gauntlet runs in (`salloc ...` then
+# `gauntlet run --launch srun`, or from an sbatch script) — no ssh keys, no
+# pam_slurm_adopt. In srun mode `hosts` may be omitted: the allocation's
+# nodes are used (configured hosts must be a subset of it). Needs Slurm
+# >= 22.05 (`--overlap` sharing GPUs between concurrent steps). See
+# docs/features/slurm_launch.md.
+[launch]
+mode = "ssh"                   # or "srun"; `--launch` overrides
+
+[launch.srun]
+# Options on every step (replace the defaults); one `--name=value` word each.
+# --nodes/--ntasks/--nodelist/--job-name/--export are managed by gauntlet.
+flags = ["--overlap", "--cpu-bind=none", "--kill-on-bad-exit=1"]
+# Appended to `flags`. An --exclusive allocation that requested no GPUs
+# gives its steps none: add e.g. "--gres=gpu:8".
+extra_flags = []
+# Agent directory on every node, an absolute literal path (no `~`).
+# Default: /tmp/gauntlet-$USER (node-local).
+# dir = "/tmp/gauntlet-alice"
+# "sbcast": broadcast the binary to the stale nodes only (default).
+# "shared": `dir` is on a shared filesystem; install once from here.
+deploy = "sbcast"
 
 [tests]
 # "overlap" (GEMM concurrent with intra-node all-reduce) runs last: its

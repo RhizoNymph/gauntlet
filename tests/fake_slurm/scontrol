@@ -1,0 +1,30 @@
+#!/bin/sh
+# Fake scontrol:
+#  - `scontrol show hostnames <list>`: the fake allocation's nodes, one per
+#    line (the list argument is only logged);
+#  - `scontrol --oneliner show node <list>`: one record per node in the
+#    `slurm_sprint_node_table` one-liner shape, with NodeAddr from
+#    <root>/node_addrs ("<name> <addr>" lines) when listed there.
+root=$(cd "$(dirname "$0")/.." && pwd)
+printf '%s\n' "$*" >> "$root/state/scontrol.log"
+if [ "$1" = show ] && [ "$2" = hostnames ]; then
+    cat "$root/nodes"
+    exit 0
+fi
+if [ "$1" = --oneliner ] && [ "$2" = show ] && [ "$3" = node ]; then
+    while IFS= read -r node; do
+        [ -n "$node" ] || continue
+        addr=""
+        if [ -f "$root/node_addrs" ]; then
+            addr=$(awk -v n="$node" '$1 == n { print $2 }' "$root/node_addrs")
+        fi
+        line="NodeName=$node Arch=x86_64 CoresPerSocket=8 CPUAlloc=0 CPUEfctv=16 CPUTot=16 CPULoad=0.10 AvailableFeatures=(null) ActiveFeatures=(null) Gres=gpu:2"
+        if [ -n "$addr" ]; then
+            line="$line NodeAddr=$addr NodeHostName=$node"
+        fi
+        printf '%s Version=24.05.1 OS=Linux 6.8.0-45-generic #45-Ubuntu SMP RealMemory=64000 State=IDLE\n' "$line"
+    done < "$root/nodes"
+    exit 0
+fi
+echo "scontrol: fake supports only show hostnames / --oneliner show node" >&2
+exit 1

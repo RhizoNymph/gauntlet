@@ -1,0 +1,36 @@
+#!/bin/sh
+# Fake scancel: `scancel --signal=SIG <id>...` signals each fake step's
+# task. Ids must use the form squeue printed (<job>.<step>, or
+# <array_id>.<step> in an array job), as real scancel resolves them.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+prefix=$(cat "$root/job_id")
+if [ -f "$root/array_id" ]; then
+    prefix=$(cat "$root/array_id")
+fi
+printf '%s\n' "$*" >> "$state/scancel.log"
+
+signal=TERM
+for arg in "$@"; do
+    case "$arg" in
+        --signal=*) signal=${arg#--signal=} ;;
+    esac
+done
+rc=0
+for arg in "$@"; do
+    case "$arg" in
+        -*) continue ;;
+        "$prefix".*) step=${arg#"$prefix".} ;;
+        *)
+            echo "scancel: error: Invalid job id $arg" >&2
+            rc=1
+            continue
+            ;;
+    esac
+    task=$(cat "$state/steps/$step.task" 2>/dev/null)
+    if [ -z "$task" ] || ! kill -s "$signal" "$task" 2>/dev/null; then
+        echo "scancel: error: Kill job error on job step id $arg" >&2
+        rc=1
+    fi
+done
+exit "$rc"

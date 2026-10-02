@@ -260,7 +260,9 @@ invisible). Real training runs one rank per GPU; so does this.
   lead that mints no id within `NCCL_ID_WAIT` is killed immediately.
 - **Remote kill**: every host abandoned by the phase timeout (and every
   host aborted early) is killed with `pkill -f '[g]auntlet-agent agent
-  nccl'` over its ssh session (`orchestrator::kill_remote_agent`, the
+  nccl'` over its ssh session — or, in srun launch mode, with `scancel
+  --signal=KILL` of its `gauntlet:<host>:nccl` step
+  (`orchestrator::kill_remote_agent` → `HostSession::kill_agent`, the
   same mechanism the peer and TCP-barrier servers use). Dropping the ssh
   future alone left the remote process blocked in a collective — never
   writing to stdout again, so not even SIGPIPE ended it — with its GPUs

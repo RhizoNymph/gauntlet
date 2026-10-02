@@ -50,6 +50,14 @@ and the variables exist before the agent process starts. This is the
 same mechanism already used for LD_LIBRARY_PATH (which dlopen likewise
 captures at process start). The map does not travel on the wire.
 
+In srun launch mode (docs/features/slurm_launch.md) the NCCL pairs
+(`AgentEnv.nccl`) are set on the local `srun` process instead and
+exported to the step with `--export=ALL`; no shell parses them, and the
+orchestrator's own `NCCL_*` variables are stripped first so the recorded
+map stays exactly the env every agent ran under. LD_LIBRARY_PATH is
+applied inside the step (`env LD_LIBRARY_PATH=<dir>/lib:<inherited>`), so
+the srun client keeps the orchestrator's own library path.
+
 ### Remote shell assumption
 sshd runs the command through the remote user's login shell. The
 command line single-quotes every value (`'…'`, with `'` spelled `'\''`),
@@ -125,15 +133,17 @@ plane story (docs/features/phase3_network.md) is documented around it.
    On a config that skipped `validate` (e.g. a bare `toml::from_str`), it
    returns the typed error instead of an env.
 2. **Session setup** (`orchestrator/mod.rs::connect_fleet`,
-   `orchestrator/bootstrap.rs::prepare_host`). `config.nccl_env()?` is
-   passed to `HostSession::connect`, which precomputes
-   `agent_env_words(remote_dir, &nccl_env)`: `LD_LIBRARY_PATH=<quoted>`
-   then `KEY=<single-quoted value>` per entry, in key order. An empty map
-   adds no words.
-3. **Spawn** (`orchestrator/session.rs`). `run_agent`, `run_agent_capture`
-   and `spawn_agent` — the only three ways an agent is started — put those
-   words between `env` and the agent binary via `raw_args` (already
-   quoted; openssh does not re-escape raw args). That covers every
+   `orchestrator/bootstrap.rs::connect_host`). `config.nccl_env()?` is
+   passed to `Launcher::connect`, whose `HostSession::establish`
+   precomputes `AgentEnv::new(remote_dir, &nccl_env)`: the agent lib dir
+   plus one pair per entry, in key order. An empty map adds nothing.
+3. **Spawn** (`orchestrator/session.rs` → `transport/`). `run_agent`,
+   `run_agent_capture` and `spawn_agent` — the only three ways an agent is
+   started — go through `HostTransport::spawn`. ssh renders
+   `LD_LIBRARY_PATH` and the pairs as `KEY='value'` words
+   (`AgentEnv::ssh_words`) between `env` and the agent binary via
+   `raw_args` (already quoted; openssh does not re-escape raw args);
+   srun sets the pairs on the srun process env. That covers every
    communicator-creating invocation. That is `agent run`, which runs the
    intra-node NCCL sweep, the intra-node overlap and any future node-local
    NCCL. It is also `agent nccl` Lead/Participate, which runs the
@@ -191,8 +201,9 @@ baseline diff compares it.
   `write_line`, the hidden `isolation_check` mode; `src/main.rs` calls
   `isolate_stdout` for agent subcommands before building the runtime.
 - `tests/stdout_isolation_tests.rs` — end-to-end protocol isolation.
-- `src/orchestrator/session.rs` — `HostSession::connect(host, ssh,
-  nccl_env)`, `agent_env_words`, `nccl_env_words`, the three spawn paths.
+- `src/orchestrator/session.rs` — `HostSession::establish`,
+  `AgentEnv` (`ssh_words`), the three spawn paths;
+  `src/orchestrator/transport/{ssh,srun}.rs` apply the env per transport.
 - `src/orchestrator/mod.rs`, `src/orchestrator/bootstrap.rs` — pass
   `config.nccl_env()` into every session.
 - `src/proto/mod.rs` — `socket_ifname` removed from the directives
@@ -218,8 +229,8 @@ baseline diff compares it.
   Single-quoted one-line values are also safe under csh/tcsh.
 - The agent never calls `std::env::set_var`. NCCL env reaches it only via
   the spawn command line, so it is present before any thread exists.
-- Every agent spawn of a session carries the same env words; there is no
-  spawn path that bypasses `env_words`.
+- Every agent spawn of a session carries the same env (`AgentEnv`);
+  there is no spawn path that bypasses it, over either transport.
 - Values are single-quoted; a POSIX shell hands them to the process byte
   for byte (tested against a real `sh` with adversarial values: quotes,
   `$`, `$(…)`, backticks, globs, newlines, `;|&<>`).
