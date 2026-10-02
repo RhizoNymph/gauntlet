@@ -79,13 +79,15 @@ use crate::proto::{
 // sizes, one value per run, kept out of MAD and jitter — see
 // `fleet_nccl`); `[tests] nccl_world = "rank_per_node" | "per_rail"` adds
 // the nccl_inter_all_reduce / nccl_inter_all_gather groups (per-size
-// series, `bus_gib_per_sec_peak`, per-rail `bus_gib_per_sec_peak_rail<r>`)
-// and the calibration.links classes nccl_{allreduce,allgather}_inter_node.
-// The per-rail world's bare `bus_gib_per_sec_peak` is the worst rail's
-// peak. The barrier probes' `fleet_span_*` groups follow the same
-// fleet-level rule (aggregated, never MAD/jitter-compared).
-// A one-host fleet no longer runs the fleet sweep (Skipped outcomes). No
-// field changed shape.
+// series opened by a `ranks` record; `bus_gib_per_sec_peak` for
+// rank-per-node; per-rail `bus_gib_per_sec_peak_rail<r>` plus the
+// worst-rail `bus_gib_per_sec_peak_min_rail`; one outcome per host per
+// test for a per-rail sweep) and the calibration.links classes
+// nccl_{allreduce,allgather}_inter_node_<n>rank, keyed by world size. The
+// barrier probes' `fleet_span_*` groups follow the same fleet-level rule
+// (aggregated, never MAD/jitter-compared). A one-host fleet no longer
+// runs the fleet sweep while the intra-node sweep runs (Skipped
+// outcomes). No field changed shape.
 pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the

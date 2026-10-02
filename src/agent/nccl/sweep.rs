@@ -23,7 +23,7 @@ use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::nccl::ReduceOp;
 
 use super::F32_BYTES;
-use super::headline::fleet_headline;
+use super::headline::{fleet_headline, series_opener};
 use super::local::{LocalRanks, PreparedRanks};
 use crate::agent::EventSink;
 use crate::agent::sweep::{
@@ -151,6 +151,11 @@ pub(super) fn run_sweep(
 
     // Only the host holding global rank 0 emits; every other host runs the
     // same collectives silently.
+    if emit_sweep {
+        for record in series_opener(series, world_size) {
+            sink.metric(record);
+        }
+    }
     let mut points = Vec::with_capacity(plan.steps().len());
     run_plan(
         &mut RankBlockCollectives {

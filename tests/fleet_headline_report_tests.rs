@@ -49,6 +49,14 @@ fn sweep_series(obs: &mut HostObservations, test: TestId, repeat: u32) {
     }
 }
 
+/// An inter-node series as the lead emits it: the `ranks` opener (world
+/// size), then the per-size records.
+fn inter_series(obs: &mut HostObservations, test: TestId, ranks: u32, repeat: u32) {
+    obs.metrics
+        .push(node(test, "ranks", f64::from(ranks), Unit::Count, repeat));
+    sweep_series(obs, test, repeat);
+}
+
 fn hosts(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("10.0.0.{i}")).collect()
 }
@@ -151,20 +159,21 @@ fn inter_node_series_fit_their_own_link_classes() {
     let names = hosts(2);
     let config = config_for(&names);
     let mut lead = HostObservations::default();
-    // Two rails, both led by the same host: their series pool into one
-    // inter-node class, never into the rank-per-GPU one.
-    sweep_series(&mut lead, TestId::NcclInterAllReduce, 0);
-    sweep_series(&mut lead, TestId::NcclInterAllReduce, 0);
-    sweep_series(&mut lead, TestId::NcclInterAllGather, 0);
+    // Two rails of the same world size, both led by the same host: their
+    // series pool into one inter-node class keyed by that size, never
+    // into the rank-per-GPU one.
+    inter_series(&mut lead, TestId::NcclInterAllReduce, 2, 0);
+    inter_series(&mut lead, TestId::NcclInterAllReduce, 2, 0);
+    inter_series(&mut lead, TestId::NcclInterAllGather, 2, 0);
     let observations = BTreeMap::from([
         (names[0].clone(), lead),
         (names[1].clone(), HostObservations::default()),
     ]);
     let results = report::build(&config, observations, 1, 2);
     let links = &results.calibration.links;
-    let fit = links["nccl_allreduce_inter_node"];
+    let fit = links["nccl_allreduce_inter_node_2rank"];
     assert!((fit.alpha_us - 10.0).abs() < 1e-6, "{fit:?}");
-    assert!(links.contains_key("nccl_allgather_inter_node"));
+    assert!(links.contains_key("nccl_allgather_inter_node_2rank"));
     assert!(!links.contains_key("nccl_allreduce_rank_per_gpu"));
     // Per-size series repeat their sample key: never aggregated, never MAD.
     assert!(
@@ -172,6 +181,69 @@ fn inter_node_series_fit_their_own_link_classes() {
             .aggregates
             .contains_key("nccl_inter_all_reduce.bus_gib_per_sec")
     );
+}
+
+#[test]
+fn a_heterogeneous_fleets_rails_fit_one_class_per_world_size() {
+    // Hosts with 8, 8 and 4 GPUs: rails 0-3 are 3-rank worlds, rails 4-7
+    // 2-rank worlds, all led by the first host in one repeat.
+    let names = hosts(3);
+    let config = config_for(&names);
+    let mut lead = HostObservations::default();
+    for rail in 0..8 {
+        let ranks = if rail < 4 { 3 } else { 2 };
+        inter_series(&mut lead, TestId::NcclInterAllReduce, ranks, 0);
+    }
+    let mut observations: BTreeMap<String, HostObservations> = names
+        .iter()
+        .map(|host| (host.clone(), HostObservations::default()))
+        .collect();
+    observations.insert(names[0].clone(), lead);
+    let results = report::build(&config, observations, 1, 2);
+    let inter: Vec<&str> = results
+        .calibration
+        .links
+        .keys()
+        .map(String::as_str)
+        .filter(|key| key.contains("inter_node"))
+        .collect();
+    assert_eq!(
+        inter,
+        [
+            "nccl_allreduce_inter_node_2rank",
+            "nccl_allreduce_inter_node_3rank"
+        ]
+    );
+}
+
+#[test]
+fn the_per_rail_and_per_node_headlines_are_different_groups() {
+    // rank_per_node's GPU-0 number and per_rail's worst-rail number are
+    // different quantities: never one metric group.
+    let names = hosts(2);
+    let config = config_for(&names);
+    let mut lead = HostObservations::default();
+    for (name, value) in [
+        ("bus_gib_per_sec_peak", 22.0),
+        ("bus_gib_per_sec_peak_min_rail", 4.0),
+    ] {
+        lead.metrics.push(node(
+            TestId::NcclInterAllReduce,
+            name,
+            value,
+            Unit::GibPerSec,
+            0,
+        ));
+    }
+    let observations = BTreeMap::from([
+        (names[0].clone(), lead),
+        (names[1].clone(), HostObservations::default()),
+    ]);
+    let results = report::build(&config, observations, 1, 2);
+    let per_node = &results.aggregates["nccl_inter_all_reduce.bus_gib_per_sec_peak"];
+    let min_rail = &results.aggregates["nccl_inter_all_reduce.bus_gib_per_sec_peak_min_rail"];
+    assert_eq!(per_node[&names[0]].moments.median, 22.0);
+    assert_eq!(min_rail[&names[0]].moments.median, 4.0);
 }
 
 #[test]

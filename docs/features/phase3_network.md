@@ -49,8 +49,8 @@ Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
    from the sweep — renamed from `*_fleet` in schema v8 because the
    world changed meaning: n is total GPUs and the ring mixes NVLink with
    the fabric, so v7 per-node fits must not line up under the same key),
-   "nccl_{allreduce,allgather}_inter_node" from the NIC-forcing world
-   shapes (schema v13), and "nccl_{allreduce,allgather}_intranode_<n>gpu"
+   "nccl_{allreduce,allgather}_inter_node_<n>rank" from the NIC-forcing
+   world shapes (schema v13, keyed by world size), and "nccl_{allreduce,allgather}_intranode_<n>gpu"
    from the intra-node sweep.
 5. Barrier-skew microbenchmark: a tiny-collective straggler probe riding
    the same NCCL communicator (rank-per-GPU shape) or run afterwards as
@@ -295,11 +295,11 @@ through the NICs.
 
 ### Scope / non-scope
 Scope: the fleet sweep's world layout (`[tests] nccl_world`), gating,
-headline metrics and link classes for the NIC-forcing shapes. Non-scope:
-running rails concurrently (the aggregate all-rails number; rails run
-sequentially by design), per-rail calibration link classes (all rails
-pool into one `_inter_node` class), and per-level NCCL env (every shape
-inherits the run-level `[nccl] env`).
+per-rail failure isolation and outcome summaries, headline metrics and
+link classes for the NIC-forcing shapes. Non-scope: running rails
+concurrently (the aggregate all-rails number; rails run sequentially by
+design), per-rail link classes (rails pool by world size), and per-level
+NCCL env (every shape inherits the run-level `[nccl] env`).
 
 ### Shapes
 `config::NcclWorldShape` (default `rank_per_gpu`, today's behaviour):
@@ -318,76 +318,114 @@ inherits the run-level `[nccl] env`).
 ### Types and control flow
 1. `orchestrator::nccl::nccl_hosts` selects NCCL-capable hosts with
    their CUDA-visible counts (unchanged rules).
-2. `shape::shaped_worlds(shape, hosts)` (pure) returns
-   `Vec<ShapedWorld { series, layout }>`. Layouts come from
+2. `shape::world_of(series, hosts)` (pure) lays out one world:
    `RankLayout::with_spans`, which takes a `GpuSpan { first, count }` per
-   host: `GpuSpan::all(n)` for rank-per-GPU, `GpuSpan::one(r)` for a
+   host — `GpuSpan::all(n)` for rank-per-GPU, `GpuSpan::one(r)` for a
    rail (rank-per-node is rail 0). Each block becomes a
    `RankBlock::on_gpus(base, count, first_gpu)` — the GPU offset rides
    the wire (`first_gpu`, serde-defaulted to 0, omitted when 0), and the
    agent opens `CudaContext::new(first_gpu + i)` for block position `i`
    after checking `first_gpu + count` devices are visible.
    `RankLayout::locate` returns the device ordinal (`RankBlock::gpu`),
-   not the block position.
-3. `sweep::nccl_sweep` (orchestrator) gates each world
-   (`shape::sweep_gate`) and runs it through the unchanged
-   `drive_fleet_nccl` with `NcclWorkload::Sweep { .., series }` — same
-   rendezvous relay, failure attribution, early abort and remote kill.
-   Step names carry the shape (`nccl sweep (rail 3)`), so a failure
-   reason names the rail.
-4. Agent (`agent/nccl/sweep.rs`): `SweepLevel::fleet(series)` picks
-   `nccl_all_*` or `nccl_inter_all_*` for the per-size series; after the
-   last size `headline::fleet_headline` emits the headline (below).
-5. `per_rail` only: the driver's intercept captures each rail lead's
-   `bus_gib_per_sec_peak_rail<r>` (accepted only from that rail's lead)
-   and, after the last rail, `shape::rail_rollup` emits
-   `nccl_inter_all_*.bus_gib_per_sec_peak` = the **worst** rail's peak
-   (min across rails that ran), against the rail-0 lead (the fleet's
-   first NCCL host). A rail that ran but reported no finite peak for a
-   collective voids that collective's overall headline (its failure is
-   recorded against its host); rails the gate kept out (one host) never
-   ran and are not part of the roll-up.
-6. NIC-forcing shapes then run the barrier probe as its own rank-per-GPU
-   job (`NcclWorkload::BarrierOnly`, `sweep::barrier_only`, gated on >= 2
-   hosts), so barrier subjects stay `host:gpuN`. The fleet overlap step
-   ignores `nccl_world` entirely (rank-per-GPU; its retention compares
-   per GPU against phase 2, which a one-rank-per-host world could not).
+   not the block position. A layout error (a world past `u32` ranks)
+   records Skipped outcomes naming it on every would-be member, and the
+   barrier still runs on its own world.
+3. Gate (`shape::sweep_gate(world, coverage)`): every world needs at
+   least 2 ranks; it also needs at least 2 hosts **when the intra-node
+   sweep ran in this phase** (`IntraNodeCoverage::Covered`, decided in
+   `network_phase` by the very branch that dispatches the intra-node
+   step). With `tests.nccl_intranode = false` a one-host world of 2+ GPUs
+   still runs, since the fleet sweep is then its only NCCL coverage.
+4. `sweep::nccl_sweep` (orchestrator) runs each world through the
+   unchanged `drive_fleet_nccl` with `NcclWorkload::Sweep { .., series }`
+   — same rendezvous relay, failure attribution, early abort and remote
+   kill. Step names carry the shape (`nccl sweep (rail 3)`).
+5. Agent (`agent/nccl/sweep.rs`): `SweepLevel::fleet(series)` picks
+   `nccl_all_*` or `nccl_inter_all_*`; an inter-node lead first emits a
+   `ranks` record per test (`headline::series_opener`, the world size),
+   then the per-size series, then the headline (`headline::fleet_headline`,
+   below).
+6. `per_rail` only — failure isolation and summaries (`rails.rs`, pure):
+   - Each rail is planned (`rails::plan_rail`) against the earlier
+     rails' exclusions: a host attributed `Failed` in a rail (a primary
+     failure, or a timeout nobody else is to blame for) is excluded from
+     every later rail and from the barrier-only job (`rails::Exclusions`),
+     so one broken host costs one phase timeout, not one per rail. Later
+     rails are re-gated with the reduced membership.
+   - Every eligible host's fate per rail (ran, failed, aborted, gated,
+     excluded, not laid out) goes into a `rails::RailLedger`; after the
+     last rail each host records **one** outcome per test: Passed if any
+     rail ran cleanly for it, otherwise Failed (it was to blame somewhere)
+     or Skipped, the reason naming every rail that did not run, with
+     consecutive rails of the same fate collapsed ("rails 4-7: skipped:
+     fewer than 2 eligible hosts"). `TestOutcome::Passed` carries no
+     reason, so a Passed host's not-run rails go to a structured info log;
+     the `_rail<r>` metrics show which rails produced numbers.
+   - The driver's intercept captures each rail lead's
+     `bus_gib_per_sec_peak_rail<r>`, and after the last rail
+     `shape::rail_rollup` emits
+     `nccl_inter_all_*.bus_gib_per_sec_peak_min_rail` = the **worst**
+     rail's peak (min across rails that ran) on the fleet's first NCCL
+     host (rail 0's lead). A rail that ran but reported no finite peak for
+     a collective voids that collective's roll-up (the failure is recorded
+     against its host); rails the gate kept out never ran and are not
+     part of it.
+7. NIC-forcing shapes then run the barrier probe as its own rank-per-GPU
+   job (`NcclWorkload::BarrierOnly`, `sweep::barrier_after` /
+   `barrier_only`, gated on `shape::MIN_HOSTS`) without the excluded
+   hosts, each of which records Skipped for `nccl_barrier` with the
+   exclusion reason; barrier subjects stay `host:gpuN`. The fleet overlap
+   step ignores `nccl_world` entirely (rank-per-GPU; its retention
+   compares per GPU against phase 2, which a one-rank-per-host world
+   could not).
 
 ### Fleet headline
 Every fleet sweep's lead emits, per collective, a node-scope headline
 chosen exactly like the intra-node one (`agent::intranode::
 peak_bus_gib_per_sec`: max across sizes, non-finite ignored; no
-measurable size, no headline):
-- rank-per-GPU: `nccl_all_reduce.bus_gib_per_sec_peak`,
-  `nccl_all_gather.bus_gib_per_sec_peak` (gap 2);
-- rank-per-node: `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak`;
+measurable size, no headline). Each shape's headline has **its own
+name**, so no metric group mixes two quantities and the viewer's diff
+never treats runs of different shapes as comparable:
+- rank-per-GPU: `nccl_all_{reduce,gather}.bus_gib_per_sec_peak` (gap 2);
+- rank-per-node: `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak` —
+  GPU 0's NIC on every host;
 - per-rail: `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak_rail<r>`
-  per rail (peak per rail) plus the rolled-up `bus_gib_per_sec_peak`
-  (worst rail overall).
+  per rail (peak per rail) plus the roll-up
+  `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak_min_rail` (worst
+  rail overall).
 
-The bare `nccl_inter_all_reduce.bus_gib_per_sec_peak` is the
-pure-inter-node number for both NIC-forcing shapes, and the one
-gauntlet-runs' `INTER_NODE_PURE_IB` entry should map to: compare it
-against nccl-tests and the IB ceiling. One name for both shapes keeps
-that mapping shape-independent. Semantics: **peak per rail, worst rail
-overall.** Each rail's number is its best size (the "peak" rule), but
-across rails the headline is the minimum, because it is what absolute
-thresholds gate on and what is compared against a NIC ceiling — one
-healthy rail must never hide a degraded one (rails at 22/22/22/4 GiB/s
-must fail a 20 GiB/s floor). The `_rail<r>` metrics say which rail it
-was.
+**gauntlet-runs mapping.** `INTER_NODE_PURE_IB` maps to
+`nccl_inter_all_reduce.bus_gib_per_sec_peak` for a `rank_per_node` run
+and to `nccl_inter_all_reduce.bus_gib_per_sec_peak_min_rail` for a
+`per_rail` run (compare against nccl-tests and the IB ceiling). The
+min-rail number is **peak per rail, worst rail overall**: each rail's
+value is its best size, but across rails the headline is the minimum,
+because it is what absolute thresholds gate on and what is compared
+against a NIC ceiling — one healthy rail must never hide a degraded one
+(rails at 22/22/22/4 GiB/s must fail a 20 GiB/s floor). The `_rail<r>`
+metrics say which rail it was.
 
 **MAD decision.** A fleet-level headline is one value per run on one
 subject (the lead host, the `fleet_span` convention). It has no fleet
 peers, so `report::fleet_nccl::is_fleet_level` keeps every
-`nccl_all_*` / `nccl_inter_all_*` `bus_gib_per_sec_peak*` group — and,
-by the same rule, the barrier probes' `fleet_span_*` groups — out of
+`nccl_all_*` / `nccl_inter_all_*` `bus_gib_per_sec_peak*` group, the
+inter-node `ranks`, and the barrier probes' `fleet_span_*` groups out of
 the outlier and jitter passes by rule — not by relying on
-`flag_outliers`' 4-sample minimum. It still aggregates
+`flag_outliers`' 4-sample minimum. They still aggregate
 (`aggregates[group][lead]` carries median/MAD/min/max/stddev across
 `--repeat`, i.e. the run-to-run jitter of the fleet number) and
-`[thresholds.absolute]` checks its median, which is how a run fails on
+`[thresholds.absolute]` checks the median, which is how a run fails on
 a low fleet or inter-node bandwidth.
+
+### Link classes
+`nccl_{allreduce,allgather}_inter_node_<n>rank`, keyed by world size like
+the intra-node `_<n>gpu` classes (`report::fleet_nccl`). Rails of a
+heterogeneous fleet have different world sizes (with some 4-GPU hosts,
+rails 4-7 have fewer members than rails 0-3), and one fit pooled across
+sizes describes no real link; rails of equal size are the same nominal
+link and pool. The report walks the lead's records in emission order and
+starts a new series at every `ranks` opener, so several rails led by one
+host in one repeat stay apart; points before any opener are dropped.
 
 ## Management vs data plane
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth
@@ -473,21 +511,29 @@ Fleet NCCL world:
   `RankError` (incl. `GpuRangeOverflow`).
 - `src/proto/mod.rs` — `InventorySnapshot::cuda_visible_gpus`,
   `gpu_visibility_mismatch`, `AGENT_EXIT_CASCADE`; `SweepSeries`
-  (`is_inter_node`, `headline`, `tests`), `NcclWorkload::{Sweep.series,
-  Barrier}`, `TestId::{NcclInterAllReduce, NcclInterAllGather}`,
-  `nccl_metric::{BUS_PEAK, bus_peak_rail, rail_suffix}`; PROTO_VERSION 11.
+  `NcclWorkload::{Sweep.series, BarrierOnly}`, `TestId::{NcclInterAllReduce,
+  NcclInterAllGather}`, `nccl_metric::{BUS_PEAK, BUS_PEAK_MIN_RAIL,
+  bus_peak_rail, rail_suffix, rank_class_suffix}`, `barrier_metric`;
+  PROTO_VERSION 11.
+- `src/proto/series.rs` — `SweepSeries` (`is_inter_node`, `headline`,
+  `tests`, `inter_node_tests`, `all_fleet_tests`): the one source of the
+  fleet sweeps' test ids and headline names.
 - `src/config.rs` — `NcclWorldShape`, `tests.nccl_world`.
 - `src/orchestrator/nccl/layout.rs` — `RankLayout<M>` (`new`,
   `with_spans`, `empty`, `members`, `world_size`, `member_count`,
   `locate`, `arrival_group`), `GpuSpan` (`all`, `one`), `RankLocation`,
   `LayoutError`.
 - `src/orchestrator/nccl/shape.rs` — pure world shapes: `ShapedWorld`,
-  `shaped_worlds`, `sweep_gate`/`SweepSkip`, `skip_outcomes`,
-  `rail_rollup`.
-- `src/orchestrator/nccl/sweep.rs` — `nccl_sweep` (shape dispatch, per
-  world gate + job, sequential rails, roll-up), `barrier_only`,
-  `Collected` (intercept: barrier timings + lead headlines),
-  `analyze_barrier`.
+  `world_of`, `rail_layout`, `IntraNodeCoverage`, `MIN_HOSTS`,
+  `sweep_gate`/`SweepSkip`, `skip_outcomes`, `rail_rollup`.
+- `src/orchestrator/nccl/rails.rs` — pure per-rail bookkeeping:
+  `Exclusions`, `plan_rail`/`RailPlan`, `RailFate`, `RailLedger`,
+  `HostRailSummary`.
+- `src/orchestrator/nccl/sweep.rs` — `nccl_sweep` (shape dispatch:
+  `rank_per_gpu_sweep`, `rank_per_node_sweep`, `per_rail_sweep`),
+  `run_world`/`WorldRun`, `barrier_after`, `barrier_only`, `Collected`
+  (intercept: barrier timings + lead headline), `analyze_barrier`,
+  layout-failure outcomes.
 - `src/orchestrator/nccl/mod.rs` — `nccl_hosts` (`nccl_rank_count`),
   `rank_per_gpu_world`, `NcclJob`, `drive_fleet_nccl` (`run_host`,
   `abort_rest`, `blame_the_lead`, `report_failures`), `block_failure`,
@@ -528,20 +574,28 @@ Fleet NCCL world:
   (one rank per GPU, global rank 0 on the first host's GPU 0); in the
   NIC-forcing shapes every block is one rank on one GPU (`first_gpu`), so
   no two ranks of a world share a node.
-- The fleet sweep never runs on a world of fewer than 2 hosts or fewer
-  than 2 ranks (`orchestrator::nccl::shape::sweep_gate`, gap 8 of the
-  cluster-testing gaps). A one-rank "all-reduce" is a local copy, whose
-  timings would calibrate a link that does not exist; a one-host world of
-  N GPUs only repeats the intra-node sweep. Every member records Skipped
-  for both of the world's tests, the reason naming the failed condition
-  (`TooFewHosts`: hosts only; `TooFewRanks`: hosts and ranks — a world
-  short of ranks is always short of hosts too). Per-rail worlds are gated
-  one by one; a rail with one host is Skipped by name ("rail 5").
+- The fleet sweep never runs on a world of fewer than 2 ranks, nor on
+  a one-host world while the intra-node sweep runs in the same phase
+  (`orchestrator::nccl::shape::sweep_gate`, gap 8 of the cluster-testing
+  gaps). A one-rank "all-reduce" is a local copy, whose timings would
+  calibrate a link that does not exist; a one-host world of N GPUs only
+  repeats the intra-node sweep — when that runs. With
+  `tests.nccl_intranode = false` a one-host world of 2+ GPUs runs. A
+  gated world records Skipped for both of its tests on every member,
+  the reason naming the failed condition (`TooFewHosts`: hosts only;
+  `TooFewRanks`: hosts and ranks).
 - The rails of `per_rail` run strictly one after another, never
-  concurrently: each rail's number belongs to its own NIC/PCIe path.
+  concurrently: each rail's number belongs to its own NIC/PCIe path. A
+  host to blame for one rail never joins a later rail or the barrier
+  job, and every host records at most one outcome per test for the
+  whole per-rail sweep.
+- No two shapes share a headline name: rank-per-node's
+  `bus_gib_per_sec_peak` and per-rail's `bus_gib_per_sec_peak_min_rail`
+  are different metric groups.
 - Only the fleet sweep follows `tests.nccl_world`. The barrier probe and
   the fleet overlap step always run on the rank-per-GPU world, so their
-  subjects (`host:gpuN`) never change with the sweep shape.
+  subjects (`host:gpuN`) never change with the sweep shape. A layout
+  error in the sweep's world never silently skips the barrier.
 - Each fleet sweep's lead emits exactly one headline per collective (per
   rail for `per_rail`, plus the orchestrator's roll-up), named through
   `proto::nccl_metric` and chosen by the intra-node rule (max over sizes,
@@ -554,7 +608,7 @@ Fleet NCCL world:
 - `agent nccl` always speaks `Hello` first; every failure after it is a
   typed `Fatal`.
 - Sweep timing (and the `nccl_allreduce_rank_per_gpu` /
-  `nccl_allreduce_inter_node` alpha/beta fits it feeds) comes from global
+  `nccl_allreduce_inter_node_<n>rank` alpha/beta fits it feeds) comes from global
   rank 0 of the world only.
 - Only a primary failure is ever recorded against a host as Failed when
   a primary exists; hosts it aborted are Skipped/warned. No abandoned

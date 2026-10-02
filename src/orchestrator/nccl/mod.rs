@@ -28,6 +28,7 @@
 mod attribution;
 mod layout;
 mod ownership;
+mod rails;
 mod records;
 mod shape;
 mod sweep;
@@ -39,6 +40,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+pub(super) use self::shape::IntraNodeCoverage;
 pub(super) use self::sweep::nccl_sweep;
 
 use self::attribution::{

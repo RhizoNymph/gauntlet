@@ -189,7 +189,12 @@ the same `drive_fleet_nccl` and analyzed by the same
 world means `nccl_barrier` subjects (`host:gpuN`) and straggler flags are
 comparable across runs with different sweep shapes, at the cost of one
 extra communicator init in the NIC-forcing shapes. The job is gated on
->= 2 NCCL-capable hosts, like the riding probe.
+`orchestrator::nccl::shape::MIN_HOSTS` (2) NCCL-capable hosts, the same
+constant the riding probe and the sweep gate use. Hosts the sweep
+excluded for failing a world (`rails::Exclusions`: to blame for a rail,
+or for the rank-per-node world) do not join it; each records Skipped for
+`nccl_barrier` with the exclusion reason. A sweep world that could not be
+laid out never skips the barrier: it runs on its own world regardless.
 
 ## Files
 - `src/analysis/skew.rs` — polarity-aware skew statistics: `analyze`

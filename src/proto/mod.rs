@@ -14,12 +14,14 @@ use thiserror::Error;
 
 mod occupancy;
 mod ranks;
+mod series;
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
     gpu_idle_outcomes,
 };
 pub use ranks::{RankAssignment, RankBlock, RankError};
+pub use series::SweepSeries;
 
 // v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
 // on the wire plus `CpuTaskSpec::sdc_hot_secs` / `GpuTaskSpec::sdc_check_secs`
@@ -59,7 +61,8 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // rank-per-GPU), `NcclWorkload::BarrierOnly` runs the barrier probe alone,
 // and the `nccl_inter_all_reduce` / `nccl_inter_all_gather` test ids ride
 // the wire. The lead of every fleet sweep also emits a fleet-level
-// `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline.
+// `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline,
+// and an inter-node lead opens its per-size series with a `ranks` record.
 pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
@@ -629,20 +632,34 @@ pub mod nccl_metric {
     /// Prefix of every sweep headline: the best bus bandwidth across the
     /// sweep's sizes. The intra-node headline is always keyed by
     /// communicator size (`bus_peak`); the fleet-level headlines are
-    /// `BUS_PEAK` (bare) and `bus_peak_rail`.
+    /// `BUS_PEAK` (bare), `bus_peak_rail` and `BUS_PEAK_MIN_RAIL`.
     pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
-    /// Fleet-level headline of a fleet or inter-node sweep (proto v11):
-    /// one value per run, attributed to the world's lead host at node
-    /// scope. Not fleet-comparable within a run (it has no peers); the
-    /// report aggregates it across repeats but keeps it out of MAD.
+    /// Fleet-level headline of the rank-per-GPU and rank-per-node sweeps
+    /// (proto v11): one value per run, attributed to the world's lead
+    /// host at node scope. Not fleet-comparable within a run (it has no
+    /// peers); the report aggregates it across repeats but keeps it out
+    /// of MAD.
     pub const BUS_PEAK: &str = BUS_PEAK_PREFIX;
-    /// Intra-node only: ranks (local GPUs) in the communicator; keys the
-    /// intra-node calibration link class.
+    /// The per-rail world's overall headline: peak per rail, **worst rail
+    /// overall** (min across rails of `bus_peak_rail`). Its own name, so
+    /// it never shares a metric group with rank-per-node's `BUS_PEAK`
+    /// (GPU 0's NIC only): the two are different quantities.
+    pub const BUS_PEAK_MIN_RAIL: &str = "bus_gib_per_sec_peak_min_rail";
+    /// Ranks in the communicator. Intra-node: local GPUs, keys the
+    /// intra-node link class (emitted after the series). Inter-node: the
+    /// world's rank count (= hosts), emitted by the lead *before* its
+    /// per-size series so the report can key every series — several rails
+    /// per lead, per repeat — by its own world size.
     pub const RANKS: &str = "ranks";
 
     /// Rail suffix of the per-rail headlines: `rail<r>`.
     pub fn rail_suffix(rail: u32) -> String {
         format!("rail{rail}")
+    }
+
+    /// World-size suffix of the inter-node link classes: `<n>rank`.
+    pub fn rank_class_suffix(ranks: u32) -> String {
+        format!("{ranks}rank")
     }
 
     /// Per-rail inter-node headline: `bus_gib_per_sec_peak_rail<r>`, the
@@ -801,63 +818,6 @@ pub enum NcclWorkload {
     BarrierOnly(BarrierSpec),
 }
 
-/// Which fleet sweep a `NcclWorkload::Sweep` is: the world shape it was
-/// laid out in (`tests.nccl_world`). Decides the test ids of the lead's
-/// per-size series and the name of its headline:
-///
-/// - `RankPerGpu` (default): `nccl_all_*`, headline
-///   `bus_gib_per_sec_peak`.
-/// - `RankPerNode`: one rank per host on its GPU 0, every peer on another
-///   node — `nccl_inter_all_*`, headline `bus_gib_per_sec_peak`.
-/// - `Rail { rail }`: one rank per host on its GPU `rail` —
-///   `nccl_inter_all_*`, headline `bus_gib_per_sec_peak_rail<r>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SweepSeries {
-    #[default]
-    RankPerGpu,
-    RankPerNode,
-    Rail {
-        rail: u32,
-    },
-}
-
-impl SweepSeries {
-    /// Whether every peer of the world is on another node, so the sweep
-    /// measures the NIC path alone.
-    pub fn is_inter_node(self) -> bool {
-        !matches!(self, SweepSeries::RankPerGpu)
-    }
-
-    /// Name of the headline the world's lead emits for this sweep.
-    pub fn headline(self) -> String {
-        match self {
-            SweepSeries::RankPerGpu | SweepSeries::RankPerNode => nccl_metric::BUS_PEAK.to_string(),
-            SweepSeries::Rail { rail } => nccl_metric::bus_peak_rail(rail),
-        }
-    }
-
-    /// The two test ids this sweep's records land under (all-reduce,
-    /// all-gather).
-    pub fn tests(self) -> [TestId; 2] {
-        if self.is_inter_node() {
-            [TestId::NcclInterAllReduce, TestId::NcclInterAllGather]
-        } else {
-            [TestId::NcclAllReduce, TestId::NcclAllGather]
-        }
-    }
-}
-
-impl std::fmt::Display for SweepSeries {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SweepSeries::RankPerGpu => f.write_str("rank-per-gpu"),
-            SweepSeries::RankPerNode => f.write_str("rank-per-node"),
-            SweepSeries::Rail { rail } => write!(f, "rail {rail}"),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "directive", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NcclDirective {
@@ -1007,44 +967,6 @@ mod tests {
     }
 
     #[test]
-    fn sweep_series_round_trip_and_name_their_headline() {
-        for (series, json, headline, tests) in [
-            (
-                SweepSeries::RankPerGpu,
-                r#"{"shape":"rank_per_gpu"}"#,
-                "bus_gib_per_sec_peak",
-                [TestId::NcclAllReduce, TestId::NcclAllGather],
-            ),
-            (
-                SweepSeries::RankPerNode,
-                r#"{"shape":"rank_per_node"}"#,
-                "bus_gib_per_sec_peak",
-                [TestId::NcclInterAllReduce, TestId::NcclInterAllGather],
-            ),
-            (
-                SweepSeries::Rail { rail: 7 },
-                r#"{"shape":"rail","rail":7}"#,
-                "bus_gib_per_sec_peak_rail7",
-                [TestId::NcclInterAllReduce, TestId::NcclInterAllGather],
-            ),
-        ] {
-            assert_eq!(serde_json::to_string(&series).expect("serialize"), json);
-            let back: SweepSeries = serde_json::from_str(json).expect("deserialize");
-            assert_eq!(back, series);
-            assert_eq!(series.headline(), headline);
-            assert_eq!(series.tests(), tests);
-            assert_eq!(series.is_inter_node(), series != SweepSeries::RankPerGpu);
-        }
-        assert!(serde_json::from_str::<SweepSeries>(r#"{"shape":"rail"}"#).is_err());
-        for (test, wire) in [
-            (TestId::NcclInterAllReduce, "\"nccl_inter_all_reduce\""),
-            (TestId::NcclInterAllGather, "\"nccl_inter_all_gather\""),
-        ] {
-            assert_eq!(serde_json::to_string(&test).expect("serialize"), wire);
-        }
-    }
-
-    #[test]
     fn barrier_only_workloads_round_trip() {
         let directive = NcclDirective::Lead {
             assignment: assignment(0, 4, 8),
@@ -1057,14 +979,6 @@ mod tests {
         assert!(json.contains(r#""kind":"barrier_only""#), "{json}");
         let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, directive);
-    }
-
-    #[test]
-    fn rail_headline_names_carry_the_rail() {
-        assert_eq!(nccl_metric::bus_peak_rail(0), "bus_gib_per_sec_peak_rail0");
-        assert_eq!(nccl_metric::rail_suffix(3), "rail3");
-        assert!(nccl_metric::bus_peak_rail(2).starts_with(nccl_metric::BUS_PEAK_PREFIX));
-        assert_eq!(nccl_metric::BUS_PEAK, "bus_gib_per_sec_peak");
     }
 
     #[test]

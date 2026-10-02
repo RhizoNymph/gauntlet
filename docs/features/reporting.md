@@ -69,11 +69,13 @@ are only compared within their own topology (the same keying as the
 Fleet-level groups (schema v13) are the opposite case: one value per
 *run*, attributed to a lead host at node scope —
 `nccl_all_{reduce,gather}.bus_gib_per_sec_peak`,
-`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak[_rail<r>]` (the
-per-rail world's bare headline is the worst rail's peak), and the
-barrier probes' `{nccl,tcp}_barrier.fleet_span_*`. One table in
-`report::fleet_nccl` (`FLEET_LEVEL`: test + metric-name prefix) lists
-them all. They have no fleet peers, so `is_fleet_level` excludes
+`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak` (rank-per-node),
+`..._peak_rail<r>` and `..._peak_min_rail` (per-rail: per rail, and the
+worst rail's peak), the inter-node `ranks`, and the barrier probes'
+`{nccl,tcp}_barrier.fleet_span_*`. One place in `report::fleet_nccl`
+(`fleet_level_families`: test + metric-name prefix, the sweep test ids
+derived from `SweepSeries`) lists them all. They have no fleet peers, so
+`is_fleet_level` excludes
 them from the outlier and jitter passes by rule (a one-subject MAD group
 is degenerate: MAD 0, the subject is its own median). They still
 aggregate — moments across `--repeat` are the run-to-run jitter of the
@@ -131,10 +133,15 @@ Per-host `NodeRoofline`:
   (distinct mount points are not comparable, so the best is the headline).
 
 `calibration.links`:
-- `nccl_allreduce_inter_node` / `nccl_allgather_inter_node` (schema
-  v13): the `nccl_inter_all_*` series of the NIC-forcing world shapes
-  (`tests.nccl_world = "rank_per_node" | "per_rail"`), every rail pooled
-  into one class, same emission-order join and fit as below
+- `nccl_allreduce_inter_node_<n>rank` / `nccl_allgather_inter_node_<n>rank`
+  (schema v13): the `nccl_inter_all_*` series of the NIC-forcing world
+  shapes (`tests.nccl_world = "rank_per_node" | "per_rail"`), keyed by
+  world size like the intra-node `_<n>gpu` classes — rails of a
+  heterogeneous fleet differ in size, and a fit pooled across sizes
+  describes no real link. Each series is opened by the lead's `ranks`
+  record; walking a host's records in emission order, every opener
+  starts a new series of that size (several rails per lead per repeat
+  stay apart), and `msg_bytes`/`elapsed_us` pair by order within it
   (`report::fleet_nccl::link_fits`, which also owns the rank-per-GPU
   classes).
 - `nccl_allreduce_rank_per_gpu` / `nccl_allgather_rank_per_gpu` (named

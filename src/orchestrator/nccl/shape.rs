@@ -13,19 +13,38 @@
 //!   count, holding one rank per host *that has a GPU `r`*, on that GPU.
 //!   The driver runs them one after another so rails never contend.
 //!
-//! Every world then passes `sweep_gate`: at least 2 hosts *and* at least
-//! 2 ranks, or it is Skipped with the failed condition named.
+//! Every world then passes `sweep_gate`: at least 2 ranks, and at least 2
+//! hosts *when the intra-node sweep covers a one-host world* — or it is
+//! Skipped with the failed condition named. (Per-rail worlds are planned
+//! one at a time against earlier rails' exclusions: `rails::plan_rail`.)
 
 use thiserror::Error;
 
 use super::layout::{GpuSpan, LayoutError, RankLayout};
 use super::records::OutcomeRecord;
+#[cfg(test)]
 use crate::config::NcclWorldShape;
 use crate::proto::{MetricRecord, Scope, SweepSeries, TestId, TestOutcome, Unit, nccl_metric};
 
-/// Fewest hosts and ranks a fleet sweep needs.
-const MIN_HOSTS: usize = 2;
+/// Fewest hosts a fleet sweep (when the intra-node level covers one host)
+/// and the barrier probe (skew needs two independent arrivals) need. The
+/// one source of that number.
+pub(crate) const MIN_HOSTS: usize = 2;
+/// Fewest ranks any fleet sweep needs: one rank has no peer.
 const MIN_RANKS: u32 = 2;
+
+/// Whether the intra-node NCCL sweep runs in this network phase, and so
+/// already measures a one-host world's communicator. Decided where the
+/// intra-node step is dispatched (`orchestrator::network_phase`), so the
+/// gate follows whatever actually selects that step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntraNodeCoverage {
+    /// The intra-node sweep runs: a one-host fleet sweep would repeat it.
+    Covered,
+    /// It does not run: a one-host world with 2+ GPUs is the only NCCL
+    /// coverage there is, so the fleet sweep runs it.
+    NotCovered,
+}
 
 /// One world the fleet sweep runs: its layout and the series it emits.
 #[derive(Debug, Clone)]
@@ -34,39 +53,50 @@ pub(crate) struct ShapedWorld<M> {
     pub layout: RankLayout<M>,
 }
 
-/// The sweep worlds of `shape` over `(host, gpus)` in fleet order. Hosts
-/// with no GPU never join a world. `per_rail` yields one world per rail
-/// that has at least one member, rails ascending; the others always yield
-/// exactly one (possibly empty) world.
-pub(crate) fn shaped_worlds<M: Clone>(
+/// The world of one series over `(host, gpus)` in fleet order (hosts
+/// with no GPU never join): every GPU for rank-per-GPU, GPU 0 of every
+/// host for rank-per-node, GPU `r` of every host that has one for rail
+/// `r`. The orchestrator lays out each world through this, one at a time
+/// (rails against the earlier rails' exclusions, `rails::plan_rail`).
+pub(crate) fn world_of<M: Clone>(
+    series: SweepSeries,
+    hosts: &[(M, u32)],
+) -> Result<ShapedWorld<M>, LayoutError> {
+    let layout = match series {
+        SweepSeries::RankPerGpu => RankLayout::new(hosts.iter().cloned())?,
+        SweepSeries::RankPerNode => rail_layout(hosts, 0)?,
+        SweepSeries::Rail { rail } => rail_layout(hosts, rail)?,
+    };
+    Ok(ShapedWorld { series, layout })
+}
+
+/// Every world of `shape` with nothing excluded, in run order — the full
+/// enumeration the unit tests check membership against (the driver walks
+/// the same series one world at a time).
+#[cfg(test)]
+fn shaped_worlds<M: Clone>(
     shape: NcclWorldShape,
     hosts: &[(M, u32)],
 ) -> Result<Vec<ShapedWorld<M>>, LayoutError> {
-    match shape {
-        NcclWorldShape::RankPerGpu => Ok(vec![ShapedWorld {
-            series: SweepSeries::RankPerGpu,
-            layout: RankLayout::new(hosts.iter().cloned())?,
-        }]),
-        NcclWorldShape::RankPerNode => Ok(vec![ShapedWorld {
-            series: SweepSeries::RankPerNode,
-            layout: rail_layout(hosts, 0)?,
-        }]),
-        NcclWorldShape::PerRail => {
-            let rails = hosts.iter().map(|(_, gpus)| *gpus).max().unwrap_or(0);
-            (0..rails)
-                .map(|rail| {
-                    Ok(ShapedWorld {
-                        series: SweepSeries::Rail { rail },
-                        layout: rail_layout(hosts, rail)?,
-                    })
-                })
-                .collect()
-        }
-    }
+    let max_gpus = hosts.iter().map(|(_, gpus)| *gpus).max().unwrap_or(0);
+    let series = match shape {
+        NcclWorldShape::RankPerGpu => vec![SweepSeries::RankPerGpu],
+        NcclWorldShape::RankPerNode => vec![SweepSeries::RankPerNode],
+        NcclWorldShape::PerRail => (0..max_gpus)
+            .map(|rail| SweepSeries::Rail { rail })
+            .collect(),
+    };
+    series
+        .into_iter()
+        .map(|series| world_of(series, hosts))
+        .collect()
 }
 
 /// One rank per host that has a GPU `gpu`, on that GPU, in fleet order.
-fn rail_layout<M: Clone>(hosts: &[(M, u32)], gpu: u32) -> Result<RankLayout<M>, LayoutError> {
+pub(crate) fn rail_layout<M: Clone>(
+    hosts: &[(M, u32)],
+    gpu: u32,
+) -> Result<RankLayout<M>, LayoutError> {
     RankLayout::with_spans(
         hosts
             .iter()
@@ -80,11 +110,11 @@ fn rail_layout<M: Clone>(hosts: &[(M, u32)], gpu: u32) -> Result<RankLayout<M>, 
 /// two variants are the only possible combinations.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum SweepSkip {
-    /// Enough ranks, all on one host: the intra-node sweep already
-    /// measures that communicator.
+    /// Enough ranks, all on one host, and the intra-node sweep runs: it
+    /// already measures that communicator.
     #[error(
         "fleet nccl sweep ({series}) needs at least {MIN_HOSTS} hosts, found {hosts} \
-         ({ranks} ranks on one node are the intra-node sweep's job)"
+         ({ranks} ranks on one node are covered by the intra-node sweep)"
     )]
     TooFewHosts {
         series: SweepSeries,
@@ -104,11 +134,16 @@ pub(crate) enum SweepSkip {
     },
 }
 
-/// The fleet sweep needs a peer on another node. With fewer than two
-/// ranks an "all-reduce" is a local copy whose timings would calibrate a
-/// link that does not exist; with every rank on one host the sweep only
-/// repeats the intra-node level. `Ok` means run.
-pub(crate) fn sweep_gate<M>(world: &ShapedWorld<M>) -> Result<(), SweepSkip> {
+/// The fleet sweep needs a peer. With fewer than two ranks an "all-reduce"
+/// is a local copy whose timings would calibrate a link that does not
+/// exist; with every rank on one host the sweep only repeats the
+/// intra-node level — when that level runs (`coverage`). Without it, a
+/// one-host world of 2+ GPUs still runs, so the fleet keeps NCCL
+/// coverage. `Ok` means run.
+pub(crate) fn sweep_gate<M>(
+    world: &ShapedWorld<M>,
+    coverage: IntraNodeCoverage,
+) -> Result<(), SweepSkip> {
     let hosts = world.layout.member_count();
     let ranks = world.layout.world_size();
     let series = world.series;
@@ -119,7 +154,7 @@ pub(crate) fn sweep_gate<M>(world: &ShapedWorld<M>) -> Result<(), SweepSkip> {
             ranks,
         });
     }
-    if hosts < MIN_HOSTS {
+    if hosts < MIN_HOSTS && coverage == IntraNodeCoverage::Covered {
         return Err(SweepSkip::TooFewHosts {
             series,
             hosts,
@@ -153,7 +188,9 @@ pub(crate) type RailPeaks = Vec<(TestId, f64)>;
 
 /// The per-rail world's overall headline — **peak per rail, worst rail
 /// overall**: per test, the minimum across rails of each rail's peak
-/// (`bus_gib_per_sec_peak_rail<r>`), emitted as `bus_gib_per_sec_peak`.
+/// (`bus_gib_per_sec_peak_rail<r>`), emitted as
+/// `bus_gib_per_sec_peak_min_rail` (its own name: rank-per-node's bare
+/// `bus_gib_per_sec_peak` is GPU 0's NIC alone, a different quantity).
 ///
 /// Worst, not best: this is the number absolute thresholds gate on and
 /// downstream tooling compares against a NIC ceiling, so one healthy rail
@@ -167,7 +204,7 @@ pub(crate) type RailPeaks = Vec<(TestId, f64)>;
 /// its host. Rails gated out (fewer than 2 hosts) never ran, carry no
 /// NIC number, and are not part of the roll-up.
 pub(crate) fn rail_rollup(rails: &[RailPeaks]) -> Vec<MetricRecord> {
-    [TestId::NcclInterAllReduce, TestId::NcclInterAllGather]
+    SweepSeries::inter_node_tests()
         .into_iter()
         .filter_map(|test| {
             rails
@@ -184,7 +221,7 @@ pub(crate) fn rail_rollup(rails: &[RailPeaks]) -> Vec<MetricRecord> {
                 .map(|worst| MetricRecord {
                     test,
                     scope: Scope::Node,
-                    name: nccl_metric::BUS_PEAK.to_string(),
+                    name: nccl_metric::BUS_PEAK_MIN_RAIL.to_string(),
                     value: worst,
                     unit: Unit::GibPerSec,
                     repeat: 0,
@@ -292,8 +329,20 @@ mod tests {
         }
     }
 
+    fn gate_with(
+        shape: NcclWorldShape,
+        hosts: &[(&'static str, u32)],
+        coverage: IntraNodeCoverage,
+    ) -> Vec<Result<(), SweepSkip>> {
+        worlds(shape, hosts)
+            .iter()
+            .map(|world| sweep_gate(world, coverage))
+            .collect()
+    }
+
+    /// The default network phase: the intra-node sweep runs.
     fn gate(shape: NcclWorldShape, hosts: &[(&'static str, u32)]) -> Vec<Result<(), SweepSkip>> {
-        worlds(shape, hosts).iter().map(sweep_gate).collect()
+        gate_with(shape, hosts, IntraNodeCoverage::Covered)
     }
 
     /// The single world's gate result.
@@ -316,7 +365,32 @@ mod tests {
         );
         let reason = result.expect_err("skip").to_string();
         assert!(reason.contains("at least 2 hosts, found 1"), "{reason}");
+        assert!(
+            reason.contains("covered by the intra-node sweep"),
+            "{reason}"
+        );
         assert!(!reason.contains("ranks, found"), "{reason}");
+    }
+
+    #[test]
+    fn one_host_runs_the_fleet_sweep_when_the_intra_node_sweep_does_not() {
+        // tests.nccl_intranode = false: the fleet sweep is the only NCCL
+        // coverage a one-host fleet has, so it runs as before.
+        let covered = IntraNodeCoverage::NotCovered;
+        assert_eq!(
+            only(gate_with(NcclWorldShape::RankPerGpu, &[("n1", 8)], covered)),
+            Ok(())
+        );
+        // A world with no peer at all still never runs.
+        let single = only(gate_with(NcclWorldShape::RankPerGpu, &[("n1", 1)], covered));
+        assert!(matches!(single, Err(SweepSkip::TooFewRanks { .. })));
+        // The NIC-forcing shapes put one rank per host: still short.
+        let per_node = only(gate_with(
+            NcclWorldShape::RankPerNode,
+            &[("n1", 8)],
+            covered,
+        ));
+        assert!(matches!(per_node, Err(SweepSkip::TooFewRanks { .. })));
     }
 
     #[test]
@@ -416,8 +490,16 @@ mod tests {
         assert_eq!(
             rollup_shape(&records),
             [
-                (TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 20.0),
-                (TestId::NcclInterAllGather, "bus_gib_per_sec_peak", 11.0),
+                (
+                    TestId::NcclInterAllReduce,
+                    "bus_gib_per_sec_peak_min_rail",
+                    20.0
+                ),
+                (
+                    TestId::NcclInterAllGather,
+                    "bus_gib_per_sec_peak_min_rail",
+                    11.0
+                ),
             ]
         );
         assert!(records.iter().all(|r| r.scope == Scope::Node));
@@ -438,8 +520,16 @@ mod tests {
         assert_eq!(
             rollup_shape(&records),
             [
-                (TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 4.0),
-                (TestId::NcclInterAllGather, "bus_gib_per_sec_peak", 2.0),
+                (
+                    TestId::NcclInterAllReduce,
+                    "bus_gib_per_sec_peak_min_rail",
+                    4.0
+                ),
+                (
+                    TestId::NcclInterAllGather,
+                    "bus_gib_per_sec_peak_min_rail",
+                    2.0
+                ),
             ]
         );
     }
@@ -457,7 +547,11 @@ mod tests {
         ]);
         assert_eq!(
             rollup_shape(&records),
-            [(TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 21.0)]
+            [(
+                TestId::NcclInterAllReduce,
+                "bus_gib_per_sec_peak_min_rail",
+                21.0
+            )]
         );
         // A rail that ran but reported nothing voids both.
         assert!(rail_rollup(&[rail(22.0, 11.0), Vec::new()]).is_empty());

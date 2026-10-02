@@ -665,11 +665,17 @@ async fn network_phase(
 ) {
     // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
     // node pairs (TCP), then the full fleet (NCCL over the fabric).
-    if config.tests.nccl_intranode {
+    // Whether the intra-node level ran decides whether a one-host fleet
+    // sweep would only repeat it (`nccl::IntraNodeCoverage`), so the gate
+    // follows the very branch that dispatches that level.
+    let intranode = if config.tests.nccl_intranode {
         intranode::intranode_sweep(config, sessions, inventories, sink).await;
-    }
+        nccl::IntraNodeCoverage::Covered
+    } else {
+        nccl::IntraNodeCoverage::NotCovered
+    };
     pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl::nccl_sweep(config, sessions, inventories, sink).await;
+    nccl::nccl_sweep(config, sessions, inventories, sink, intranode).await;
     tcp_barrier_sweep(config, sessions, sink).await;
 }
 

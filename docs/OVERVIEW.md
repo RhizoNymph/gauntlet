@@ -167,13 +167,18 @@ Features Index:
       every host that has one, rails run sequentially), laid out by the
       pure orchestrator/nccl/shape.rs into RankLayouts whose RankBlocks
       carry the first local GPU; series land under nccl_inter_all_* and fit
-      nccl_{allreduce,allgather}_inter_node. The sweep runs only on worlds
-      with >= 2 hosts and >= 2 ranks (Skipped naming the failed condition).
-      Every fleet sweep's lead emits a fleet-level bus_gib_per_sec_peak
-      headline (per-rail: _rail<r> peaks plus a worst-rail roll-up), aggregated
-      across repeats and threshold-checked but never MAD-compared (one
-      value per run, no fleet peers). Barrier probe and fleet overlap
-      always stay rank-per-GPU.
+      nccl_{allreduce,allgather}_inter_node_<n>rank (keyed by world size).
+      Per-rail: a host to blame for one rail is excluded from later rails
+      and the barrier (orchestrator/nccl/rails.rs), and every host records
+      one outcome per test for the whole sweep. The sweep runs only on
+      worlds with >= 2 ranks, and >= 2 hosts while the intra-node sweep
+      runs (Skipped naming the failed condition). Every fleet sweep's lead
+      emits a fleet-level headline: bus_gib_per_sec_peak (rank-per-GPU,
+      rank-per-node), per rail _rail<r> plus the worst-rail
+      bus_gib_per_sec_peak_min_rail — aggregated across repeats and
+      threshold-checked but never MAD-compared (one value per run, no
+      fleet peers; the barrier fleet_span_* follow the same rule).
+      Barrier probe and fleet overlap always stay rank-per-GPU.
     entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
     depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md

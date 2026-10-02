@@ -12,15 +12,42 @@
 //! - rank-per-node: `nccl_inter_all_*.bus_gib_per_sec_peak`
 //! - rail `r`: `nccl_inter_all_*.bus_gib_per_sec_peak_rail<r>` (the
 //!   orchestrator derives the per-rail world's overall
-//!   `bus_gib_per_sec_peak` from these once every rail ran).
+//!   `bus_gib_per_sec_peak_min_rail` — worst rail — from these once every
+//!   rail ran).
 //!
 //! A world of one rank has no bus bandwidth to speak of, and a collective
 //! no size of which could run (all-gather sizes too small to shard) has no
 //! peak: neither emits a headline.
+//!
+//! Inter-node sweeps also open their per-size series with a `ranks`
+//! record per test (`series_opener`): one lead can lead several rails of
+//! different world sizes in one repeat, so the report keys each series by
+//! the `ranks` record that precedes it.
 
 use crate::agent::intranode::{MultiGpuWorld, peak_bus_gib_per_sec};
 use crate::agent::sweep::{Collective, SweepPoint};
-use crate::proto::{MetricRecord, Scope, SweepSeries, Unit};
+use crate::proto::{MetricRecord, Scope, SweepSeries, Unit, nccl_metric};
+
+/// Records the lead emits before an inter-node sweep's per-size series:
+/// `ranks` = the world size, once per test. Nothing for rank-per-GPU (its
+/// link class is not keyed by size).
+pub(crate) fn series_opener(series: SweepSeries, world_size: u32) -> Vec<MetricRecord> {
+    if !series.is_inter_node() {
+        return Vec::new();
+    }
+    series
+        .tests()
+        .into_iter()
+        .map(|test| MetricRecord {
+            test,
+            scope: Scope::Node,
+            name: nccl_metric::RANKS.to_string(),
+            value: f64::from(world_size),
+            unit: Unit::Count,
+            repeat: 0,
+        })
+        .collect()
+}
 
 /// The headline records for a completed fleet sweep of `world_size` ranks.
 pub(crate) fn fleet_headline(
@@ -130,6 +157,24 @@ mod tests {
                 (TestId::NcclInterAllGather, "bus_gib_per_sec_peak_rail3"),
             ]
         );
+    }
+
+    #[test]
+    fn inter_node_series_open_with_their_world_size() {
+        let opener = series_opener(SweepSeries::Rail { rail: 2 }, 3);
+        let shape: Vec<(TestId, &str, f64, Unit)> = opener
+            .iter()
+            .map(|r| (r.test, r.name.as_str(), r.value, r.unit))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (TestId::NcclInterAllReduce, "ranks", 3.0, Unit::Count),
+                (TestId::NcclInterAllGather, "ranks", 3.0, Unit::Count),
+            ]
+        );
+        assert_eq!(series_opener(SweepSeries::RankPerNode, 2).len(), 2);
+        assert!(series_opener(SweepSeries::RankPerGpu, 16).is_empty());
     }
 
     #[test]
