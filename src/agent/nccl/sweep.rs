@@ -179,7 +179,7 @@ pub(super) fn run_sweep(
 }
 
 /// The barrier-skew probe alone, on its own communicator
-/// (`NcclWorkload::Barrier`).
+/// (`NcclWorkload::BarrierOnly`).
 pub(super) fn run_barrier(
     sink: &EventSink,
     ranks: &LocalRanks,

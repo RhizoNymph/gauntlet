@@ -8,7 +8,7 @@ use tracing::warn;
 
 use super::ObservationSink;
 use crate::analysis::skew::BarrierSkew;
-use crate::proto::{MetricRecord, Scope, TestId, Unit};
+use crate::proto::{MetricRecord, Scope, TestId, Unit, barrier_metric};
 
 /// Who a barrier rank is in the results document: its host and the scope
 /// under that host.
@@ -83,10 +83,10 @@ pub(super) fn barrier_records(
     }
     if let Some(host) = fleet_host {
         for (name, value) in [
-            ("fleet_span_p50_us", skew.fleet.p50_us),
-            ("fleet_span_p90_us", skew.fleet.p90_us),
-            ("fleet_span_p99_us", skew.fleet.p99_us),
-            ("fleet_span_max_us", skew.fleet.max_us),
+            (barrier_metric::FLEET_SPAN_P50_US, skew.fleet.p50_us),
+            (barrier_metric::FLEET_SPAN_P90_US, skew.fleet.p90_us),
+            (barrier_metric::FLEET_SPAN_P99_US, skew.fleet.p99_us),
+            (barrier_metric::FLEET_SPAN_MAX_US, skew.fleet.max_us),
         ] {
             records.push((
                 host.to_string(),
@@ -183,7 +183,7 @@ mod tests {
         // Fleet span stays one node-scope series on the lead host.
         let spans: Vec<&(String, MetricRecord)> = records
             .iter()
-            .filter(|(_, record)| record.name.starts_with("fleet_span"))
+            .filter(|(_, record)| record.name.starts_with(barrier_metric::FLEET_SPAN_PREFIX))
             .collect();
         assert_eq!(spans.len(), 4);
         assert!(

@@ -1,12 +1,16 @@
-//! Fleet-level NCCL sweep results (schema v13): which metric groups are
-//! fleet-level headlines, and the calibration link classes of the fleet
-//! and inter-node sweeps.
+//! Fleet-level results (schema v13): which metric groups are fleet-level
+//! (one value per run), and the calibration link classes of the fleet and
+//! inter-node sweeps.
 //!
-//! **Fleet-level headlines stay out of MAD.** The fleet sweep's
-//! `bus_gib_per_sec_peak` (and the inter-node `bus_gib_per_sec_peak`,
-//! `bus_gib_per_sec_peak_rail<r>`) is one value per *run*, attributed to
-//! the world's lead host at node scope (the `fleet_span` convention). A
-//! group with one subject has no fleet peers: a median/MAD over it is
+//! **Fleet-level groups stay out of MAD.** Two kinds of metric are one
+//! value per *run*, attributed to a lead host at node scope:
+//! - the sweep headlines — the fleet sweep's `bus_gib_per_sec_peak`, the
+//!   inter-node `bus_gib_per_sec_peak` and `bus_gib_per_sec_peak_rail<r>`;
+//! - the barrier probes' fleet span — `nccl_barrier.fleet_span_*` and
+//!   `tcp_barrier.fleet_span_*`, the per-iteration spread of the whole
+//!   world's arrivals.
+//!
+//! A group with one subject has no fleet peers: a median/MAD over it is
 //! degenerate (MAD 0, the subject is its own median), and a spread
 //! comparison across subjects (jitter) is meaningless. So these groups
 //! skip the outlier and jitter passes by rule, instead of relying on
@@ -21,23 +25,26 @@ use std::collections::BTreeMap;
 use super::{metric_key, sweep_points};
 use crate::analysis::fit::{AlphaBetaFit, fit_alpha_beta};
 use crate::orchestrator::collect::HostObservations;
-use crate::proto::{TestId, nccl_metric};
+use crate::proto::{TestId, barrier_metric, nccl_metric};
 
-/// The sweep test ids whose headline is fleet-level (one per run).
-const FLEET_LEVEL_TESTS: [TestId; 4] = [
-    TestId::NcclAllReduce,
-    TestId::NcclAllGather,
-    TestId::NcclInterAllReduce,
-    TestId::NcclInterAllGather,
+/// Every fleet-level metric family: (test, metric-name prefix). One rule,
+/// one table — a new fleet-level metric is a new row here.
+const FLEET_LEVEL: [(TestId, &str); 6] = [
+    (TestId::NcclAllReduce, nccl_metric::BUS_PEAK_PREFIX),
+    (TestId::NcclAllGather, nccl_metric::BUS_PEAK_PREFIX),
+    (TestId::NcclInterAllReduce, nccl_metric::BUS_PEAK_PREFIX),
+    (TestId::NcclInterAllGather, nccl_metric::BUS_PEAK_PREFIX),
+    (TestId::NcclBarrier, barrier_metric::FLEET_SPAN_PREFIX),
+    (TestId::TcpBarrier, barrier_metric::FLEET_SPAN_PREFIX),
 ];
 
-/// Whether a metric group ("<test>.<metric>") is a fleet-level sweep
-/// headline: one value per run, never MAD-compared.
+/// Whether a metric group ("<test>.<metric>") is fleet-level: one value
+/// per run on a lead host, never MAD- or jitter-compared.
 pub(crate) fn is_fleet_level(group: &str) -> bool {
-    FLEET_LEVEL_TESTS.iter().any(|test| {
+    FLEET_LEVEL.iter().any(|(test, prefix)| {
         group
             .strip_prefix(&metric_key(*test, ""))
-            .is_some_and(|name| name.starts_with(nccl_metric::BUS_PEAK_PREFIX))
+            .is_some_and(|name| name.starts_with(prefix))
     })
 }
 
@@ -75,12 +82,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fleet_headlines_are_fleet_level_and_intra_node_ones_are_not() {
+    fn fleet_headlines_and_spans_are_fleet_level_per_node_metrics_are_not() {
         for group in [
             "nccl_all_reduce.bus_gib_per_sec_peak",
             "nccl_all_gather.bus_gib_per_sec_peak",
             "nccl_inter_all_reduce.bus_gib_per_sec_peak",
             "nccl_inter_all_gather.bus_gib_per_sec_peak_rail3",
+            "nccl_barrier.fleet_span_p50_us",
+            "nccl_barrier.fleet_span_max_us",
+            "tcp_barrier.fleet_span_p99_us",
         ] {
             assert!(is_fleet_level(group), "{group}");
         }
@@ -91,6 +101,11 @@ mod tests {
             "nccl_all_reduce.bus_gib_per_sec",
             "nccl_inter_all_reduce.elapsed_us",
             "gpu_gemm_perf.gflops_bf16",
+            // Per-rank barrier metrics are fleet comparisons.
+            "nccl_barrier.p99_us",
+            "tcp_barrier.slowest_frac",
+            // A fleet_span name under another test is not this family.
+            "nccl_all_reduce.fleet_span_p50_us",
         ] {
             assert!(!is_fleet_level(group), "{group}");
         }

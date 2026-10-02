@@ -56,7 +56,7 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // v11: NCCL world shapes — `RankBlock` carries the local GPU its ranks
 // start on (`first_gpu`, serde-defaulted to 0 and omitted when 0), the
 // sweep workload carries its `SweepSeries` (serde-defaulted to
-// rank-per-GPU), `NcclWorkload::Barrier` runs the barrier probe alone,
+// rank-per-GPU), `NcclWorkload::BarrierOnly` runs the barrier probe alone,
 // and the `nccl_inter_all_reduce` / `nccl_inter_all_gather` test ids ride
 // the wire. The lead of every fleet sweep also emits a fleet-level
 // `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline.
@@ -603,6 +603,19 @@ pub struct NcclSweepSpec {
     pub iters_per_size: u32,
 }
 
+/// Barrier-skew metric names shared by the emitter
+/// (`orchestrator::barrier`) and the report's fleet-level rule.
+pub mod barrier_metric {
+    /// Prefix of the fleet-level barrier-span distribution
+    /// (`fleet_span_{p50,p90,p99,max}_us`): one series per run, attributed
+    /// to the lead host, never MAD-compared (`report::fleet_nccl`).
+    pub const FLEET_SPAN_PREFIX: &str = "fleet_span";
+    pub const FLEET_SPAN_P50_US: &str = "fleet_span_p50_us";
+    pub const FLEET_SPAN_P90_US: &str = "fleet_span_p90_us";
+    pub const FLEET_SPAN_P99_US: &str = "fleet_span_p99_us";
+    pub const FLEET_SPAN_MAX_US: &str = "fleet_span_max_us";
+}
+
 /// Metric names shared by the NCCL sweep emitters (fleet and intra-node)
 /// and the report's link-fit extraction, so a renamed string cannot
 /// silently break the join.
@@ -785,7 +798,7 @@ pub enum NcclWorkload {
     /// The barrier-skew microbenchmark alone (proto v11): run on the
     /// rank-per-GPU world when the sweep itself ran in a different world
     /// shape, so barrier subjects stay `host:gpuN` whatever the shape.
-    Barrier(BarrierSpec),
+    BarrierOnly(BarrierSpec),
 }
 
 /// Which fleet sweep a `NcclWorkload::Sweep` is: the world shape it was
@@ -1035,13 +1048,13 @@ mod tests {
     fn barrier_only_workloads_round_trip() {
         let directive = NcclDirective::Lead {
             assignment: assignment(0, 4, 8),
-            workload: NcclWorkload::Barrier(BarrierSpec {
+            workload: NcclWorkload::BarrierOnly(BarrierSpec {
                 iters: 2000,
                 bytes: 8,
             }),
         };
         let json = serde_json::to_string(&directive).expect("serialize");
-        assert!(json.contains(r#""kind":"barrier""#), "{json}");
+        assert!(json.contains(r#""kind":"barrier_only""#), "{json}");
         let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, directive);
     }

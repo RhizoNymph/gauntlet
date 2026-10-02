@@ -148,25 +148,44 @@ pub(crate) fn skip_outcomes(skip: &SweepSkip) -> Vec<OutcomeRecord> {
         .collect()
 }
 
-/// The per-rail world's overall headline: per test, the best rail
-/// headline (`bus_gib_per_sec_peak_rail<r>`) as `bus_gib_per_sec_peak` —
-/// the same max-of-measured-peaks rule as every sweep headline, one level
-/// up. Non-finite values are ignored; a test no rail measured has no
-/// headline.
-pub(crate) fn rail_rollup(rail_peaks: &[(TestId, f64)]) -> Vec<MetricRecord> {
+/// The headline values one rail's lead reported, `(test, value)`.
+pub(crate) type RailPeaks = Vec<(TestId, f64)>;
+
+/// The per-rail world's overall headline — **peak per rail, worst rail
+/// overall**: per test, the minimum across rails of each rail's peak
+/// (`bus_gib_per_sec_peak_rail<r>`), emitted as `bus_gib_per_sec_peak`.
+///
+/// Worst, not best: this is the number absolute thresholds gate on and
+/// downstream tooling compares against a NIC ceiling, so one healthy rail
+/// must never hide a degraded one (rails at 22/22/22/4 GiB/s must fail a
+/// 20 GiB/s floor).
+///
+/// `rails` holds one entry per rail that *ran* (passed the gate). A rail
+/// that ran but reported no finite value for a test (it failed part-way)
+/// makes that test's overall headline absent rather than optimistic: the
+/// worst rail is unknown, and the failure is already recorded against
+/// its host. Rails gated out (fewer than 2 hosts) never ran, carry no
+/// NIC number, and are not part of the roll-up.
+pub(crate) fn rail_rollup(rails: &[RailPeaks]) -> Vec<MetricRecord> {
     [TestId::NcclInterAllReduce, TestId::NcclInterAllGather]
         .into_iter()
         .filter_map(|test| {
-            rail_peaks
+            rails
                 .iter()
-                .filter(|(rail_test, value)| *rail_test == test && value.is_finite())
-                .map(|(_, value)| *value)
-                .reduce(f64::max)
-                .map(|peak| MetricRecord {
+                .map(|peaks| {
+                    peaks
+                        .iter()
+                        .find(|(rail_test, value)| *rail_test == test && value.is_finite())
+                        .map(|(_, value)| *value)
+                })
+                .collect::<Option<Vec<f64>>>()?
+                .into_iter()
+                .reduce(f64::min)
+                .map(|worst| MetricRecord {
                     test,
                     scope: Scope::Node,
                     name: nccl_metric::BUS_PEAK.to_string(),
-                    value: peak,
+                    value: worst,
                     unit: Unit::GibPerSec,
                     repeat: 0,
                 })
@@ -377,31 +396,70 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_rail_rollup_is_the_best_rail_per_collective() {
-        let records = rail_rollup(&[
-            (TestId::NcclInterAllReduce, 20.0),
-            (TestId::NcclInterAllReduce, 23.5),
-            (TestId::NcclInterAllReduce, f64::NAN),
-            (TestId::NcclInterAllGather, 11.0),
-        ]);
-        let shape: Vec<(TestId, &str, f64)> = records
+    fn rail(reduce: f64, gather: f64) -> RailPeaks {
+        vec![
+            (TestId::NcclInterAllReduce, reduce),
+            (TestId::NcclInterAllGather, gather),
+        ]
+    }
+
+    fn rollup_shape(records: &[MetricRecord]) -> Vec<(TestId, &str, f64)> {
+        records
             .iter()
             .map(|r| (r.test, r.name.as_str(), r.value))
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn the_rail_rollup_is_the_worst_rail_per_collective() {
+        let records = rail_rollup(&[rail(20.0, 12.0), rail(23.5, 11.0), rail(21.0, 13.0)]);
         assert_eq!(
-            shape,
+            rollup_shape(&records),
             [
-                (TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 23.5),
+                (TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 20.0),
                 (TestId::NcclInterAllGather, "bus_gib_per_sec_peak", 11.0),
             ]
         );
         assert!(records.iter().all(|r| r.scope == Scope::Node));
-        assert!(rail_rollup(&[]).is_empty());
+        assert!(records.iter().all(|r| r.unit == Unit::GibPerSec));
+        assert!(rail_rollup(&[]).is_empty(), "no rail ran, no headline");
+    }
+
+    #[test]
+    fn one_degraded_rail_drags_the_headline_down() {
+        // Three healthy rails cannot hide the fourth: a 20 GiB/s floor on
+        // the headline must trip.
+        let records = rail_rollup(&[
+            rail(22.0, 11.0),
+            rail(22.0, 11.0),
+            rail(22.0, 11.0),
+            rail(4.0, 2.0),
+        ]);
         assert_eq!(
-            rail_rollup(&[(TestId::NcclInterAllGather, 3.0)]).len(),
-            1,
-            "a collective no rail measured has no headline"
+            rollup_shape(&records),
+            [
+                (TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 4.0),
+                (TestId::NcclInterAllGather, "bus_gib_per_sec_peak", 2.0),
+            ]
         );
+    }
+
+    #[test]
+    fn a_rail_that_ran_without_a_number_voids_that_headline() {
+        // Rail 1 measured all-reduce but its all-gather leg failed (or
+        // came back non-finite): the worst all-gather rail is unknown.
+        let records = rail_rollup(&[
+            rail(22.0, 11.0),
+            vec![
+                (TestId::NcclInterAllReduce, 21.0),
+                (TestId::NcclInterAllGather, f64::NAN),
+            ],
+        ]);
+        assert_eq!(
+            rollup_shape(&records),
+            [(TestId::NcclInterAllReduce, "bus_gib_per_sec_peak", 21.0)]
+        );
+        // A rail that ran but reported nothing voids both.
+        assert!(rail_rollup(&[rail(22.0, 11.0), Vec::new()]).is_empty());
     }
 }

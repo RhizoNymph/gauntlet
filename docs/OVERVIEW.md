@@ -170,7 +170,7 @@ Features Index:
       nccl_{allreduce,allgather}_inter_node. The sweep runs only on worlds
       with >= 2 hosts and >= 2 ranks (Skipped naming the failed condition).
       Every fleet sweep's lead emits a fleet-level bus_gib_per_sec_peak
-      headline (per-rail: _rail<r> plus a best-rail roll-up), aggregated
+      headline (per-rail: _rail<r> peaks plus a worst-rail roll-up), aggregated
       across repeats and threshold-checked but never MAD-compared (one
       value per run, no fleet peers). Barrier probe and fleet overlap
       always stay rank-per-GPU.

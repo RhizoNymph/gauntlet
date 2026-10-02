@@ -66,11 +66,14 @@ intra-node straggler headline. Its name carries the GPU count, so nodes
 are only compared within their own topology (the same keying as the
 `_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
 
-Fleet-level headlines (schema v13) are the opposite case: one value per
-*run*, attributed to the world's lead host at node scope —
-`nccl_all_{reduce,gather}.bus_gib_per_sec_peak` and
-`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak[_rail<r>]`. They
-have no fleet peers, so `report::fleet_nccl::is_fleet_level` excludes
+Fleet-level groups (schema v13) are the opposite case: one value per
+*run*, attributed to a lead host at node scope —
+`nccl_all_{reduce,gather}.bus_gib_per_sec_peak`,
+`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak[_rail<r>]` (the
+per-rail world's bare headline is the worst rail's peak), and the
+barrier probes' `{nccl,tcp}_barrier.fleet_span_*`. One table in
+`report::fleet_nccl` (`FLEET_LEVEL`: test + metric-name prefix) lists
+them all. They have no fleet peers, so `is_fleet_level` excludes
 them from the outlier and jitter passes by rule (a one-subject MAD group
 is degenerate: MAD 0, the subject is its own median). They still
 aggregate — moments across `--repeat` are the run-to-run jitter of the
@@ -230,8 +233,9 @@ tail progress:
   result away from OLS.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
-- Fleet-level sweep headlines never enter the outlier or jitter passes;
-  they always aggregate and always face absolute thresholds.
+- Fleet-level groups (sweep headlines, barrier `fleet_span_*`) never
+  enter the outlier or jitter passes; they always aggregate and always
+  face absolute thresholds.
 
 ## Error-counter findings (schema v4)
 

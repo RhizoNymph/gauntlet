@@ -33,7 +33,7 @@
 //! `nccl_inter_all_*` for the NIC-forcing shapes) and the headline name.
 //! Other hosts emit only Fatal on error — and one `NcclBarrierTimings`
 //! per local rank when the barrier-skew probe rides along
-//! (`NcclWorkload::Barrier` runs that probe alone).
+//! (`NcclWorkload::BarrierOnly` runs that probe alone).
 //!
 //! Fleet overlap (`fleet_overlap`): the directive's `NcclWorkload::Overlap`
 //! runs the combined-load protocol instead of the sweep — an isolated fleet
@@ -278,7 +278,7 @@ pub mod imp {
             NcclWorkload::Overlap(spec) => {
                 Buffers::Overlap(OverlapBuffers::alloc(&prepared, spec)?)
             }
-            NcclWorkload::Barrier(spec) => {
+            NcclWorkload::BarrierOnly(spec) => {
                 Buffers::Sweep(SweepBuffers::alloc_for_barrier(&prepared, *spec)?)
             }
         };
@@ -317,7 +317,7 @@ pub mod imp {
             (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
                 overlap_fleet(sink, &ranks, buffers, spec)
             }
-            (NcclWorkload::Barrier(spec), Buffers::Sweep(buffers)) => {
+            (NcclWorkload::BarrierOnly(spec), Buffers::Sweep(buffers)) => {
                 run_barrier(sink, &ranks, buffers, *spec)
             }
             _ => bail!("workload buffers do not match the workload"),

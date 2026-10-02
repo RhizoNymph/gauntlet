@@ -81,6 +81,9 @@ use crate::proto::{
 // the nccl_inter_all_reduce / nccl_inter_all_gather groups (per-size
 // series, `bus_gib_per_sec_peak`, per-rail `bus_gib_per_sec_peak_rail<r>`)
 // and the calibration.links classes nccl_{allreduce,allgather}_inter_node.
+// The per-rail world's bare `bus_gib_per_sec_peak` is the worst rail's
+// peak. The barrier probes' `fleet_span_*` groups follow the same
+// fleet-level rule (aggregated, never MAD/jitter-compared).
 // A one-host fleet no longer runs the fleet sweep (Skipped outcomes). No
 // field changed shape.
 pub const SCHEMA_VERSION: u32 = 13;
@@ -340,8 +343,9 @@ pub fn build(
 
     // Fleet-relative straggler detection over per-subject medians, so
     // run-to-run noise inside one subject cannot masquerade as slowness.
-    // Fleet-level headlines (one value per run, on the lead host) have no
-    // fleet peers: they skip both MAD passes (`fleet_nccl`).
+    // Fleet-level groups (sweep headlines, barrier fleet span: one value
+    // per run, on the lead host) have no fleet peers: they skip both MAD
+    // passes (`fleet_nccl`).
     let mut outliers = BTreeMap::new();
     for (group, subjects) in mad_groups(&aggregates) {
         let samples: Vec<Sample> = subjects
@@ -445,8 +449,9 @@ pub fn build(
 }
 
 /// The aggregate groups that enter the fleet-relative MAD passes (outliers
-/// and jitter): every group but the fleet-level sweep headlines, which
-/// have one subject per run and so no peers to be compared against.
+/// and jitter): every group but the fleet-level ones (sweep headlines,
+/// barrier fleet span), which have one subject per run and so no peers to
+/// be compared against.
 fn mad_groups(
     aggregates: &Aggregates,
 ) -> impl Iterator<Item = (&String, &BTreeMap<String, MetricAggregate>)> {

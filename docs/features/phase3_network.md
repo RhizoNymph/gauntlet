@@ -54,7 +54,7 @@ Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
    from the intra-node sweep.
 5. Barrier-skew microbenchmark: a tiny-collective straggler probe riding
    the same NCCL communicator (rank-per-GPU shape) or run afterwards as
-   its own rank-per-GPU job (`NcclWorkload::Barrier`, the NIC-forcing
+   its own rank-per-GPU job (`NcclWorkload::BarrierOnly`, the NIC-forcing
    shapes), plus a TCP star-barrier fallback after it. See
    docs/features/barrier_skew.md.
 
@@ -341,10 +341,14 @@ inherits the run-level `[nccl] env`).
 5. `per_rail` only: the driver's intercept captures each rail lead's
    `bus_gib_per_sec_peak_rail<r>` (accepted only from that rail's lead)
    and, after the last rail, `shape::rail_rollup` emits
-   `nccl_inter_all_*.bus_gib_per_sec_peak` = the best rail, against the
-   rail-0 lead (the fleet's first NCCL host).
+   `nccl_inter_all_*.bus_gib_per_sec_peak` = the **worst** rail's peak
+   (min across rails that ran), against the rail-0 lead (the fleet's
+   first NCCL host). A rail that ran but reported no finite peak for a
+   collective voids that collective's overall headline (its failure is
+   recorded against its host); rails the gate kept out (one host) never
+   ran and are not part of the roll-up.
 6. NIC-forcing shapes then run the barrier probe as its own rank-per-GPU
-   job (`NcclWorkload::Barrier`, `sweep::barrier_only`, gated on >= 2
+   job (`NcclWorkload::BarrierOnly`, `sweep::barrier_only`, gated on >= 2
    hosts), so barrier subjects stay `host:gpuN`. The fleet overlap step
    ignores `nccl_world` entirely (rank-per-GPU; its retention compares
    per GPU against phase 2, which a one-rank-per-host world could not).
@@ -358,19 +362,26 @@ measurable size, no headline):
   `nccl_all_gather.bus_gib_per_sec_peak` (gap 2);
 - rank-per-node: `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak`;
 - per-rail: `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak_rail<r>`
-  per rail plus the rolled-up `bus_gib_per_sec_peak`.
+  per rail (peak per rail) plus the rolled-up `bus_gib_per_sec_peak`
+  (worst rail overall).
 
-The bare `bus_gib_per_sec_peak` is the pure-inter-node number to compare
-against nccl-tests and the IB ceiling (`INTER_NODE_PURE_IB` on the
-gauntlet-runs side); the rail metrics single out a degraded rail. The
-roll-up takes the *best* rail, consistent with "peak" everywhere else; a
-bad rail shows in its own `_rail<r>` metric, not by dragging the
-headline down.
+The bare `nccl_inter_all_reduce.bus_gib_per_sec_peak` is the
+pure-inter-node number for both NIC-forcing shapes, and the one
+gauntlet-runs' `INTER_NODE_PURE_IB` entry should map to: compare it
+against nccl-tests and the IB ceiling. One name for both shapes keeps
+that mapping shape-independent. Semantics: **peak per rail, worst rail
+overall.** Each rail's number is its best size (the "peak" rule), but
+across rails the headline is the minimum, because it is what absolute
+thresholds gate on and what is compared against a NIC ceiling — one
+healthy rail must never hide a degraded one (rails at 22/22/22/4 GiB/s
+must fail a 20 GiB/s floor). The `_rail<r>` metrics say which rail it
+was.
 
 **MAD decision.** A fleet-level headline is one value per run on one
 subject (the lead host, the `fleet_span` convention). It has no fleet
 peers, so `report::fleet_nccl::is_fleet_level` keeps every
-`nccl_all_*` / `nccl_inter_all_*` `bus_gib_per_sec_peak*` group out of
+`nccl_all_*` / `nccl_inter_all_*` `bus_gib_per_sec_peak*` group — and,
+by the same rule, the barrier probes' `fleet_span_*` groups — out of
 the outlier and jitter passes by rule — not by relying on
 `flag_outliers`' 4-sample minimum. It still aggregates
 (`aggregates[group][lead]` carries median/MAD/min/max/stddev across

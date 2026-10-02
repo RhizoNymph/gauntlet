@@ -87,6 +87,39 @@ fn the_fleet_headline_aggregates_across_repeats_but_never_enters_mad() {
 }
 
 #[test]
+fn barrier_fleet_span_aggregates_but_never_enters_mad() {
+    // fleet_span_* is the same shape as the sweep headlines: one series
+    // per run on the lead host, so the same rule keeps it out of MAD.
+    let names = hosts(6);
+    let config = config_for(&names);
+    let mut observations: BTreeMap<String, HostObservations> = names
+        .iter()
+        .map(|host| (host.clone(), HostObservations::default()))
+        .collect();
+    for (test, lead) in [(TestId::NcclBarrier, 0), (TestId::TcpBarrier, 1)] {
+        let obs = observations.get_mut(&names[lead]).expect("lead");
+        for (repeat, value) in [(0, 40.0), (1, 41.0), (2, 400.0), (3, 39.0)] {
+            obs.metrics
+                .push(node(test, "fleet_span_p99_us", value, Unit::Micros, repeat));
+        }
+    }
+    let results = report::build(&config, observations, 1, 2);
+    for (group, lead) in [
+        ("nccl_barrier.fleet_span_p99_us", &names[0]),
+        ("tcp_barrier.fleet_span_p99_us", &names[1]),
+    ] {
+        let subjects = &results.aggregates[group];
+        assert_eq!(subjects.len(), 1, "{group}: one subject, the lead");
+        assert_eq!(subjects[lead].moments.n, 4, "{group}");
+        assert!(!results.fleet.outliers.contains_key(group), "{group}");
+        assert!(
+            !results.fleet.jitter_outliers.contains_key(group),
+            "{group}"
+        );
+    }
+}
+
+#[test]
 fn a_low_fleet_headline_still_trips_an_absolute_floor() {
     let names = hosts(2);
     let mut config = config_for(&names);

@@ -8,12 +8,12 @@
 //! - `per_rail`: one world per rail, driven one after another (never
 //!   concurrently, so rails do not contend for PCIe/NIC bandwidth and each
 //!   rail's number is attributable to its path). After the last rail the
-//!   best rail headline is rolled up into the overall
-//!   `nccl_inter_all_*.bus_gib_per_sec_peak`, attributed to the lead
-//!   host.
+//!   rail headlines are rolled up into the overall
+//!   `nccl_inter_all_*.bus_gib_per_sec_peak` — peak per rail, worst rail
+//!   overall (`shape::rail_rollup`) — attributed to the lead host.
 //!
 //! For the two NIC-forcing shapes the barrier probe runs afterwards as its
-//! own rank-per-GPU job (`NcclWorkload::Barrier`): barrier subjects stay
+//! own rank-per-GPU job (`NcclWorkload::BarrierOnly`): barrier subjects stay
 //! `host:gpuN` whatever the shape, so barrier results stay comparable
 //! across runs with different sweep shapes.
 //!
@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
-use super::shape::{ShapedWorld, rail_rollup, shaped_worlds, skip_outcomes, sweep_gate};
+use super::shape::{RailPeaks, ShapedWorld, rail_rollup, shaped_worlds, skip_outcomes, sweep_gate};
 use super::{
     EventIntercept, FleetWorld, NcclFailureMode, NcclJob, accept_owned, block_owners,
     drive_fleet_nccl, emit_outcomes, gpu_subject, nccl_hosts, rank_per_gpu_world,
@@ -67,9 +67,12 @@ pub(in crate::orchestrator) async fn nccl_sweep(
         return;
     }
 
-    let mut rail_peaks: HeadlineValues = Vec::new();
+    // One entry per world that ran (passed the gate).
+    let mut rail_peaks: Vec<RailPeaks> = Vec::new();
     for world in &worlds {
-        rail_peaks.extend(run_world(config, world, sink, None).await);
+        if let Some(peaks) = run_world(config, world, sink, None).await {
+            rail_peaks.push(peaks);
+        }
     }
     if shape == NcclWorldShape::PerRail
         && let Some((lead, _)) = worlds.first().and_then(|w| w.layout.members().first())
@@ -102,13 +105,13 @@ fn step_name(series: SweepSeries) -> String {
 /// Gate one world, then sweep it. `barrier` rides the sweep's own
 /// communicator when given (rank-per-GPU only). Returns the headline
 /// values the world's lead reported, `(test, value)`, for the per-rail
-/// roll-up.
+/// roll-up — `None` when the gate kept the world from running.
 async fn run_world(
     config: &FleetConfig,
     world: &ShapedWorld<Arc<HostSession>>,
     sink: &ObservationSink,
     barrier: Option<BarrierSpec>,
-) -> HeadlineValues {
+) -> Option<RailPeaks> {
     let series = world.series;
     let layout = &world.layout;
     if let Err(skip) = sweep_gate(world) {
@@ -123,11 +126,10 @@ async fn run_world(
         for (session, _) in layout.members() {
             emit_outcomes(sink, session.addr(), outcomes.clone());
         }
-        return Vec::new();
+        return None;
     }
-    let Some((lead, _)) = layout.members().first() else {
-        return Vec::new();
-    };
+    // The gate guarantees members.
+    let (lead, _) = layout.members().first()?;
     info!(
         %series,
         world_size = layout.world_size(),
@@ -164,7 +166,7 @@ async fn run_world(
     if barrier.is_some() {
         analyze_barrier(sink, layout, timings);
     }
-    headlines
+    Some(headlines)
 }
 
 /// The barrier probe as its own rank-per-GPU job, for sweeps that ran in
@@ -195,7 +197,7 @@ async fn barrier_only(
     // No headline rides a barrier job: nothing to capture.
     let intercept = collected.intercept(lead.addr().to_string(), String::new());
     let job = NcclJob {
-        workload: NcclWorkload::Barrier(spec),
+        workload: NcclWorkload::BarrierOnly(spec),
     };
     drive_fleet_nccl(
         config,
@@ -213,8 +215,6 @@ async fn barrier_only(
 
 /// Barrier timing series with the host that sent each.
 type SenderTimings = Vec<(String, RankSeries)>;
-/// Headline values a world's lead reported, `(test, value)`.
-type HeadlineValues = Vec<(TestId, f64)>;
 
 /// What one sweep or barrier job's intercept collects from the event
 /// streams: every rank's barrier timings with their sender (consumed),
@@ -222,7 +222,7 @@ type HeadlineValues = Vec<(TestId, f64)>;
 #[derive(Default, Clone)]
 struct Collected {
     timings: Arc<Mutex<SenderTimings>>,
-    headlines: Arc<Mutex<HeadlineValues>>,
+    headlines: Arc<Mutex<RailPeaks>>,
 }
 
 impl Collected {
@@ -253,7 +253,7 @@ impl Collected {
         })
     }
 
-    fn take(self) -> (SenderTimings, HeadlineValues) {
+    fn take(self) -> (SenderTimings, RailPeaks) {
         let timings = std::mem::take(&mut *self.timings.lock().expect("barrier timings poisoned"));
         let headlines = std::mem::take(&mut *self.headlines.lock().expect("headlines poisoned"));
         (timings, headlines)

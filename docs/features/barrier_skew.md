@@ -135,7 +135,10 @@ straggler experiences.
    a rank → `RankSubject { host, scope }` locator. Fleet-level,
    attributed to the lead / coordinator host under `Scope::Node` like
    the sweep metrics: `fleet_span_p50_us`, `fleet_span_p90_us`,
-   `fleet_span_p99_us`, `fleet_span_max_us`.
+   `fleet_span_p99_us`, `fleet_span_max_us` (`proto::barrier_metric`).
+   One series per run, so (schema v13) they are aggregated across
+   repeats and threshold-checked but kept out of MAD and jitter
+   (`report::fleet_nccl::is_fleet_level`, the fleet-headline rule).
 5. **Analysis**: the per-rank metrics are one-value-per-host groups, so
    they flow through the ordinary MAD outlier machinery (under
    `nccl_barrier` a straggler is a *low*-side `p50_us` outlier, compared
@@ -179,7 +182,7 @@ The NCCL barrier always runs on the rank-per-GPU world, whatever
 shapes"). With `rank_per_gpu` it rides the sweep's communicator as
 before. With `rank_per_node` / `per_rail` the sweep's worlds hold one
 rank per host on one GPU, so the probe runs afterwards as its own
-rank-per-GPU job: `NcclWorkload::Barrier(BarrierSpec)` (buffers sized to
+rank-per-GPU job: `NcclWorkload::BarrierOnly(BarrierSpec)` (buffers sized to
 the barrier payload alone, `agent::nccl::sweep::run_barrier`), driven by
 the same `drive_fleet_nccl` and analyzed by the same
 `orchestrator::nccl::sweep::analyze_barrier`. Choice: keeping one barrier
