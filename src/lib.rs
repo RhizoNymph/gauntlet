@@ -2,6 +2,7 @@ pub mod agent;
 pub mod analysis;
 pub mod cli;
 pub mod config;
+pub mod launch;
 pub mod nccl_env;
 pub mod orchestrator;
 pub mod proto;

@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::launch::{LaunchConfig, LaunchMode};
 use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
@@ -25,8 +26,10 @@ pub enum ConfigError {
         path: PathBuf,
         source: Box<toml::de::Error>,
     },
-    #[error("no hosts configured")]
-    NoHosts,
+    /// Only srun launch can infer hosts (from the allocation); every other
+    /// mode needs them listed.
+    #[error("no hosts configured (launch mode {mode} needs `hosts`; only srun mode infers them)")]
+    NoHosts { mode: LaunchMode },
     #[error("duplicate host address: {addr}")]
     DuplicateHost { addr: String },
     #[error("thresholds.mad_k must be positive, got {got}")]
@@ -46,7 +49,12 @@ pub enum ConfigError {
 pub struct FleetConfig {
     #[serde(default)]
     pub ssh: SshConfig,
+    /// May be omitted in srun launch mode: the allocation's nodes are used.
+    #[serde(default)]
     pub hosts: Vec<HostEntry>,
+    /// `[launch]`: ssh (default) or srun inside a Slurm allocation.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     #[serde(default)]
     pub tests: TestConfig,
     #[serde(default)]
@@ -253,27 +261,45 @@ impl NcclConfig {
 
 impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_for(path, None)
+    }
+
+    /// `load`, validated for the launch mode the command will actually use
+    /// (`--launch` over `[launch] mode`): `gauntlet run --launch srun` on a
+    /// config without hosts is valid, the allocation supplies them.
+    pub fn load_for(path: &Path, cli_launch: Option<LaunchMode>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        Self::from_toml_str(&text, path)
+        let config = Self::parse(&text, path)?;
+        config.validate_for(config.launch.effective_mode(cli_launch))?;
+        Ok(config)
     }
 
     /// Parse and validate a config document; `path` only labels errors.
     pub fn from_toml_str(text: &str, path: &Path) -> Result<Self, ConfigError> {
-        let config: FleetConfig = toml::from_str(text).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+        let config = Self::parse(text, path)?;
         config.validate()?;
         Ok(config)
     }
 
+    fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+    }
+
+    /// Validate for the configured launch mode.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.hosts.is_empty() {
-            return Err(ConfigError::NoHosts);
-        }
+        self.validate_for(self.launch.mode)
+    }
+
+    /// Validate for an effective launch `mode` (which decides whether an
+    /// empty host list is acceptable).
+    pub fn validate_for(&self, mode: LaunchMode) -> Result<(), ConfigError> {
+        self.require_hosts_for(mode)?;
         let mut seen = std::collections::BTreeSet::new();
         for host in self.hosts() {
             if !seen.insert(host.addr.clone()) {
@@ -291,6 +317,31 @@ impl FleetConfig {
         }
         self.nccl_env()?;
         Ok(())
+    }
+
+    /// An empty host list is valid only where hosts can be inferred (srun
+    /// launch). Checked against the *effective* mode, which a `--launch`
+    /// override may change after `load`.
+    pub fn require_hosts_for(&self, mode: LaunchMode) -> Result<(), ConfigError> {
+        if self.hosts.is_empty() && mode != LaunchMode::Srun {
+            return Err(ConfigError::NoHosts { mode });
+        }
+        Ok(())
+    }
+
+    /// The same config over a resolved host list (srun launch: the
+    /// allocation, or the configured subset of it). Revalidated, so the
+    /// result upholds every `validate` invariant, plus a non-empty fleet.
+    pub fn with_hosts(&self, hosts: Vec<HostConfig>) -> Result<Self, ConfigError> {
+        let mut config = self.clone();
+        config.hosts = hosts.into_iter().map(HostEntry::Full).collect();
+        if config.hosts.is_empty() {
+            return Err(ConfigError::NoHosts {
+                mode: config.launch.mode,
+            });
+        }
+        config.validate_for(LaunchMode::Srun)?;
+        Ok(config)
     }
 
     /// Hosts normalized to full `HostConfig` form.
