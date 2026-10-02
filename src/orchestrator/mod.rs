@@ -21,6 +21,7 @@ pub mod collect;
 pub mod deploy;
 mod intranode;
 mod nccl;
+mod nccl_shim;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -242,7 +243,15 @@ pub async fn run(args: RunArgs) -> Result<()> {
         "fleet ready"
     );
 
-    let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
+    // The libnccl shim lives under remote_dir, which (node-local by
+    // default) can lose it on reboot while the agent is re-uploaded; runs
+    // that use NCCL rebuild it here instead of relying on a past bootstrap.
+    let mut inventories: BTreeMap<String, InventorySnapshot> = if nccl_shim::phases_use_nccl(phases)
+    {
+        nccl_shim::ensure_fleet_shims(&sessions, config.ssh.max_concurrent).await
+    } else {
+        BTreeMap::new()
+    };
     // Error-counter baselines, taken once before the first load phase; the
     // matching delta pass runs after the last load phase of the last repeat.
     let mut counter_baselines: BTreeMap<String, CounterSnapshot> = BTreeMap::new();
