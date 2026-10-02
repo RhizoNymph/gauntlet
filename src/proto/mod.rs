@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::nccl_level::NcclLevel;
+use crate::nccl_transport::NcclTransportReport;
+
 mod occupancy;
 mod ranks;
 
@@ -53,7 +56,13 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-pub const PROTO_VERSION: u32 = 10;
+// v11: per-level NCCL env and transport capture — `NcclWorkload::Barrier`
+// (the barrier-skew probe in its own world, when the barrier level's env
+// differs from the fleet level's) and the `nccl_transport` event (the
+// network/peer transports NCCL used, parsed from its INFO log, or why
+// unknown). The per-level env and NCCL debug-log variables travel on the
+// spawn command line, never on the wire.
+pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -150,6 +159,13 @@ pub enum AgentEvent {
     CounterDeltas {
         deltas: Box<CounterDeltas>,
     },
+    /// The transports NCCL used for the communicator this process hosted
+    /// (or why they are unknown), parsed from NCCL's INFO log after the
+    /// workload ran. One per NCCL-hosting process; forwarded to the
+    /// collector as is.
+    NcclTransport {
+        report: Box<NcclTransportReport>,
+    },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
         message: String,
@@ -177,6 +193,19 @@ impl Phase {
         Phase::Network,
         Phase::Overlap,
     ];
+
+    /// The NCCL level of the communicator an `agent run` of this phase
+    /// hosts, if any. The orchestrator spawns such a process under that
+    /// level's env, and the agent records its transport under it — one
+    /// source of truth for both sides. The orchestrator sends exactly one
+    /// phase per `agent run`, so a process never hosts two levels.
+    pub fn nccl_level(self) -> Option<NcclLevel> {
+        match self {
+            Phase::Network => Some(NcclLevel::Intranode),
+            Phase::Overlap => Some(NcclLevel::OverlapIntranode),
+            Phase::Inventory | Phase::CpuMem | Phase::Gpu => None,
+        }
+    }
 
     pub fn parse(s: &str) -> Option<Phase> {
         match s {
@@ -746,6 +775,22 @@ pub enum NcclWorkload {
     /// all-reduce under GEMM load on every local GPU; every rank reports
     /// an `OverlapFleetReport`.
     Overlap(OverlapSpec),
+    /// The barrier-skew probe on its own communicator: used instead of
+    /// `Sweep { barrier }` when the barrier level's NCCL env differs from
+    /// the fleet level's, so the probe runs under its own env.
+    Barrier(BarrierSpec),
+}
+
+impl NcclWorkload {
+    /// The NCCL level this workload's communicator belongs to (a sweep
+    /// carrying the barrier probe is still the fleet communicator).
+    pub fn level(&self) -> NcclLevel {
+        match self {
+            NcclWorkload::Sweep { .. } => NcclLevel::Fleet,
+            NcclWorkload::Overlap(_) => NcclLevel::OverlapFleet,
+            NcclWorkload::Barrier(_) => NcclLevel::Barrier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

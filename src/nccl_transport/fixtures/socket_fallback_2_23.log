@@ -1,0 +1,21 @@
+bdx-0412:4410:4410 [0] NCCL INFO Bootstrap : Using bond0:10.20.4.12<0>
+bdx-0412:4410:4410 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so. Using internal network plugin.
+bdx-0412:4410:4410 [0] NCCL INFO cudaDriverVersion 12060
+NCCL version 2.23.4+cuda12.6
+bdx-0412:4410:4410 [0] NCCL INFO NCCL version 2.23.4+cuda12.6
+bdx-0412:4410:4467 [0] NCCL INFO NCCL_IB_HCA set to mlx5_9
+bdx-0412:4410:4467 [0] NCCL WARN NET/IB : No device found.
+bdx-0412:4410:4467 [0] NCCL INFO NET/IB : No device found.
+bdx-0412:4410:4467 [0] NCCL INFO NCCL_SOCKET_IFNAME set by environment to bond0
+bdx-0412:4410:4467 [0] NCCL INFO NET/Socket : Using [0]bond0:10.20.4.12<0>
+bdx-0412:4410:4467 [0] NCCL INFO Using network Socket
+bdx-0412:4410:4467 [0] NCCL INFO ncclCommInitRankConfig comm 0x55aa10c0 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 18000 commId 0x6b1f0e2d - Init START
+bdx-0412:4410:4467 [0] NCCL INFO comm 0x55aa10c0 rank 0 nRanks 16 nNodes 2 localRanks 8 localRank 0 MNNVL 0
+bdx-0412:4410:4467 [0] NCCL INFO Channel 00/0 : 15[7] -> 0[0] [receive] via NET/Socket/0
+bdx-0412:4410:4467 [0] NCCL INFO Channel 01/0 : 15[7] -> 0[0] [receive] via NET/Socket/0
+bdx-0412:4410:4467 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM
+bdx-0412:4410:4467 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/CUMEM
+bdx-0412:4410:4474 [7] NCCL INFO Channel 00/0 : 7[7] -> 8[0] [send] via NET/Socket/0
+bdx-0412:4410:4474 [7] NCCL INFO Channel 01/0 : 7[7] -> 8[0] [send] via NET/Socket/0
+bdx-0412:4410:4467 [0] NCCL INFO Connected all rings
+bdx-0412:4410:4467 [0] NCCL INFO ncclCommInitRankConfig comm 0x55aa10c0 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 18000 commId 0x6b1f0e2d - Init COMPLETE

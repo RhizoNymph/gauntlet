@@ -199,9 +199,11 @@ pub mod imp {
 
     use super::fleet_overlap::{OverlapBuffers, overlap_fleet};
     use super::local::{PreparedRanks, nccl_error};
-    use super::sweep::{SweepBuffers, run_sweep};
+    use super::sweep::{BarrierBuffers, SweepBuffers, run_barrier, run_sweep};
     use super::watchdog::{CascadeAbort, exit_cascade};
     use crate::agent::EventSink;
+    use crate::agent::transport::CaptureWindow;
+    use crate::nccl_transport::CommSpan;
     use crate::proto::{AgentEvent, NcclDirective, NcclWorkload};
 
     pub use super::local::{decode_id, encode_id};
@@ -258,6 +260,9 @@ pub mod imp {
             }
         };
 
+        // Before the first NCCL call: resolve this process's NCCL debug log
+        // and clear any previous file there.
+        let capture = CaptureWindow::open();
         // Stage 1, no NCCL: device check, contexts, binds, buffers. The
         // lead finishes it before minting the id, so a lead that cannot
         // run never recruits the followers.
@@ -269,39 +274,55 @@ pub mod imp {
             NcclWorkload::Overlap(spec) => {
                 Buffers::Overlap(OverlapBuffers::alloc(&prepared, spec)?)
             }
-        };
-        let id = match rendezvous {
-            Rendezvous::Join(id) => id,
-            Rendezvous::Mint => {
-                let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
-                sink.emit(&AgentEvent::NcclId {
-                    unique_id_b64: encode_id(&id),
-                });
-                id
+            NcclWorkload::Barrier(spec) => {
+                Buffers::Barrier(BarrierBuffers::alloc(&prepared, spec)?)
             }
         };
-        // Stage 2: grouped communicator init.
-        let ranks = prepared.connect(id)?;
-        match (workload, buffers) {
-            (
-                NcclWorkload::Sweep {
-                    sizes,
-                    iters_per_size,
-                    barrier,
-                },
-                Buffers::Sweep(buffers),
-            ) => run_sweep(sink, &ranks, buffers, sizes, *iters_per_size, *barrier),
-            (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
-                overlap_fleet(sink, &ranks, buffers, spec)
+        // From the first NCCL call on, every exit path — id mint failure,
+        // communicator init failure, workload error, success — emits the
+        // transport report exactly once (`CaptureWindow::run`), then the
+        // outcome propagates. A failed init is exactly when the diagnosis
+        // matters (wrong NCCL_IB_HCA / GID index), and NCCL has logged its
+        // network selection by then.
+        let span = CommSpan::from_world(assignment.block().count(), assignment.world_size());
+        capture.run(sink, workload.level(), span, || {
+            let id = match rendezvous {
+                Rendezvous::Join(id) => id,
+                Rendezvous::Mint => {
+                    let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
+                    sink.emit(&AgentEvent::NcclId {
+                        unique_id_b64: encode_id(&id),
+                    });
+                    id
+                }
+            };
+            // Stage 2: grouped communicator init.
+            let ranks = prepared.connect(id)?;
+            match (workload, buffers) {
+                (
+                    NcclWorkload::Sweep {
+                        sizes,
+                        iters_per_size,
+                        barrier,
+                    },
+                    Buffers::Sweep(buffers),
+                ) => run_sweep(sink, &ranks, buffers, sizes, *iters_per_size, *barrier),
+                (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
+                    overlap_fleet(sink, &ranks, buffers, spec)
+                }
+                (NcclWorkload::Barrier(spec), Buffers::Barrier(buffers)) => {
+                    run_barrier(sink, &ranks, buffers, *spec)
+                }
+                _ => bail!("workload buffers do not match the workload"),
             }
-            _ => bail!("workload buffers do not match the workload"),
-        }
+        })
     }
 
     /// The workload's buffers, allocated in stage 1.
     enum Buffers {
         Sweep(SweepBuffers),
         Overlap(OverlapBuffers),
+        Barrier(BarrierBuffers),
     }
 }
 

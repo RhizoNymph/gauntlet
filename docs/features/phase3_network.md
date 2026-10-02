@@ -154,6 +154,21 @@ Some knobs have no effect here:
 Other knobs do act on intra-node paths: NCCL_P2P_LEVEL, NCCL_ALGO,
 NCCL_PROTO and NCCL_DEBUG.
 
+Since proto v11 the sweep's process runs under the `intranode` level's
+effective env (`[nccl.levels.intranode]` layered over `[nccl] env`), so a
+knob such as NCCL_ALGO=Ring can be forced on the NVLink sweep alone
+without touching the fleet levels. The orchestrator picks it through
+`Phase::Network.nccl_level()` when it spawns the network-phase `agent
+run`.
+
+### Transport record
+After the sweep loop the agent parses NCCL's INFO log and emits an
+`NcclTransport` event (level `intranode`, span single host): the network
+NCCL initialized and, more usefully here, how many peer connections ran
+over P2P, SHM or NET. A NET count on an intra-node communicator means
+P2P/SHM were unavailable or disabled. A single-host communicator is never
+flagged for its network transport. See docs/features/nccl_transport.md.
+
 ### Calibration link classes
 `report/intranode.rs`: per (host, repeat), `msg_bytes` and `elapsed_us`
 are joined by emission order and bucketed by that run's `ranks` value;
@@ -275,6 +290,31 @@ invisible). Real training runs one rank per GPU; so does this.
   recorded as a structured host error against the sender (a broken
   agent, whichever step) — never misattributed, and a duplicate no
   longer voids the whole barrier analysis.
+
+## Per-level env and transport (proto v11 / schema v13)
+
+- The fleet sweep's processes run under the `fleet` level env, the fleet
+  overlap step's under `overlap_fleet` (`NcclWorkload::level`, read by
+  `NcclJob::spawn_env`). Setting `[nccl.levels.fleet] env = {
+  NCCL_P2P_DISABLE = 1, NCCL_SHM_DISABLE = 1 }` pushes every hop of the
+  rank-per-GPU world through the NICs (the cheap approximation of a
+  pure-IB mode) without affecting the intra-node levels.
+- The NCCL barrier probe rides the sweep's communicator only when the
+  `barrier` and `fleet` effective envs are identical. Otherwise
+  `nccl_sweep` runs the sweep without it and then a second job,
+  `NcclWorkload::Barrier(spec)`, on a fresh communicator with the same
+  rank layout under the `barrier` env (`orchestrator/nccl/barrier_job.rs`).
+  Its timings feed the same skew analysis and `nccl_barrier` metrics. That
+  second job runs only after a clean sweep; when the sweep blamed a host,
+  every member records `nccl_barrier` Skipped naming it.
+- Every `agent nccl` process that reached its first NCCL call emits one
+  `NcclTransport` report for its communicator, whether the id mint, init
+  or workload succeeded or failed; span is `MultiHost` when the world is
+  larger than the host's rank block. A multi-host communicator on NCCL's
+  socket transport, on a host whose inventory shows an ACTIVE IB/RoCE
+  port and with IB not disabled by the level env, becomes
+  `fleet.socket_fallbacks` (verdict Stragglers); an Ethernet-only fleet
+  on sockets is not flagged. Details: docs/features/nccl_transport.md.
 
 ## Management vs data plane
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth

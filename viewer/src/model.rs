@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use gauntlet::analysis::fit::FitBound;
 use gauntlet::analysis::stats;
 use gauntlet::proto::{Scope, TestOutcome, Unit};
+use gauntlet::report::nccl_env::LevelEnvMap;
 use gauntlet::report::{
     Aggregates, NodeRoofline, RunResults, Verdict, aggregate_metrics, scope_label,
     test_display_name, verdict,
@@ -125,6 +126,10 @@ pub struct ViewModel {
     /// runs), `Some(empty)` = untuned. Diff mode compares it against the
     /// baseline's.
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// Effective NCCL env per level: `None` = not recorded (pre-v13
+    /// runs). The overview lists levels that differ from `nccl_env`; diff
+    /// mode compares it against the baseline's.
+    pub nccl_level_env: Option<LevelEnvMap>,
     /// `RunResults.schema_version` of the run: diffs across versions
     /// compare metrics whose meaning may have changed.
     pub schema_version: u32,
@@ -316,6 +321,7 @@ impl ViewModel {
             run_id: results.run_id.clone(),
             debug_build: results.debug_build,
             nccl_env: results.nccl_env.clone(),
+            nccl_level_env: results.nccl_level_env.clone(),
             schema_version: results.schema_version,
             wall_secs: results
                 .finished_epoch_secs

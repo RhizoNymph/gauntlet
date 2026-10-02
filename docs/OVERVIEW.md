@@ -56,7 +56,13 @@ Overview:
     The resolved `[nccl]` env (validated NCCL_* map) is set on the remote
     `env ... gauntlet agent ...` command line of every agent spawn — never
     on the wire, never via set_var in the agent — and recorded run-level
-    in RunResults.nccl_env.
+    in RunResults.nccl_env. A process hosting an NCCL communicator gets
+    its level's effective env instead (global <- `[nccl.levels.<level>]`,
+    recorded in RunResults.nccl_level_env) plus NCCL debug-log variables
+    the config does not set; after its workload the agent parses that
+    NCCL INFO log and emits an `nccl_transport` event (network transport,
+    plugin, HCAs, peer channels) -> hosts.*.nccl_transports ->
+    fleet.socket_fallbacks.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -194,9 +200,38 @@ Features Index:
       without the multi-threaded agent mutating its environment. Recorded
       run-level in `RunResults.nccl_env`; the viewer's diff mode lists
       drift against the baseline.
-    entry_points: [nccl_env.rs, config.rs, orchestrator/session.rs, report/nccl_env.rs]
+      Per-level overrides (proto v11 / schema v13): `[nccl.levels.<level>]
+      env` layers onto the global map for one NCCL call site (NcclLevel:
+      intranode, fleet, barrier, overlap_intranode, overlap_fleet; mapped
+      from Phase::nccl_level / NcclWorkload::level). Each level has its own
+      agent process (one phase per `agent run`; the barrier probe moves to
+      its own communicator when its env differs from the fleet's), so the
+      orchestrator starts each with its level's env (`AgentEnv::Nccl`).
+      Effective envs recorded in `RunResults.nccl_level_env`; per-level
+      drift in the viewer.
+    entry_points: [nccl_env.rs, nccl_level.rs, config.rs, orchestrator/session.rs, orchestrator/nccl/mod.rs, report/nccl_env.rs]
     depends_on: [phase3_network, overlap_phase]
     doc: docs/features/nccl_env.md
+  nccl_transport:
+    description: >
+      Transport capture (proto v11 / schema v13): NCCL-hosting processes
+      are started with NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,NET and a
+      per-host/level NCCL_DEBUG_FILE (never overriding config values; a
+      config NCCL_DEBUG below INFO, or a subsys mask without INIT, adds
+      nothing and records "unknown"). The agent clears the log path before
+      NCCL starts and, on every exit after its first NCCL call (init
+      failures included), parses the log (pure parser, NCCL 2.18-2.30
+      fixtures) into one `nccl_transport` event: network transport
+      (IB/RoCE ports, socket interfaces, net plugin), peer channel counts
+      (P2P/SHM/NET/GDR/COLLNET), NCCL version. A multi-host communicator on
+      TCP sockets, on a host whose inventory shows an ACTIVE IB/RoCE port,
+      without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env, is a
+      `fleet.socket_fallbacks` finding (verdict Stragglers); Ethernet-only
+      hosts are never flagged. The table shows a "nccl transports"
+      section.
+    entry_points: [nccl_transport/, agent/transport.rs, orchestrator/session.rs, report/nccl_transport.rs]
+    depends_on: [nccl_env, phase3_network, overlap_phase]
+    doc: docs/features/nccl_transport.md
   overlap_phase:
     description: >
       Combined-load straggler tests, run last. Node-local step: sustained
@@ -244,7 +279,7 @@ Features Index:
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
     entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport]
     doc: docs/features/reporting.md
   viewer:
     description: >

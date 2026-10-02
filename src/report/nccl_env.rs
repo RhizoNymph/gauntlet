@@ -7,8 +7,18 @@
 //! could never disagree. What *can* change is the tuning between runs,
 //! which is exactly what makes two runs' NCCL numbers incomparable — hence
 //! the drift view.
+//!
+//! Per-level effective envs (`RunResults.nccl_level_env`, schema v13) get
+//! the same treatment: the table lists every level whose env differs from
+//! the global one, and the drift view lists per-level changes that the
+//! global drift does not already explain.
 
 use std::collections::BTreeMap;
+
+use crate::nccl_level::NcclLevel;
+
+/// Effective env per level, as recorded in `RunResults.nccl_level_env`.
+pub type LevelEnvMap = BTreeMap<NcclLevel, BTreeMap<String, String>>;
 
 /// One key's difference between a baseline run's NCCL env and the current
 /// run's.
@@ -57,6 +67,55 @@ pub fn nccl_env_drift(
     current: Option<&BTreeMap<String, String>>,
 ) -> Option<Vec<NcclEnvChange>> {
     Some(env_drift(baseline?, current?))
+}
+
+/// Per-level drift: for every level whose effective env changed between
+/// the runs, the changes not already listed in `global_drift` (a changed
+/// global key shows up once, globally, not once per level). Levels without
+/// remaining changes are omitted, so `Some(empty)` means no level-specific
+/// drift. `None` when either run did not record per-level envs (pre-v13).
+pub fn nccl_level_env_drift(
+    baseline: Option<&LevelEnvMap>,
+    current: Option<&LevelEnvMap>,
+    global_drift: &[NcclEnvChange],
+) -> Option<BTreeMap<NcclLevel, Vec<NcclEnvChange>>> {
+    let (baseline, current) = (baseline?, current?);
+    let empty = BTreeMap::new();
+    let mut levels: Vec<NcclLevel> = baseline.keys().chain(current.keys()).copied().collect();
+    levels.sort();
+    levels.dedup();
+    Some(
+        levels
+            .into_iter()
+            .filter_map(|level| {
+                let changes: Vec<NcclEnvChange> = env_drift(
+                    baseline.get(&level).unwrap_or(&empty),
+                    current.get(&level).unwrap_or(&empty),
+                )
+                .into_iter()
+                .filter(|change| !global_drift.contains(change))
+                .collect();
+                (!changes.is_empty()).then_some((level, changes))
+            })
+            .collect(),
+    )
+}
+
+/// Levels whose effective env differs from the global env, with that
+/// effective env rendered by `format_nccl_env`, in level order. Empty when
+/// no level has an override (or nothing was recorded).
+pub fn format_level_overrides(
+    global: Option<&BTreeMap<String, String>>,
+    levels: Option<&LevelEnvMap>,
+) -> Vec<(NcclLevel, String)> {
+    let (Some(global), Some(levels)) = (global, levels) else {
+        return Vec::new();
+    };
+    levels
+        .iter()
+        .filter(|(_, env)| *env != global)
+        .map(|(level, env)| (*level, format_nccl_env(Some(env))))
+        .collect()
 }
 
 fn env_drift(
@@ -187,6 +246,96 @@ mod tests {
                 value: "bond0".into()
             }])
         );
+    }
+
+    fn levels(entries: &[(NcclLevel, &[(&str, &str)])]) -> LevelEnvMap {
+        entries
+            .iter()
+            .map(|(level, pairs)| (*level, env(pairs)))
+            .collect()
+    }
+
+    #[test]
+    fn level_drift_omits_unchanged_levels_and_global_changes() {
+        let baseline = levels(&[
+            (
+                NcclLevel::Intranode,
+                &[("NCCL_ALGO", "Ring"), ("NCCL_DEBUG", "WARN")],
+            ),
+            (NcclLevel::Fleet, &[("NCCL_DEBUG", "WARN")]),
+            (NcclLevel::Barrier, &[("NCCL_DEBUG", "WARN")]),
+        ]);
+        let current = levels(&[
+            (
+                NcclLevel::Intranode,
+                &[("NCCL_ALGO", "Tree"), ("NCCL_DEBUG", "INFO")],
+            ),
+            (
+                NcclLevel::Fleet,
+                &[("NCCL_DEBUG", "INFO"), ("NCCL_P2P_DISABLE", "1")],
+            ),
+            (NcclLevel::Barrier, &[("NCCL_DEBUG", "INFO")]),
+        ]);
+        // NCCL_DEBUG changed globally: reported there, not per level.
+        let global = nccl_env_drift(
+            Some(&env(&[("NCCL_DEBUG", "WARN")])),
+            Some(&env(&[("NCCL_DEBUG", "INFO")])),
+        )
+        .expect("recorded");
+        let drift =
+            nccl_level_env_drift(Some(&baseline), Some(&current), &global).expect("recorded");
+        assert_eq!(
+            drift,
+            BTreeMap::from([
+                (
+                    NcclLevel::Intranode,
+                    vec![NcclEnvChange::Changed {
+                        key: "NCCL_ALGO".into(),
+                        from: "Ring".into(),
+                        to: "Tree".into()
+                    }]
+                ),
+                (
+                    NcclLevel::Fleet,
+                    vec![NcclEnvChange::Added {
+                        key: "NCCL_P2P_DISABLE".into(),
+                        value: "1".into()
+                    }]
+                ),
+            ])
+        );
+        assert_eq!(
+            nccl_level_env_drift(Some(&baseline), Some(&baseline), &[]),
+            Some(BTreeMap::new())
+        );
+    }
+
+    #[test]
+    fn level_drift_needs_both_runs_recorded() {
+        let recorded = levels(&[(NcclLevel::Fleet, &[("NCCL_ALGO", "Ring")])]);
+        assert_eq!(nccl_level_env_drift(None, Some(&recorded), &[]), None);
+        assert_eq!(nccl_level_env_drift(Some(&recorded), None, &[]), None);
+    }
+
+    #[test]
+    fn only_levels_that_differ_from_the_global_env_are_listed() {
+        let global = env(&[("NCCL_DEBUG", "WARN")]);
+        let recorded = levels(&[
+            (
+                NcclLevel::Intranode,
+                &[("NCCL_ALGO", "Ring"), ("NCCL_DEBUG", "WARN")],
+            ),
+            (NcclLevel::Fleet, &[("NCCL_DEBUG", "WARN")]),
+        ]);
+        assert_eq!(
+            format_level_overrides(Some(&global), Some(&recorded)),
+            vec![(
+                NcclLevel::Intranode,
+                "NCCL_ALGO=Ring NCCL_DEBUG=WARN".to_string()
+            )]
+        );
+        assert!(format_level_overrides(None, Some(&recorded)).is_empty());
+        assert!(format_level_overrides(Some(&global), None).is_empty());
     }
 
     #[test]

@@ -1,0 +1,29 @@
+node0:2186543:2186543 [0] NCCL INFO Bootstrap : Using bond0:10.1.1.10<0>
+node0:2186543:2186543 [0] NCCL INFO NET/Plugin : Plugin load (libnccl-net.so) returned 2 : libnccl-net.so: cannot open shared object file: No such file or directory
+node0:2186543:2186543 [0] NCCL INFO NET/Plugin : No plugin found, using internal implementation
+node0:2186543:2186543 [0] NCCL INFO cudaDriverVersion 12020
+NCCL version 2.18.5+cuda12.2
+node0:2186543:2186543 [0] NCCL INFO NCCL version 2.18.5+cuda12.2
+node0:2186543:2186598 [0] NCCL INFO NCCL_IB_HCA set to mlx5_0,mlx5_1
+node0:2186543:2186598 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB ; OOB bond0:10.1.1.10<0>
+node0:2186543:2186598 [0] NCCL INFO Using network IB
+node0:2186543:2186598 [0] NCCL INFO comm 0x55d4c8a0e2b0 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 18000 commId 0x9f1c2b3a4d5e6f70 - Init START
+node0:2186543:2186599 [1] NCCL INFO comm 0x55d4c8a1f3c0 rank 1 nranks 8 cudaDev 1 nvmlDev 1 busId 2a000 commId 0x9f1c2b3a4d5e6f70 - Init START
+node0:2186543:2186598 [0] NCCL INFO Setting affinity for GPU 0 to ffff,ffffffff
+node0:2186543:2186598 [0] NCCL INFO Channel 00/02 :    0   1   2   3   4   5   6   7
+node0:2186543:2186598 [0] NCCL INFO Channel 01/02 :    0   1   2   3   4   5   6   7
+node0:2186543:2186598 [0] NCCL INFO Trees [0] 1/4/-1->0->-1 [1] 1/-1/-1->0->4
+node0:2186543:2186598 [0] NCCL INFO P2P Chunksize set to 131072
+node0:2186543:2186598 [0] NCCL INFO Channel 00/0 : 7[7] -> 0[0] [receive] via NET/IB/0/GDRDMA
+node0:2186543:2186598 [0] NCCL INFO Channel 01/0 : 7[7] -> 0[0] [receive] via NET/IB/1/GDRDMA
+node0:2186543:2186598 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/IPC/read
+node0:2186543:2186598 [0] NCCL INFO Channel 01/0 : 0[0] -> 1[1] via P2P/IPC/read
+node0:2186543:2186599 [1] NCCL INFO Channel 00/0 : 1[1] -> 2[2] via P2P/IPC/read
+node0:2186543:2186599 [1] NCCL INFO Channel 01/0 : 1[1] -> 2[2] via P2P/IPC/read
+node0:2186543:2186601 [3] NCCL INFO Channel 00/0 : 3[3] -> 4[0] [send] via NET/IB/0/GDRDMA
+node0:2186543:2186601 [3] NCCL INFO Channel 01/0 : 3[3] -> 4[0] [send] via NET/IB/1/GDRDMA
+node0:2186543:2186598 [0] NCCL INFO Connected all rings
+node0:2186543:2186598 [0] NCCL INFO Connected all trees
+node0:2186543:2186598 [0] NCCL INFO threadThresholds 8/8/64 | 64/8/64 | 512 | 512
+node0:2186543:2186598 [0] NCCL INFO 2 coll channels, 0 nvls channels, 2 p2p channels, 2 p2p channels per peer
+node0:2186543:2186598 [0] NCCL INFO comm 0x55d4c8a0e2b0 rank 0 nranks 8 cudaDev 0 nvmlDev 0 busId 18000 commId 0x9f1c2b3a4d5e6f70 - Init COMPLETE

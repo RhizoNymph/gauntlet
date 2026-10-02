@@ -62,6 +62,12 @@ connected fleet graph plus a quantitative metric table.
   `gauntlet::report::nccl_env::nccl_env_drift`). The overview shows the
   run's env. Drift is context for NCCL deltas, never a node regression.
   If either run predates the field (`nccl_env: None`), no drift is shown.
+  Per-level drift (schema v13 `nccl_level_env`): `DiffView.
+  nccl_level_env_drift` lists, per NCCL level, the changes the global
+  drift does not already show, rendered as `[level] change` lines under
+  the same chip; `None` when either run predates v13. The overview adds
+  `nccl env [level]: ...` for every level whose env differs from the
+  global one (`ViewModel.nccl_level_env`).
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report
@@ -119,7 +125,8 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
   baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
   improved flag) plus node/edge regression severities and capped issue
   lists, a `Comparability` verdict (same schema or not, with the chip
-  text), and `nccl_env_drift` (NCCL tuning differences vs the baseline).
+  text), `nccl_env_drift` (NCCL tuning differences vs the baseline) and
+  `nccl_level_env_drift` (per-level differences beyond the global ones).
   `higher_is_better(unit)` is the direction-of-goodness oracle.
   `ViewModel.schema_version` carries each run's schema.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`

@@ -66,4 +66,26 @@ gpu_idle_max_used_mib = 1024
 # (no LD_PRELOAD etc.). Values are strings, integers or booleans
 # (true/false -> 1/0), non-empty and single-line. Set NCCL_SOCKET_IFNAME
 # here or via socket_ifname, not both.
-# env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_IB_GID_INDEX = 3, NCCL_DEBUG = "WARN" }
+# env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_IB_GID_INDEX = 3 }
+#
+# Transport capture: every NCCL-hosting agent process is also started with
+# NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,NET and
+# NCCL_DEBUG_FILE=<remote_dir>/nccl-logs/<level>.%h.log, and the run records
+# which transport each communicator used (IB/RoCE ports, socket interfaces,
+# net plugin, P2P/SHM/NET peer channels). A multi-host communicator on TCP
+# sockets is flagged only on hosts with an ACTIVE IB/RoCE port (an
+# Ethernet-only fleet is fine) and unless that level sets
+# NCCL_IB_DISABLE=1 or NCCL_NET=Socket. Debug variables set here are never
+# overridden; an NCCL_DEBUG below INFO, or an NCCL_DEBUG_SUBSYS without
+# INIT, turns capture off (recorded as unknown).
+
+# Per-level overrides, layered on top of [nccl] env for one NCCL call site
+# only (same key/value rules). Levels: intranode (intra-node sweep), fleet
+# (fleet sweep), barrier (NCCL barrier-skew probe), overlap_intranode
+# (node-local overlap step), overlap_fleet (fleet overlap step). When the
+# barrier's effective env differs from the fleet's, the probe runs on its
+# own communicator instead of riding the fleet sweep's.
+# [nccl.levels.intranode]
+# env = { NCCL_ALGO = "Ring" }                          # force Ring on NVLink only
+# [nccl.levels.fleet]
+# env = { NCCL_P2P_DISABLE = 1, NCCL_SHM_DISABLE = 1 }  # push every hop through the NICs
