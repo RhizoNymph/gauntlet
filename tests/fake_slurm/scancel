@@ -1,0 +1,22 @@
+#!/bin/sh
+# Fake scancel: `scancel --signal=SIG <job>.<step>` signals the fake step's
+# task (its pid is the step id).
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+printf '%s\n' "$*" >> "$state/scancel.log"
+
+signal=TERM
+target=""
+for arg in "$@"; do
+    case "$arg" in
+        --signal=*) signal=${arg#--signal=} ;;
+        -*) ;;
+        *) target=$arg ;;
+    esac
+done
+case "$target" in
+    "$job".*) step=${target#"$job".} ;;
+    *) echo "scancel: invalid job step id $target" >&2; exit 1 ;;
+esac
+kill -s "$signal" "$step"

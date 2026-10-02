@@ -1,0 +1,29 @@
+#!/bin/sh
+# Fake sbcast: every fake "node" shares this machine's filesystem, so one
+# copy is the broadcast. Refuses to overwrite without --force, like sbcast.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+printf '%s\n' "$*" >> "$state/sbcast.log"
+
+force=0
+jobid=""
+source=""
+dest=""
+for arg in "$@"; do
+    case "$arg" in
+        --force|-f) force=1 ;;
+        --jobid=*) jobid=${arg#--jobid=} ;;
+        -*) ;;
+        *) if [ -z "$source" ]; then source=$arg; else dest=$arg; fi ;;
+    esac
+done
+if [ "$jobid" != "$job" ]; then
+    echo "sbcast: invalid job id $jobid" >&2
+    exit 1
+fi
+if [ -e "$dest" ] && [ "$force" != 1 ]; then
+    echo "sbcast: $dest exists" >&2
+    exit 1
+fi
+cp "$source" "$dest"

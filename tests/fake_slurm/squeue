@@ -1,0 +1,28 @@
+#!/bin/sh
+# Fake squeue: lists the live steps the fake srun registered, in the
+# `--format=%i|%j` shape (`<job>.<step>|<name>`). Only `--steps` listings of
+# this job are supported.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+printf '%s\n' "$*" >> "$state/squeue.log"
+
+steps=0
+jobs=""
+for arg in "$@"; do
+    case "$arg" in
+        --steps) steps=1 ;;
+        --jobs=*) jobs=${arg#--jobs=} ;;
+    esac
+done
+if [ "$steps" != 1 ] || [ "$jobs" != "$job" ]; then
+    echo "squeue: fake supports only --steps --jobs=$job" >&2
+    exit 1
+fi
+for file in "$state"/steps/*; do
+    [ -e "$file" ] || continue
+    pid=${file##*/}
+    if kill -0 "$pid" 2>/dev/null; then
+        cat "$file"
+    fi
+done

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Fake scontrol: only `scontrol show hostnames <list>`, which prints the
+# fake allocation's nodes one per line (the list argument is just logged).
+root=$(cd "$(dirname "$0")/.." && pwd)
+printf '%s\n' "$*" >> "$root/state/scontrol.log"
+if [ "$1" != show ] || [ "$2" != hostnames ]; then
+    echo "scontrol: fake supports only show hostnames" >&2
+    exit 1
+fi
+cat "$root/nodes"

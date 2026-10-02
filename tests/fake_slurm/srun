@@ -1,0 +1,53 @@
+#!/bin/sh
+# Fake srun for the srun-launch integration tests: every invocation is one
+# "job step" run on this machine. It records its argv and the environment
+# the task would inherit, registers the step (job.step|name, step id = this
+# shell's pid, which the exec below hands to the task) for the fake squeue,
+# then execs the command so stdin/stdout/stderr pass straight through, as
+# srun's I/O forwarding does for a single task.
+#
+# State lives next to the shim: <root>/bin/srun, <root>/state/, <root>/nodes,
+# <root>/job_id.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+step=$$
+sep=$(printf '\037')
+
+# One write per record: concurrent steps append to the same logs.
+record=$(
+    printf 'step=%s' "$step"
+    for arg in "$@"; do printf '%s%s' "$sep" "$arg"; done
+)
+printf '%s\n' "$record" >> "$state/srun.log"
+
+record=$(
+    printf 'step=%s' "$step"
+    env | grep -E '^(NCCL_[A-Z0-9_]*|CUDA_VISIBLE_DEVICES|ROCR_VISIBLE_DEVICES|GPU_DEVICE_ORDINAL|LD_LIBRARY_PATH)=' \
+        | sort | while IFS= read -r line; do printf '%s%s' "$sep" "$line"; done
+)
+printf '%s\n' "$record" >> "$state/srun-env.log"
+
+name=""
+node=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --job-name=*) name=${1#--job-name=} ;;
+        --nodelist=*) node=${1#--nodelist=} ;;
+        -*) ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ $# -eq 0 ]; then
+    echo "srun: fatal: no command given" >&2
+    exit 2
+fi
+if ! grep -qx -- "$node" "$root/nodes"; then
+    echo "srun: error: Required node not available (down, drained or reserved): $node" >&2
+    exit 1
+fi
+
+mkdir -p "$state/steps"
+printf '%s.%s|%s\n' "$job" "$step" "$name" > "$state/steps/$step"
+exec "$@"
