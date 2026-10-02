@@ -1,10 +1,17 @@
 #!/bin/sh
 # Fake srun for the srun-launch integration tests: every invocation is one
-# "job step" run on this machine. It records its argv and the environment
-# the task would inherit, registers the step (job.step|name, step id = this
-# shell's pid, which the exec below hands to the task) for the fake squeue,
-# then execs the command so stdin/stdout/stderr pass straight through, as
-# srun's I/O forwarding does for a single task.
+# "job step" run on this machine, behaving like srun where gauntlet depends
+# on it:
+#  - argv and the srun *client* environment are recorded;
+#  - every --nodelist node must be in the fake allocation;
+#  - the step is registered for the fake squeue (<id>|<name>, its nodes,
+#    its task pid); the step id is this shell's pid, printed as
+#    <job>.<step>, or <array_id>.<step> when <root>/array_id exists;
+#  - the command runs as a child with stdin/stdout/stderr passed through
+#    (srun's I/O forwarding for one task);
+#  - SIGTERM makes it SIGKILL the task and exit 137, like srun's "forcing
+#    job termination"; an exit reports the task's status (128+signal for a
+#    signalled task).
 #
 # State lives next to the shim: <root>/bin/srun, <root>/state/, <root>/nodes,
 # <root>/job_id.
@@ -29,11 +36,11 @@ record=$(
 printf '%s\n' "$record" >> "$state/srun-env.log"
 
 name=""
-node=""
+nodes=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --job-name=*) name=${1#--job-name=} ;;
-        --nodelist=*) node=${1#--nodelist=} ;;
+        --nodelist=*) nodes=${1#--nodelist=} ;;
         -*) ;;
         *) break ;;
     esac
@@ -43,11 +50,39 @@ if [ $# -eq 0 ]; then
     echo "srun: fatal: no command given" >&2
     exit 2
 fi
-if ! grep -qx -- "$node" "$root/nodes"; then
-    echo "srun: error: Required node not available (down, drained or reserved): $node" >&2
-    exit 1
-fi
+for node in $(printf '%s' "$nodes" | tr ',' ' '); do
+    if ! grep -qx -- "$node" "$root/nodes"; then
+        echo "srun: error: Required node not available (down, drained or reserved): $node" >&2
+        exit 1
+    fi
+done
 
+id="$job.$step"
+if [ -f "$root/array_id" ]; then
+    id="$(cat "$root/array_id").$step"
+fi
 mkdir -p "$state/steps"
-printf '%s.%s|%s\n' "$job" "$step" "$name" > "$state/steps/$step"
-exec "$@"
+printf '%s\n' "$nodes" | tr ',' '\n' > "$state/steps/$step.nodes"
+printf '%s|%s\n' "$id" "$name" > "$state/steps/$step"
+
+# POSIX sh gives an asynchronous command /dev/null as stdin *before* its
+# redirections apply, so forward the real stdin through fd 3.
+exec 3<&0
+"$@" <&3 3<&- &
+task=$!
+exec 3<&-
+printf '%s\n' "$task" > "$state/steps/$step.task"
+
+cancelled=0
+trap 'cancelled=1; kill -KILL "$task" 2>/dev/null; printf "%s\n" "$step" >> "$state/cancelled.log"' TERM
+
+wait "$task"
+rc=$?
+while kill -0 "$task" 2>/dev/null; do
+    wait "$task"
+    rc=$?
+done
+if [ "$cancelled" = 1 ]; then
+    exit 137
+fi
+exit "$rc"

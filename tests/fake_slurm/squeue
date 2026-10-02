@@ -1,7 +1,8 @@
 #!/bin/sh
 # Fake squeue: lists the live steps the fake srun registered, in the
-# `--format=%i|%j` shape (`<job>.<step>|<name>`). Only `--steps` listings of
-# this job are supported.
+# `--format=%i|%j` shape (`<id>|<name>`). Only `--steps` listings of this
+# job (by its raw SLURM_JOB_ID) are supported. A step is live while its
+# task process is.
 root=$(cd "$(dirname "$0")/.." && pwd)
 state="$root/state"
 job=$(cat "$root/job_id")
@@ -20,9 +21,12 @@ if [ "$steps" != 1 ] || [ "$jobs" != "$job" ]; then
     exit 1
 fi
 for file in "$state"/steps/*; do
+    case "$file" in
+        *.task | *.nodes) continue ;;
+    esac
     [ -e "$file" ] || continue
-    pid=${file##*/}
-    if kill -0 "$pid" 2>/dev/null; then
+    task=$(cat "$file.task" 2>/dev/null) || continue
+    if kill -0 "$task" 2>/dev/null; then
         cat "$file"
     fi
 done

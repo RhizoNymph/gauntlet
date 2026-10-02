@@ -1,27 +1,29 @@
 //! srun launch mode, end to end on localhost against a fake Slurm.
 //!
 //! `tests/fake_slurm/{srun,squeue,scancel,sbcast,scontrol}` are small shell
-//! scripts installed into a temp dir per test. Each fake "node" is a
-//! distinct loopback address (127.0.0.x) on this machine: srun execs the
-//! real agent locally (stdio passed straight through, like srun's I/O
-//! forwarding for one task), registers the step for squeue/scancel, and
-//! records its argv and the task environment. The real `gauntlet` binary
-//! drives `run --launch srun` and `bootstrap` through them, so the whole
-//! path — allocation detection, nodelist expansion, sbcast deploy, the
-//! JSON-lines protocol over srun stdio, stdin directives, step kills — is
-//! exercised without Slurm.
+//! scripts installed into a temp dir per test. Fake nodes have Slurm
+//! NodeNames that do not resolve (`node-a` ...) and NodeAddrs on distinct
+//! loopback addresses (127.0.0.x): srun runs the real agent locally (stdio
+//! passed through, SIGTERM cancels the step like real srun), registers the
+//! step for squeue/scancel/sbcast, and records its argv and client
+//! environment. The real `gauntlet` binary drives `run --launch srun` and
+//! `bootstrap` through them, so the whole path — allocation detection,
+//! nodelist and NodeAddr resolution, scoped sbcast deploy, the JSON-lines
+//! protocol over srun stdio, stdin directives, step kills and cancellation
+//! of abandoned steps — is exercised without Slurm.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use gauntlet::config::HostConfig;
 use gauntlet::launch::{LaunchRecord, SlurmJobId, SrunConfig, SrunDir};
 use gauntlet::nccl_env::NcclEnv;
-use gauntlet::orchestrator::bootstrap::{BootstrapReport, CheckStatus};
+use gauntlet::orchestrator::bootstrap::{BootstrapReport, CheckStatus, HostReadiness};
+use gauntlet::orchestrator::session::HostSession;
 use gauntlet::orchestrator::transport::{Launcher, SlurmTools, SrunLauncher};
 use gauntlet::report::{RunResults, SCHEMA_VERSION};
 
@@ -38,12 +40,29 @@ const SEP: char = '\u{1f}';
 /// A value no shell, srun option parser or env transport may alter.
 const ADVERSARIAL: &str = "mlx5_0,mlx5_1 'q' \"d\" $HOME `id` $(touch /nonexistent/x) ;|&*~ \\b =x";
 
+/// The orchestrator's own library path, which srun must keep and the
+/// agent must get with the agent lib dir prepended.
+const ORCHESTRATOR_LD_PATH: &str = "/opt/module/cuda/lib64:/opt/slurm/lib";
+
+/// (NodeName, NodeAddr) of the fake allocation.
+const NODES: [(&str, &str); 3] = [
+    ("node-a", "127.0.0.1"),
+    ("node-b", "127.0.0.2"),
+    ("node-c", "127.0.0.3"),
+];
+
+fn node_names() -> Vec<&'static str> {
+    NODES.iter().map(|(name, _)| *name).collect()
+}
+
 struct FakeSlurm {
     root: PathBuf,
 }
 
 impl FakeSlurm {
-    fn new(tag: &str, nodes: &[&str]) -> Self {
+    /// A fake allocation of `nodes` (NodeName, NodeAddr); an empty address
+    /// means scontrol reports no NodeAddr for that node.
+    fn new(tag: &str, nodes: &[(&str, &str)]) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -61,10 +80,26 @@ impl FakeSlurm {
                 .expect("chmod shim");
         }
         std::fs::write(root.join("job_id"), JOB_ID.to_string()).expect("job id");
-        let mut list = nodes.join("\n");
-        list.push('\n');
-        std::fs::write(root.join("nodes"), list).expect("nodes");
+        let names: String = nodes.iter().map(|(name, _)| format!("{name}\n")).collect();
+        std::fs::write(root.join("nodes"), names).expect("nodes");
+        let addrs: String = nodes
+            .iter()
+            .filter(|(_, addr)| !addr.is_empty())
+            .map(|(name, addr)| format!("{name} {addr}\n"))
+            .collect();
+        std::fs::write(root.join("node_addrs"), addrs).expect("node addrs");
         Self { root }
+    }
+
+    /// Nodes on which sbcast transfers fail.
+    fn mark_bad(&self, nodes: &[&str]) {
+        let list: String = nodes.iter().map(|node| format!("{node}\n")).collect();
+        std::fs::write(self.root.join("bad_nodes"), list).expect("bad nodes");
+    }
+
+    /// Make squeue print step ids in array-task form, `<array_id>.<step>`.
+    fn as_array_task(&self, array_id: &str) {
+        std::fs::write(self.root.join("array_id"), array_id).expect("array id");
     }
 
     fn bin(&self) -> PathBuf {
@@ -85,9 +120,32 @@ impl FakeSlurm {
         parse_records(&self.log("srun.log"))
     }
 
-    /// step id -> the selected env entries the task inherited.
+    /// step id -> the selected env entries of the srun client process.
     fn srun_envs(&self) -> BTreeMap<String, Vec<String>> {
         parse_records(&self.log("srun-env.log"))
+    }
+
+    /// Nodes a step was launched on.
+    fn step_nodes(&self, step: &str) -> Vec<String> {
+        std::fs::read_to_string(self.root.join("state/steps").join(format!("{step}.nodes")))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether a step's task process is still alive.
+    fn step_alive(&self, step: &str) -> bool {
+        let Ok(task) =
+            std::fs::read_to_string(self.root.join("state/steps").join(format!("{step}.task")))
+        else {
+            return false;
+        };
+        Command::new("kill")
+            .args(["-0", task.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 
     fn write_config(&self, body: &str) -> PathBuf {
@@ -98,7 +156,8 @@ impl FakeSlurm {
 
     /// `gauntlet <args>` inside the fake allocation: shims first on PATH,
     /// SLURM_JOB_ID / SLURM_JOB_NODELIST set, plus orchestrator-side
-    /// variables that must never reach an agent.
+    /// variables that must never reach an agent and a library path srun
+    /// must keep.
     fn gauntlet(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_gauntlet"));
         let path = format!(
@@ -111,16 +170,46 @@ impl FakeSlurm {
             .current_dir(&self.root)
             .env("PATH", path)
             .env("SLURM_JOB_ID", JOB_ID.to_string())
-            .env("SLURM_JOB_NODELIST", "fake[1-3]")
+            .env("SLURM_JOB_NODELIST", "node-[a-c]")
             .env("CUDA_VISIBLE_DEVICES", "orchestrator-only")
             .env("NCCL_STRAY_FROM_SHELL", "1")
+            .env("LD_LIBRARY_PATH", ORCHESTRATOR_LD_PATH)
             .env("RUST_LOG", "info");
         command
+    }
+
+    /// An in-process launcher over the shims (transport-level tests).
+    fn launcher(&self) -> Launcher {
+        let srun = SrunLauncher::new(
+            SlurmJobId::new(JOB_ID),
+            SrunConfig::default(),
+            SrunDir::parse(self.node_dir().to_str().expect("utf8")).expect("dir"),
+            Vec::new(),
+            None,
+            SlurmTools::in_dir(&self.bin()),
+        );
+        Launcher::Srun(Arc::new(srun))
+    }
+
+    fn install_agent(&self) {
+        let bin = self.node_dir().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        std::fs::copy(env!("CARGO_BIN_EXE_gauntlet"), bin.join("gauntlet-agent")).expect("copy");
     }
 }
 
 impl Drop for FakeSlurm {
     fn drop(&mut self) {
+        // No fake step may outlive its test.
+        for (step, _) in self.srun_calls() {
+            if self.step_alive(&step)
+                && let Ok(task) = std::fs::read_to_string(
+                    self.root.join("state/steps").join(format!("{step}.task")),
+                )
+            {
+                let _ = Command::new("kill").args(["-KILL", task.trim()]).status();
+            }
+        }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -185,17 +274,6 @@ fn output_within(command: &mut Command, deadline: Duration, slurm: &FakeSlurm) -
         std::thread::sleep(Duration::from_millis(100));
     };
     let Some(status) = status else {
-        // Kill whatever fake steps are still alive so the readers finish.
-        for step in std::fs::read_dir(slurm.root.join("state/steps"))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(step.file_name())
-                .status();
-        }
         let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned();
         panic!(
             "gauntlet did not finish within {deadline:?}\n--- stderr\n{stderr}\n--- srun.log\n{}\n--- squeue.log\n{}",
@@ -226,13 +304,42 @@ fn value_of<'a>(args: &'a [String], option: &str) -> Option<&'a str> {
     })
 }
 
-const NODES: [&str; 3] = ["127.0.0.1", "127.0.0.2", "127.0.0.3"];
+fn bootstrap_report(slurm: &FakeSlurm, config: &str) -> (Output, BootstrapReport) {
+    let output = output_within(
+        &mut slurm.gauntlet(&["bootstrap", "--json", "--config", config]),
+        Duration::from_secs(300),
+        slurm,
+    );
+    let report: BootstrapReport = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", show(&output)));
+    (output, report)
+}
+
+fn check<'a>(
+    row: &'a HostReadiness,
+    name: &str,
+) -> &'a gauntlet::orchestrator::bootstrap::ReadinessCheck {
+    row.checks
+        .iter()
+        .find(|check| check.name == name)
+        .unwrap_or_else(|| panic!("{}: no {name} check: {:?}", row.host, row.checks))
+}
+
+fn host(addr: &str) -> HostConfig {
+    HostConfig {
+        addr: addr.into(),
+        data_addr: None,
+        labels: Default::default(),
+    }
+}
 
 /// `gauntlet run --launch srun` with no hosts configured: the fleet is the
-/// allocation, the agent arrives by sbcast, the inventory and network
+/// allocation (NodeNames as step targets, NodeAddrs for peer traffic), the
+/// agent arrives by one step-scoped sbcast, the inventory and network
 /// phases (event streams, stdin task specs, pairwise peers, the TCP
-/// barrier) all run through srun steps, and every step carries exactly
-/// the configured NCCL env.
+/// barrier) all run through srun steps, every step carries exactly the
+/// configured NCCL env, and srun itself keeps the orchestrator's library
+/// path while the agent gets the agent lib dir prepended to it.
 #[test]
 fn run_over_srun_infers_hosts_and_runs_phases_end_to_end() {
     let slurm = FakeSlurm::new("run", &NODES);
@@ -282,7 +389,6 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
         show(&output)
     );
 
-    // Results: the allocation's nodes, all healthy, launch recorded.
     // (An orchestrator error also exits 1, so the document must exist.)
     let text = std::fs::read_to_string(&out)
         .unwrap_or_else(|error| panic!("no results ({error}):\n{}", show(&output)));
@@ -294,8 +400,15 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
             job_id: SlurmJobId::new(JOB_ID)
         })
     );
+    // Hosts are keyed by NodeName; their pairwise peers were reached at
+    // NodeAddr (the names do not resolve, so any metric proves it).
     let hosts: BTreeSet<&str> = results.hosts.keys().map(String::as_str).collect();
-    assert_eq!(hosts, NODES.into_iter().collect(), "{}", show(&output));
+    assert_eq!(
+        hosts,
+        node_names().into_iter().collect(),
+        "{}",
+        show(&output)
+    );
     for (host, observations) in &results.hosts {
         assert!(
             observations.errors.is_empty(),
@@ -323,23 +436,25 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
     let table = String::from_utf8_lossy(&output.stdout);
     assert!(table.contains("launch: srun (slurm job 4242)"), "{table}");
 
-    // Hosts came from `scontrol show hostnames $SLURM_JOB_NODELIST`.
-    assert_eq!(slurm.log("scontrol.log").trim(), "show hostnames fake[1-3]");
+    // Hosts and addresses: one scontrol call each.
+    assert_eq!(
+        slurm.log("scontrol.log").lines().collect::<Vec<_>>(),
+        [
+            "show hostnames node-[a-c]",
+            "--oneliner show node node-[a-c]"
+        ]
+    );
 
-    // Every step: managed flags, defaults plus extra flags, one node of
-    // the allocation, and a gauntlet step name.
     let calls = slurm.srun_calls();
-    assert!(calls.len() >= 9, "too few steps: {calls:?}");
+    let envs = slurm.srun_envs();
     let agent = format!("{}/bin/gauntlet-agent", dir.display());
-    let mut agent_steps = Vec::new();
+    let mut agent_steps = 0;
     for (step, args) in &calls {
         for flag in [
             "--overlap",
             "--cpu-bind=none",
             "--kill-on-bad-exit=1",
             "--mpi=none",
-            "--nodes=1",
-            "--ntasks=1",
             "--export=ALL",
         ] {
             assert!(
@@ -347,87 +462,105 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
                 "{step}: {flag} missing in {args:?}"
             );
         }
-        let node = value_of(args, "--nodelist").expect("nodelist");
-        assert!(NODES.contains(&node), "{step}: {node}");
         let name = value_of(args, "--job-name").expect("job name");
-        assert!(name.starts_with("gauntlet"), "{step}: {name}");
+        let nodes = value_of(args, "--nodelist").expect("nodelist");
         let command = args
             .iter()
             .position(|arg| !arg.starts_with('-'))
             .expect("command word");
-        if args[command] == agent {
-            assert_eq!(args[command + 1], "agent", "{args:?}");
-            assert!(
-                name.starts_with(&format!("gauntlet:{node}:")),
-                "{name} vs {node}"
+        if name.starts_with("gauntlet-bcast:") {
+            // The broadcast carrier spans exactly the stale nodes.
+            assert_eq!(nodes, "node-a,node-b,node-c", "{args:?}");
+            assert_eq!(args[command], "sleep");
+            continue;
+        }
+        assert!(node_names().contains(&nodes), "{step}: {nodes}");
+        assert!(args.iter().any(|arg| arg == "--nodes=1"), "{args:?}");
+        assert!(args.iter().any(|arg| arg == "--ntasks=1"), "{args:?}");
+        let env = envs.get(step).expect("env record");
+        if name.starts_with(&format!("gauntlet:{nodes}:agent ")) {
+            agent_steps += 1;
+            // env LD_LIBRARY_PATH=<lib>:<orchestrator's> <agent> agent ...
+            assert_eq!(
+                &args[command..command + 4],
+                [
+                    "env".to_string(),
+                    format!(
+                        "LD_LIBRARY_PATH={}/lib:{ORCHESTRATOR_LD_PATH}",
+                        dir.display()
+                    ),
+                    agent.clone(),
+                    "agent".to_string(),
+                ],
+                "{args:?}"
             );
-            agent_steps.push(step.clone());
+            // srun's own environment: the orchestrator's library path, the
+            // resolved NCCL env byte for byte, and nothing stray.
+            assert_eq!(
+                env,
+                &vec![
+                    format!("LD_LIBRARY_PATH={ORCHESTRATOR_LD_PATH}"),
+                    "NCCL_DEBUG=WARN".to_string(),
+                    "NCCL_SOCKET_IFNAME=lo".to_string(),
+                    format!("NCCL_TEST_VALUE={ADVERSARIAL}"),
+                ],
+                "step {step}"
+            );
         } else {
+            assert_eq!(name, format!("gauntlet:{nodes}:exec"));
             assert_eq!(&args[command..command + 2], ["sh", "-c"], "{args:?}");
+            assert_eq!(
+                env,
+                &vec![format!("LD_LIBRARY_PATH={ORCHESTRATOR_LD_PATH}")]
+            );
         }
     }
     // inventory + counters + pairs + barrier on every node, at least.
-    assert!(agent_steps.len() >= 9, "{agent_steps:?}");
+    assert!(agent_steps >= 9, "{agent_steps}");
 
-    // The agent environment: exactly LD_LIBRARY_PATH and the resolved
-    // NCCL env, values byte for byte; the orchestrator's GPU visibility
-    // and stray NCCL_* never leak in.
-    let envs = slurm.srun_envs();
-    for step in &agent_steps {
-        let env = envs.get(step).expect("env record");
-        assert_eq!(
-            env,
-            &vec![
-                format!("LD_LIBRARY_PATH={}/lib", dir.display()),
-                "NCCL_DEBUG=WARN".to_string(),
-                "NCCL_SOCKET_IFNAME=lo".to_string(),
-                format!("NCCL_TEST_VALUE={ADVERSARIAL}"),
-            ],
-            "step {step}"
-        );
-    }
-
-    // One sbcast for the whole allocation, to a job-unique staging file
+    // One sbcast, scoped to the carrier step, to a job-unique staging file
     // that is cleaned up after the per-node installs.
     let sbcast = slurm.log("sbcast.log");
     let lines: Vec<&str> = sbcast.lines().collect();
     assert_eq!(lines.len(), 1, "{sbcast}");
-    let staging_prefix = format!("{}.sbcast-{JOB_ID}-", dir.display());
     assert!(
-        lines[0].starts_with(&format!("--force --jobid={JOB_ID} ")),
+        lines[0].starts_with(&format!("--force --jobid={JOB_ID}.")),
         "{sbcast}"
     );
+    let staging_prefix = format!("{}.sbcast-{JOB_ID}-", dir.display());
     assert!(lines[0].contains(&staging_prefix), "{sbcast}");
-    let staging = lines[0]
-        .rsplit_once(' ')
-        .map(|(_, dest)| dest)
-        .expect("dest");
-    assert!(!Path::new(staging).exists(), "staging file left behind");
+    assert!(staging_files(&slurm).is_empty(), "staging file left behind");
     assert!(Path::new(&agent).exists());
 
-    // Every peer teardown looks its step up by name.
+    // Every squeue call lists this job's steps.
+    let squeue = slurm.log("squeue.log");
+    assert!(!squeue.is_empty());
     assert!(
-        slurm
-            .log("squeue.log")
+        squeue
             .lines()
             .all(|line| line == format!("--noheader --steps --jobs={JOB_ID} --format=%i|%j")),
-        "{}",
-        slurm.log("squeue.log")
+        "{squeue}"
     );
-    assert!(!slurm.log("squeue.log").is_empty());
+    // No step outlived the run.
+    for step in calls.keys() {
+        assert!(!slurm.step_alive(step), "step {step} still running");
+    }
 }
 
-/// `gauntlet bootstrap` in srun mode (config `mode = "srun"`): configured
-/// hosts are a checked subset of the allocation in config order, the
-/// connectivity column names the job, deploy goes through sbcast, and a
-/// second bootstrap uploads nothing.
+/// `gauntlet bootstrap` in srun mode: configured hosts are a checked subset
+/// of the allocation in config order; a broken node *outside* the subset
+/// never fails the deploy (the broadcast is scoped to the stale fleet
+/// nodes); connectivity names the job; a second bootstrap uploads nothing.
 #[test]
-fn bootstrap_over_srun_reports_srun_checks_and_is_idempotent() {
-    let slurm = FakeSlurm::new("bootstrap", &NODES);
+fn bootstrap_over_srun_scopes_the_broadcast_and_is_idempotent() {
+    let mut nodes = NODES.to_vec();
+    nodes.push(("node-bad", "127.0.0.9"));
+    let slurm = FakeSlurm::new("bootstrap", &nodes);
+    slurm.mark_bad(&["node-bad"]);
     let dir = slurm.node_dir();
     let config = slurm.write_config(&format!(
         r#"
-hosts = ["127.0.0.3", "127.0.0.1"]
+hosts = ["node-c", "node-a"]
 
 [launch]
 mode = "srun"
@@ -438,75 +571,135 @@ dir = {dir}
         dir = toml_string(dir.to_str().expect("utf8")),
     ));
     let config = config.to_str().expect("utf8").to_string();
-    let bootstrap = || {
-        let output = slurm
-            .gauntlet(&["bootstrap", "--json", "--config", &config])
-            .output()
-            .expect("run bootstrap");
-        let report: BootstrapReport = serde_json::from_slice(&output.stdout)
-            .unwrap_or_else(|error| panic!("{error}: {}", show(&output)));
-        (output, report)
-    };
 
-    let (output, first) = bootstrap();
+    let (output, first) = bootstrap_report(&slurm, &config);
     let rows: Vec<&str> = first.hosts.iter().map(|row| row.host.as_str()).collect();
-    assert_eq!(rows, ["127.0.0.3", "127.0.0.1"], "{}", show(&output));
+    assert_eq!(rows, ["node-c", "node-a"], "{}", show(&output));
     for row in &first.hosts {
-        let check = |name: &str| {
-            row.checks
-                .iter()
-                .find(|check| check.name == name)
-                .unwrap_or_else(|| panic!("{}: no {name} check: {:?}", row.host, row.checks))
-        };
-        assert_eq!(check("connectivity").status, CheckStatus::Ok);
+        assert_eq!(check(row, "connectivity").status, CheckStatus::Ok);
         assert!(
-            check("connectivity")
+            check(row, "connectivity")
                 .detail
                 .starts_with(&format!("srun step in job {JOB_ID}: ")),
             "{:?}",
-            check("connectivity")
+            check(row, "connectivity")
         );
-        assert_eq!(check("arch").status, CheckStatus::Ok);
-        assert_eq!(check("deploy").status, CheckStatus::Ok, "{:?}", row.checks);
-        assert_eq!(check("deploy").detail, "installed via sbcast");
-        assert_eq!(check("probe").status, CheckStatus::Ok, "{:?}", row.checks);
+        assert_eq!(check(row, "arch").status, CheckStatus::Ok);
+        assert_eq!(
+            check(row, "deploy").status,
+            CheckStatus::Ok,
+            "{:?}",
+            row.checks
+        );
+        assert_eq!(check(row, "deploy").detail, "installed via sbcast");
+        assert_eq!(
+            check(row, "probe").status,
+            CheckStatus::Ok,
+            "{:?}",
+            row.checks
+        );
         assert!(row.inventory.is_some());
     }
-    // Only the configured nodes got steps.
-    let nodes: BTreeSet<String> = slurm
+    // One sbcast, targeting the carrier step on exactly the fleet nodes.
+    let sbcast = slurm.log("sbcast.log");
+    assert_eq!(sbcast.lines().count(), 1, "{sbcast}");
+    let step = sbcast
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(&format!("--jobid={JOB_ID}.")))
+        .expect("step-scoped jobid");
+    assert_eq!(slurm.step_nodes(step), ["node-c", "node-a"]);
+    // Only the configured nodes ever got steps.
+    let targeted: BTreeSet<String> = slurm
         .srun_calls()
         .values()
         .filter_map(|args| value_of(args, "--nodelist").map(str::to_string))
+        .flat_map(|list| list.split(',').map(str::to_string).collect::<Vec<_>>())
         .collect();
     assert_eq!(
-        nodes,
-        ["127.0.0.1", "127.0.0.3"]
-            .map(String::from)
-            .into_iter()
-            .collect()
+        targeted,
+        ["node-a", "node-c"].map(String::from).into_iter().collect()
     );
 
-    let (output, second) = bootstrap();
+    let (output, second) = bootstrap_report(&slurm, &config);
     for row in &second.hosts {
-        let deploy = row
-            .checks
-            .iter()
-            .find(|check| check.name == "deploy")
-            .unwrap_or_else(|| panic!("{}", show(&output)));
-        assert_eq!(deploy.detail, "up to date");
+        assert_eq!(
+            check(row, "deploy").detail,
+            "up to date",
+            "{}",
+            show(&output)
+        );
     }
     assert_eq!(slurm.log("sbcast.log").lines().count(), 1);
+}
+
+/// A broken node *inside* the fleet fails only its own deploy: the fleet
+/// broadcast fails, deploy falls back to one sbcast per node, and the
+/// staging file is cleaned up from every targeted node anyway.
+#[test]
+fn one_bad_fleet_node_fails_only_its_own_deploy() {
+    let mut nodes = NODES.to_vec();
+    nodes.push(("node-bad", "127.0.0.9"));
+    let slurm = FakeSlurm::new("badnode", &nodes);
+    slurm.mark_bad(&["node-bad"]);
+    let dir = slurm.node_dir();
+    let config = slurm.write_config(&format!(
+        "hosts = [\"node-a\", \"node-bad\", \"node-b\"]\n[launch]\nmode = \"srun\"\n[launch.srun]\ndir = {}\n",
+        toml_string(dir.to_str().expect("utf8")),
+    ));
+    let (output, report) = bootstrap_report(&slurm, config.to_str().expect("utf8"));
+    let deploy: Vec<(&str, CheckStatus)> = report
+        .hosts
+        .iter()
+        .map(|row| (row.host.as_str(), check(row, "deploy").status))
+        .collect();
+    assert_eq!(
+        deploy,
+        [
+            ("node-a", CheckStatus::Ok),
+            ("node-bad", CheckStatus::Fail),
+            ("node-b", CheckStatus::Ok),
+        ],
+        "{}",
+        show(&output)
+    );
+    let bad = &report.hosts[1];
+    let detail = &check(bad, "deploy").detail;
+    assert!(
+        detail.contains("sbcast") && detail.contains("node-bad"),
+        "{detail}"
+    );
+    // The fleet attempt, then one per node.
+    assert_eq!(
+        slurm.log("sbcast.log").lines().count(),
+        4,
+        "{}",
+        slurm.log("sbcast.log")
+    );
+    assert!(staging_files(&slurm).is_empty(), "staging left behind");
+}
+
+/// sbcast staging files (siblings of the agent dir) currently on disk.
+fn staging_files(slurm: &FakeSlurm) -> Vec<PathBuf> {
+    let prefix = format!("{}.sbcast-", slurm.node_dir().display());
+    std::fs::read_dir(&slurm.root)
+        .expect("root")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.to_string_lossy().starts_with(prefix.as_str()))
+        .collect()
 }
 
 #[test]
 fn srun_mode_outside_an_allocation_is_a_clear_error() {
     let slurm = FakeSlurm::new("noalloc", &NODES);
     let config = slurm.write_config("[launch]\nmode = \"srun\"\n");
-    let output = slurm
-        .gauntlet(&["run", "--config", config.to_str().expect("utf8")])
-        .env_remove("SLURM_JOB_ID")
-        .output()
-        .expect("run gauntlet");
+    let output = output_within(
+        slurm
+            .gauntlet(&["run", "--config", config.to_str().expect("utf8")])
+            .env_remove("SLURM_JOB_ID"),
+        Duration::from_secs(60),
+        &slurm,
+    );
     assert!(!output.status.success(), "{}", show(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("SLURM_JOB_ID is not set"), "{stderr}");
@@ -517,17 +710,18 @@ fn srun_mode_outside_an_allocation_is_a_clear_error() {
 #[test]
 fn configured_hosts_outside_the_allocation_are_rejected() {
     let slurm = FakeSlurm::new("outside", &NODES);
-    let config = slurm.write_config("hosts = [\"127.0.0.1\", \"elsewhere\"]\n");
-    let output = slurm
-        .gauntlet(&[
+    let config = slurm.write_config("hosts = [\"node-a\", \"elsewhere\"]\n");
+    let output = output_within(
+        &mut slurm.gauntlet(&[
             "bootstrap",
             "--launch",
             "srun",
             "--config",
             config.to_str().expect("utf8"),
-        ])
-        .output()
-        .expect("run gauntlet");
+        ]),
+        Duration::from_secs(60),
+        &slurm,
+    );
     assert!(!output.status.success(), "{}", show(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("elsewhere"), "{stderr}");
@@ -540,73 +734,55 @@ fn ssh_mode_still_requires_hosts() {
     let slurm = FakeSlurm::new("nohosts", &NODES);
     let config = slurm.write_config("[launch]\nmode = \"srun\"\n");
     // The config is valid for srun; overriding to ssh leaves no hosts.
-    let output = slurm
-        .gauntlet(&[
+    let output = output_within(
+        &mut slurm.gauntlet(&[
             "run",
             "--launch",
             "ssh",
             "--config",
             config.to_str().expect("utf8"),
-        ])
-        .output()
-        .expect("run gauntlet");
+        ]),
+        Duration::from_secs(60),
+        &slurm,
+    );
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no hosts configured"), "{stderr}");
 }
 
 // ---------------------------------------------------------------------------
-// Transport-level: the kill paths the NCCL early-abort and peer teardown use
+// Transport-level: kills, batching, and abandoned steps
 // ---------------------------------------------------------------------------
 
-fn launcher(slurm: &FakeSlurm) -> Launcher {
-    let srun = SrunLauncher::new(
-        SlurmJobId::new(JOB_ID),
-        SrunConfig::default(),
-        SrunDir::parse(slurm.node_dir().to_str().expect("utf8")).expect("dir"),
-        Vec::new(),
-        SlurmTools::in_dir(&slurm.bin()),
-    );
-    Launcher::Srun(Arc::new(srun))
+async fn connect(launcher: &Launcher, addr: &str) -> Arc<HostSession> {
+    Arc::new(
+        launcher
+            .connect(host(addr), &NcclEnv::default())
+            .await
+            .unwrap_or_else(|error| panic!("connect {addr}: {error:#}")),
+    )
 }
 
-fn install_agent(slurm: &FakeSlurm) {
-    let bin = slurm.node_dir().join("bin");
-    std::fs::create_dir_all(&bin).expect("bin");
-    std::fs::copy(env!("CARGO_BIN_EXE_gauntlet"), bin.join("gauntlet-agent")).expect("copy");
+/// The steps named `name`, by step id.
+fn steps_named(slurm: &FakeSlurm, name: &str) -> Vec<String> {
+    slurm
+        .srun_calls()
+        .into_iter()
+        .filter(|(_, args)| value_of(args, "--job-name") == Some(name))
+        .map(|(step, _)| step)
+        .collect()
 }
 
 /// The peer-teardown backstop: a background agent step is found by name
 /// and SIGKILLed with scancel; a matching command on another node is left
-/// alone.
+/// alone. srun reports the killed task as exit 128 + 9.
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_cancels_only_the_named_step_on_that_node() {
     let slurm = FakeSlurm::new("kill", &NODES);
-    let launcher = launcher(&slurm);
-    let env = NcclEnv::default();
-    let first = launcher
-        .connect(
-            gauntlet::config::HostConfig {
-                addr: "127.0.0.1".into(),
-                data_addr: None,
-                labels: Default::default(),
-            },
-            &env,
-        )
-        .await
-        .expect("connect first");
-    let second = launcher
-        .connect(
-            gauntlet::config::HostConfig {
-                addr: "127.0.0.2".into(),
-                data_addr: None,
-                labels: Default::default(),
-            },
-            &env,
-        )
-        .await
-        .expect("connect second");
-    install_agent(&slurm);
+    let launcher = slurm.launcher();
+    let first = connect(&launcher, "node-a").await;
+    let second = connect(&launcher, "node-b").await;
+    slurm.install_agent();
 
     let port = port_base(1).to_string();
     let other_port = (port_base(1) + 1).to_string();
@@ -629,7 +805,7 @@ async fn kill_cancels_only_the_named_step_on_that_node() {
         .await
         .expect("step must end after scancel")
         .expect("wait");
-    assert_eq!(status.signal(), Some(9), "{status:?}");
+    assert_eq!(status.code(), Some(137), "{status:?}");
     let scancel = slurm.log("scancel.log");
     assert_eq!(scancel.lines().count(), 1, "{scancel}");
     assert!(
@@ -644,7 +820,112 @@ async fn kill_cancels_only_the_named_step_on_that_node() {
         .await
         .expect("second step ends")
         .expect("wait");
-    assert_eq!(status.signal(), Some(9));
+    assert_eq!(status.code(), Some(137));
+}
+
+/// In an `sbatch --array` job squeue prints `<array_job>_<task>.<step>`
+/// while SLURM_JOB_ID is the task's raw id: the kill must scancel the id
+/// exactly as printed (the fake scancel rejects the raw form).
+#[tokio::test(flavor = "multi_thread")]
+async fn kill_cancels_array_task_steps_by_their_printed_id() {
+    let slurm = FakeSlurm::new("array", &NODES);
+    slurm.as_array_task("1237_3");
+    let launcher = slurm.launcher();
+    let session = connect(&launcher, "node-c").await;
+    slurm.install_agent();
+    let port = port_base(4).to_string();
+    let child = session
+        .spawn_agent(&["peer", "serve", "--port", &port])
+        .await
+        .expect("spawn");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    session.kill_agent("peer serve").await;
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("array-task step cancelled")
+        .expect("wait");
+    assert_eq!(status.code(), Some(137));
+    let scancel = slurm.log("scancel.log");
+    assert!(scancel.starts_with("--signal=KILL 1237_3."), "{scancel}");
+}
+
+/// The fleet kill (the NCCL early-abort path): one squeue listing and one
+/// scancel cover every host.
+#[tokio::test(flavor = "multi_thread")]
+async fn fleet_kill_lists_once_and_cancels_every_host_in_one_scancel() {
+    let slurm = FakeSlurm::new("fleetkill", &NODES);
+    let launcher = slurm.launcher();
+    let mut sessions = Vec::new();
+    for name in node_names() {
+        sessions.push(connect(&launcher, name).await);
+    }
+    slurm.install_agent();
+    let mut children = Vec::new();
+    for (index, session) in sessions.iter().enumerate() {
+        let port = (port_base(5) + index as u16).to_string();
+        children.push(
+            session
+                .spawn_agent(&["peer", "serve", "--port", &port])
+                .await
+                .expect("spawn"),
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let squeue_before = slurm.log("squeue.log").lines().count();
+
+    HostSession::kill_agents(&sessions, "peer serve").await;
+
+    for child in children {
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("every step cancelled")
+            .expect("wait");
+        assert_eq!(status.code(), Some(137));
+    }
+    assert_eq!(slurm.log("squeue.log").lines().count(), squeue_before + 1);
+    let scancel = slurm.log("scancel.log");
+    let lines: Vec<&str> = scancel.lines().collect();
+    assert_eq!(lines.len(), 1, "{scancel}");
+    assert_eq!(
+        lines[0].split_whitespace().count(),
+        1 + NODES.len(),
+        "{scancel}"
+    );
+}
+
+/// Concurrent single-host kills (every host of a world hitting the same
+/// phase timeout) are batched into one listing and one scancel too.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_kills_are_batched() {
+    let slurm = FakeSlurm::new("batch", &NODES);
+    let launcher = slurm.launcher();
+    let a = connect(&launcher, "node-a").await;
+    let b = connect(&launcher, "node-b").await;
+    slurm.install_agent();
+    let port_a = port_base(6).to_string();
+    let port_b = (port_base(6) + 1).to_string();
+    let child_a = a
+        .spawn_agent(&["peer", "serve", "--port", &port_a])
+        .await
+        .expect("a");
+    let child_b = b
+        .spawn_agent(&["peer", "serve", "--port", &port_b])
+        .await
+        .expect("b");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let squeue_before = slurm.log("squeue.log").lines().count();
+
+    tokio::join!(a.kill_agent("peer serve"), b.kill_agent("peer serve"));
+
+    for child in [child_a, child_b] {
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("cancelled")
+            .expect("wait");
+        assert_eq!(status.code(), Some(137));
+    }
+    assert_eq!(slurm.log("squeue.log").lines().count(), squeue_before + 1);
+    assert_eq!(slurm.log("scancel.log").lines().count(), 1);
 }
 
 /// The NCCL early-abort shape: an agent blocked mid-run (a barrier
@@ -654,21 +935,9 @@ async fn kill_cancels_only_the_named_step_on_that_node() {
 #[tokio::test(flavor = "multi_thread")]
 async fn kill_aborts_an_agent_blocked_mid_run() {
     let slurm = FakeSlurm::new("abort", &NODES);
-    let launcher = launcher(&slurm);
-    let session = Arc::new(
-        launcher
-            .connect(
-                gauntlet::config::HostConfig {
-                    addr: "127.0.0.3".into(),
-                    data_addr: None,
-                    labels: Default::default(),
-                },
-                &NcclEnv::default(),
-            )
-            .await
-            .expect("connect"),
-    );
-    install_agent(&slurm);
+    let launcher = slurm.launcher();
+    let session = connect(&launcher, "node-c").await;
+    slurm.install_agent();
 
     let port = port_base(2).to_string();
     let running = tokio::spawn({
@@ -697,5 +966,41 @@ async fn kill_aborts_an_agent_blocked_mid_run() {
         .expect("join")
         .expect("run");
     assert!(!output.success());
-    assert_eq!(output.status.signal(), Some(9));
+    assert_eq!(output.status.code(), Some(137));
+}
+
+/// A shell step that hangs past its caller's timeout is cancelled, not
+/// orphaned: dropping the future SIGTERMs srun, which kills the task.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_exec_step_abandoned_by_a_timeout_is_cancelled() {
+    let slurm = FakeSlurm::new("exectimeout", &NODES);
+    let launcher = slurm.launcher();
+    let session = connect(&launcher, "node-b").await;
+    let before: BTreeSet<String> = steps_named(&slurm, "gauntlet:node-b:exec")
+        .into_iter()
+        .collect();
+
+    let abandoned =
+        tokio::time::timeout(Duration::from_secs(1), session.exec_capture("sleep 60")).await;
+    assert!(
+        abandoned.is_err(),
+        "the exec must still be running at the timeout"
+    );
+
+    let hung: Vec<String> = steps_named(&slurm, "gauntlet:node-b:exec")
+        .into_iter()
+        .filter(|step| !before.contains(step))
+        .collect();
+    assert_eq!(hung.len(), 1, "{hung:?}");
+    let step = &hung[0];
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while slurm.step_alive(step) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!slurm.step_alive(step), "abandoned exec step still running");
+    assert!(
+        slurm.log("cancelled.log").lines().any(|line| line == step),
+        "srun was not told to cancel step {step}: {}",
+        slurm.log("cancelled.log")
+    );
 }
