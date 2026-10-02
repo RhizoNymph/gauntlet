@@ -172,8 +172,8 @@ impl PartialWriter {
 pub async fn run(args: RunArgs) -> Result<()> {
     let config = FleetConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
-    let phases = config.resolve_phases(&args.phases)?;
-    let net_steps = config.resolve_net_steps(&args.net_steps)?;
+    let plan = config.run_plan(&args.phases, &args.net_steps)?;
+    let phases = plan.phases();
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
@@ -229,7 +229,9 @@ pub async fn run(args: RunArgs) -> Result<()> {
     info!(
         hosts = sessions.len(),
         phases = ?phases,
-        net_steps = ?net_steps.iter().map(NetStep::name).collect::<Vec<_>>(),
+        net_steps = ?plan
+            .net_steps()
+            .map(|steps| steps.iter().map(NetStep::name).collect::<Vec<_>>()),
         "fleet ready"
     );
 
@@ -243,7 +245,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if args.repeat > 1 {
             info!(repeat, of = args.repeat, "repeat start");
         }
-        for phase in &phases {
+        for phase in phases {
             // The inventory is a census, not a measurement.
             if *phase == Phase::Inventory && repeat > 0 {
                 continue;
@@ -275,11 +277,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Phase::Network => {
+                    // `run_plan` resolves a step set whenever the phase
+                    // list contains Network.
+                    let Some(net_steps) = plan.net_steps() else {
+                        bail!("network phase scheduled without a resolved step set");
+                    };
                     network_phase(
                         &config,
                         &sessions,
                         &mut inventories,
-                        &net_steps,
+                        net_steps,
                         args.sample_pairs,
                         &sink,
                     )

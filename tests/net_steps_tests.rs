@@ -68,16 +68,17 @@ fn unknown_and_empty_selections_are_rejected() {
         steps(&config, &["warp"]),
         Err(ConfigError::UnknownNetStep { .. })
     ));
-    assert!(matches!(
-        parse(
-            r#"
-            hosts = ["a"]
-            [tests]
-            net_steps = []
-            "#
-        ),
-        Err(ConfigError::NoNetSteps)
-    ));
+    // An empty config selection loads (bootstrap and non-network runs never
+    // look at it) but cannot be resolved for a network run.
+    let empty = parse(
+        r#"
+        hosts = ["a"]
+        [tests]
+        net_steps = []
+        "#,
+    )
+    .expect("empty net_steps loads");
+    assert!(matches!(steps(&empty, &[]), Err(ConfigError::NoNetSteps)));
     assert!(
         parse(
             r#"
@@ -210,4 +211,101 @@ fn cli_parses_comma_separated_net_steps() {
         panic!("expected run");
     };
     assert_eq!(args.net_steps, vec!["intranode", "nccl"]);
+}
+
+#[test]
+fn config_accepts_every_cli_spelling() {
+    // The example config advertises `tcp`; config and CLI share one table.
+    for (spelling, step) in NetStep::PARSE_TABLE {
+        let config = parse(&format!(
+            "hosts = [\"a\", \"b\"]\n[tests]\nnet_steps = [\"{spelling}\"]\n"
+        ))
+        .unwrap_or_else(|error| panic!("{spelling}: {error}"));
+        assert_eq!(config.tests.net_steps, vec![*step], "{spelling}");
+    }
+    let config = parse(
+        r#"
+        hosts = ["a", "b"]
+        [tests]
+        net_steps = ["tcp", "nccl"]
+        "#,
+    )
+    .expect("tcp alias in config");
+    assert_eq!(
+        steps(&config, &[]).expect("resolve"),
+        vec![NetStep::Pairwise, NetStep::Nccl]
+    );
+}
+
+#[test]
+fn config_rejects_unknown_step_names_with_the_accepted_list() {
+    let error = parse(
+        r#"
+        hosts = ["a"]
+        [tests]
+        net_steps = ["warp"]
+        "#,
+    )
+    .expect_err("unknown step");
+    let text = error.to_string();
+    assert!(text.contains("warp"), "{text}");
+    assert!(text.contains("pairwise (tcp)"), "{text}");
+}
+
+/// Config whose own selection resolves to nothing: `nccl_intranode = false`
+/// removes the only listed step.
+const SELF_EMPTYING: &str = r#"
+hosts = ["a", "b"]
+[tests]
+nccl_intranode = false
+net_steps = ["intranode"]
+"#;
+
+#[test]
+fn a_self_emptying_config_still_loads() {
+    // Rejecting it at load would also break `bootstrap`, which never runs
+    // the network phase.
+    parse(SELF_EMPTYING).expect("loads");
+}
+
+#[test]
+fn cli_net_steps_override_is_applied_before_validation() {
+    let config = parse(SELF_EMPTYING).expect("loads");
+    let plan = config
+        .run_plan(&["network".into()], &["nccl".into()])
+        .expect("--net-steps nccl rescues the empty config selection");
+    let steps: Vec<NetStep> = plan.net_steps().expect("network selected").iter().collect();
+    assert_eq!(steps, vec![NetStep::Nccl]);
+    // Without the override the network run is rejected.
+    assert!(matches!(
+        config.run_plan(&["network".into()], &[]),
+        Err(ConfigError::NoNetSteps)
+    ));
+}
+
+#[test]
+fn net_steps_are_not_validated_when_the_network_phase_is_not_selected() {
+    let config = parse(SELF_EMPTYING).expect("loads");
+    let plan = config.run_plan(&["gpu".into()], &[]).expect("gpu-only run");
+    assert_eq!(plan.phases(), &[gauntlet::proto::Phase::Gpu]);
+    assert!(plan.net_steps().is_none());
+    // Typos in --net-steps are still reported.
+    assert!(matches!(
+        config.run_plan(&["gpu".into()], &["warp".into()]),
+        Err(ConfigError::UnknownNetStep { .. })
+    ));
+}
+
+#[test]
+fn the_default_plan_carries_net_steps_because_network_is_a_default_phase() {
+    let config = parse(r#"hosts = ["a", "b"]"#).expect("config");
+    let plan = config.run_plan(&[], &[]).expect("plan");
+    assert!(plan.phases().contains(&gauntlet::proto::Phase::Network));
+    assert_eq!(
+        plan.net_steps()
+            .expect("network")
+            .iter()
+            .collect::<Vec<_>>(),
+        NetStep::ALL.to_vec()
+    );
 }
