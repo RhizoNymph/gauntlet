@@ -62,7 +62,6 @@ fn a_clean_run_is_clean_and_records_it() {
 fn every_failed_outcome_is_hard_evidence() {
     for test in [
         TestId::CpuCorrectness,
-        TestId::GpuIdle,
         TestId::GpuGemmSdc,
         TestId::CpuSdcHot,
         TestId::NcclAllReduce,
@@ -72,6 +71,22 @@ fn every_failed_outcome_is_hard_evidence() {
         fail(&mut results, test);
         assert_eq!(report::verdict(&results), Verdict::Failures, "{test:?}");
     }
+}
+
+#[test]
+fn a_busy_gpu_is_a_soft_finding() {
+    // Another tenant's process is environmental, not broken hardware.
+    let mut results = clean();
+    fail(&mut results, TestId::GpuIdle);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+    // ... and stays below host failures and hard evidence.
+    results
+        .fleet
+        .failed_hosts
+        .insert("n2".into(), vec!["timed out".into()]);
+    assert_eq!(report::verdict(&results), Verdict::HostFailures);
+    fail(&mut results, TestId::CpuCorrectness);
+    assert_eq!(report::verdict(&results), Verdict::Failures);
 }
 
 #[test]
@@ -159,19 +174,38 @@ fn informational_findings_leave_the_verdict_clean() {
 }
 
 #[test]
-fn precedence_is_host_failures_then_failures_then_outliers() {
+fn precedence_follows_the_exit_code() {
     let mut results = clean();
     results
         .fleet
         .outliers
         .insert("mem_bandwidth.triad".into(), vec![outlier()]);
-    fail(&mut results, TestId::CpuCorrectness);
-    assert_eq!(report::verdict(&results), Verdict::Failures);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
     results
         .fleet
         .failed_hosts
         .insert("n2".into(), vec!["timed out".into()]);
     assert_eq!(report::verdict(&results), Verdict::HostFailures);
+    // Hard evidence on a reachable host is not hidden by a dead one.
+    fail(&mut results, TestId::CpuCorrectness);
+    assert_eq!(report::verdict(&results), Verdict::Failures);
+
+    let mut counters_and_dead_host = clean();
+    counters_and_dead_host
+        .fleet
+        .failed_hosts
+        .insert("n2".into(), vec!["unreachable".into()]);
+    counters_and_dead_host.fleet.counter_findings.insert(
+        "n1".into(),
+        vec![CounterFinding {
+            domain: CounterDomain::GpuEcc,
+            device: "gpu0".into(),
+            counter: "uncorrected".into(),
+            before: 0,
+            after: 1,
+        }],
+    );
+    assert_eq!(report::verdict(&counters_and_dead_host), Verdict::Failures);
 }
 
 #[test]
@@ -182,10 +216,10 @@ fn build_records_the_verdict_it_would_exit_with() {
         .map(|host| (host.to_string(), HostObservations::default()))
         .collect();
     observations.get_mut("n2").expect("n2").outcomes.push((
-        TestId::GpuIdle,
+        TestId::GpuGemmCorrectness,
         Scope::Gpu { index: 0 },
         TestOutcome::Failed {
-            reason: "busy".into(),
+            reason: "residual too large".into(),
         },
     ));
     let results = report::build(&config, observations, 1, 2);

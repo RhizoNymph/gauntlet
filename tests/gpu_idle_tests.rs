@@ -181,7 +181,7 @@ fn threshold_boundary_on_the_derived_outcome() {
 fn a_busy_gpu_is_a_straggler_finding_not_a_host_failure() {
     let results = report::build(&config(""), fleet(vllm_busy()), 100, 110);
     assert!(results.fleet.failed_hosts.is_empty());
-    assert_eq!(report::verdict(&results), Verdict::Failures);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 
     let idle_results = report::build(&config(""), fleet(idle()), 100, 110);
     assert_eq!(report::verdict(&idle_results), Verdict::Clean);
