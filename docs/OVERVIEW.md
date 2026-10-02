@@ -84,14 +84,21 @@ Features Index:
       (`srun <flags> --nodes=1 --ntasks=1 --nodelist=<host>
       --job-name=gauntlet:<host>:<args> --export=ALL <agent> agent ...`;
       default flags --overlap, --cpu-bind=none, --kill-on-bad-exit=1,
-      typed and config-overridable). Hosts default to the allocation
-      (`scontrol show hostnames`, pure parser) or must be a subset of it;
-      no SLURM_JOB_ID is a typed error. Agent env via the srun process env
-      (orchestrator NCCL_* and GPU-visibility vars stripped). Deploy by one
-      sbcast to /tmp/gauntlet-$USER (or a shared path). Kill = squeue
-      lookup by step name + scancel --signal=KILL. Behind a transport enum
-      (Ssh | Srun) so nothing above HostSession changes.
-    entry_points: [launch/, orchestrator/transport/, orchestrator/session.rs, orchestrator/deploy.rs, config.rs, cli.rs]
+      typed and config-overridable; managed, stdio-changing and
+      signal-changing options rejected in every getopt spelling). Hosts
+      default to the allocation (`scontrol show hostnames`, pure parser)
+      or must be a subset of it, keyed by NodeName with NodeAddr (one
+      `scontrol --oneliner show node`) as data_addr; no SLURM_JOB_ID is a
+      typed error. NCCL env via the srun process env (orchestrator NCCL_*
+      and GPU-visibility vars stripped); `<dir>/lib` prepended to
+      LD_LIBRARY_PATH inside the step so srun keeps its own. Deploy by a
+      step-scoped sbcast (carrier step on the stale nodes, per-node
+      fallback) to /tmp/gauntlet-$USER (or a shared path), staging
+      cleaned everywhere. Every step named; kill = batched squeue lookup
+      + scancel --signal=KILL of the printed ids (array/het jobs work);
+      a dropped srun gets SIGTERM so it cancels its step. Behind a
+      transport enum (Ssh | Srun) so nothing above HostSession changes.
+    entry_points: [launch/, orchestrator/transport/, orchestrator/session.rs, orchestrator/deploy.rs, orchestrator/fanout.rs, config.rs, cli.rs]
     depends_on: [bootstrap, nccl_env, phase3_network]
     doc: docs/features/slurm_launch.md
   bootstrap:

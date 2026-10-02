@@ -17,9 +17,10 @@ in; srun mode needs no ssh at all).
    connect (`Launcher::connect`) → arch check (`uname -m` must equal
    orchestrator arch, else Fail), per host (`connect_host`); then deploy
    fleet-wide (`deploy::ensure_fleet` over the Ready sessions: sha256
-   compare, then per-host sftp upload over ssh, or one sbcast plus
-   per-node installs over srun — sbcast reaches every node at once, which
-   is why deploy is not a per-host step); then per host
+   compare, then per-host sftp upload over ssh, or one step-scoped sbcast
+   to the stale nodes (per-node fallback on failure) plus per-node
+   installs over srun — a broadcast covers many nodes at once, which is
+   why deploy is not a per-host step); then per host
    (`finish_host`): run `agent probe`, parse
    `InventorySnapshot` into readiness checks (gpu_driver, gpu_libs,
    gpu_idle, clock_sync, ib_ports, governor, persistence_mode) → with `--tune`, apply
@@ -81,7 +82,7 @@ writes `performance` into every `cpufreq/scaling_governor` via
 
 ## Files
 - `src/orchestrator/bootstrap.rs` — `run`, `CheckStatus`, `HostReadiness`,
-  `ReadinessCheck`, `Stage`, `fan_out`, `connect_host`, `finish_host`,
+  `ReadinessCheck`, `Stage`, `connect_host`, `finish_host`,
   `connectivity_detail`.
 - `src/orchestrator/bootstrap/gpu_idle.rs` — `gpu_idle_check`.
 - `src/orchestrator/deploy.rs` — `ensure_fleet`, `DeployOutcome`,

@@ -36,7 +36,7 @@ extra_flags = []
 # Agent directory on every node, an absolute literal path (no `~`).
 # Default: /tmp/gauntlet-$USER (node-local).
 # dir = "/tmp/gauntlet-alice"
-# "sbcast": broadcast the binary to every allocated node (default).
+# "sbcast": broadcast the binary to the stale nodes only (default).
 # "shared": `dir` is on a shared filesystem; install once from here.
 deploy = "sbcast"
 

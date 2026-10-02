@@ -50,11 +50,13 @@ and the variables exist before the agent process starts. This is the
 same mechanism already used for LD_LIBRARY_PATH (which dlopen likewise
 captures at process start). The map does not travel on the wire.
 
-In srun launch mode (docs/features/slurm_launch.md) the same pairs
-(`agent_env_vars`) are set on the local `srun` process instead and
+In srun launch mode (docs/features/slurm_launch.md) the NCCL pairs
+(`AgentEnv.nccl`) are set on the local `srun` process instead and
 exported to the step with `--export=ALL`; no shell parses them, and the
 orchestrator's own `NCCL_*` variables are stripped first so the recorded
-map stays exactly the env every agent ran under.
+map stays exactly the env every agent ran under. LD_LIBRARY_PATH is
+applied inside the step (`env LD_LIBRARY_PATH=<dir>/lib:<inherited>`), so
+the srun client keeps the orchestrator's own library path.
 
 ### Remote shell assumption
 sshd runs the command through the remote user's login shell. The
@@ -133,15 +135,15 @@ plane story (docs/features/phase3_network.md) is documented around it.
 2. **Session setup** (`orchestrator/mod.rs::connect_fleet`,
    `orchestrator/bootstrap.rs::connect_host`). `config.nccl_env()?` is
    passed to `Launcher::connect`, whose `HostSession::establish`
-   precomputes `agent_env_vars(remote_dir, &nccl_env)`:
-   `LD_LIBRARY_PATH` then one pair per entry, in key order. An empty map
-   adds nothing.
+   precomputes `AgentEnv::new(remote_dir, &nccl_env)`: the agent lib dir
+   plus one pair per entry, in key order. An empty map adds nothing.
 3. **Spawn** (`orchestrator/session.rs` → `transport/`). `run_agent`,
    `run_agent_capture` and `spawn_agent` — the only three ways an agent is
-   started — go through `HostTransport::spawn`. ssh renders the pairs as
-   `KEY='value'` words (`env_words`) between `env` and the agent binary
-   via `raw_args` (already quoted; openssh does not re-escape raw args);
-   srun sets them on the srun process env. That covers every
+   started — go through `HostTransport::spawn`. ssh renders
+   `LD_LIBRARY_PATH` and the pairs as `KEY='value'` words
+   (`AgentEnv::ssh_words`) between `env` and the agent binary via
+   `raw_args` (already quoted; openssh does not re-escape raw args);
+   srun sets the pairs on the srun process env. That covers every
    communicator-creating invocation. That is `agent run`, which runs the
    intra-node NCCL sweep, the intra-node overlap and any future node-local
    NCCL. It is also `agent nccl` Lead/Participate, which runs the
@@ -200,7 +202,7 @@ baseline diff compares it.
   `isolate_stdout` for agent subcommands before building the runtime.
 - `tests/stdout_isolation_tests.rs` — end-to-end protocol isolation.
 - `src/orchestrator/session.rs` — `HostSession::establish`,
-  `agent_env_vars`, `env_words`, the three spawn paths;
+  `AgentEnv` (`ssh_words`), the three spawn paths;
   `src/orchestrator/transport/{ssh,srun}.rs` apply the env per transport.
 - `src/orchestrator/mod.rs`, `src/orchestrator/bootstrap.rs` — pass
   `config.nccl_env()` into every session.
@@ -227,7 +229,7 @@ baseline diff compares it.
   Single-quoted one-line values are also safe under csh/tcsh.
 - The agent never calls `std::env::set_var`. NCCL env reaches it only via
   the spawn command line, so it is present before any thread exists.
-- Every agent spawn of a session carries the same env (`agent_env_vars`);
+- Every agent spawn of a session carries the same env (`AgentEnv`);
   there is no spawn path that bypasses it, over either transport.
 - Values are single-quoted; a POSIX shell hands them to the process byte
   for byte (tested against a real `sh` with adversarial values: quotes,
