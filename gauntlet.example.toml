@@ -29,6 +29,13 @@ gemm_sdc_check_secs = 5      # loaded secs between bitwise checks in the sustain
 cpu_sdc_hot_secs = 10        # all-core correctness-under-power screen duration
 disk_paths = ["/tmp"]
 net_port_base = 29500
+# Network-phase steps (default: all): intranode (NCCL across local GPUs),
+# pairwise (TCP mesh; alias tcp), nccl (fleet NCCL sweep), barrier
+# (barrier-skew probes; the NCCL barrier also needs nccl). Deselected
+# steps record Skipped outcomes "disabled by config". `--net-steps`
+# overrides, e.g. `--phases network --net-steps nccl` for a quick NCCL-only
+# check.
+net_steps = ["intranode", "pairwise", "nccl", "barrier"]
 # NCCL message-size sweeps (network phase). Default sizes: 1 KiB .. 1 GiB.
 # nccl_sizes = [1024, 1048576, 1073741824]
 nccl_iters_per_size = 20

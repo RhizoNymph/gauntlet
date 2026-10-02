@@ -44,6 +44,7 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::nccl_env::NcclEnv;
+use crate::net_steps::{NetStep, NetSteps, disabled_outcomes};
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit, gpu_idle_outcomes,
@@ -172,6 +173,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     let config = FleetConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
     let phases = config.resolve_phases(&args.phases)?;
+    let net_steps = config.resolve_net_steps(&args.net_steps)?;
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
@@ -227,6 +229,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     info!(
         hosts = sessions.len(),
         phases = ?phases,
+        net_steps = ?net_steps.iter().map(NetStep::name).collect::<Vec<_>>(),
         "fleet ready"
     );
 
@@ -276,6 +279,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
                         &config,
                         &sessions,
                         &mut inventories,
+                        &net_steps,
                         args.sample_pairs,
                         &sink,
                     )
@@ -660,17 +664,45 @@ async fn network_phase(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
+    steps: &NetSteps,
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
+    // Deselected steps leave an explicit trace on every host, so a
+    // bandwidth-only run reads as "not run", never as "missing".
+    let disabled = disabled_outcomes(steps);
+    if !disabled.is_empty() {
+        info!(
+            skipped = ?disabled.iter().map(|(test, _)| *test).collect::<Vec<_>>(),
+            "network steps disabled by config"
+        );
+        for session in sessions {
+            for (test, outcome) in &disabled {
+                sink.event(
+                    session.addr(),
+                    AgentEvent::Outcome {
+                        test: *test,
+                        scope: Scope::Node,
+                        outcome: outcome.clone(),
+                    },
+                );
+            }
+        }
+    }
     // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
     // node pairs (TCP), then the full fleet (NCCL over the fabric).
-    if config.tests.nccl_intranode {
+    if steps.contains(NetStep::Intranode) {
         intranode::intranode_sweep(config, sessions, inventories, sink).await;
     }
-    pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl::nccl_sweep(config, sessions, inventories, sink).await;
-    tcp_barrier_sweep(config, sessions, sink).await;
+    if steps.contains(NetStep::Pairwise) {
+        pairwise_sweep(config, sessions, sample_pairs, sink).await;
+    }
+    if steps.contains(NetStep::Nccl) {
+        nccl::nccl_sweep(config, sessions, inventories, steps.nccl_barrier(), sink).await;
+    }
+    if steps.contains(NetStep::Barrier) {
+        tcp_barrier_sweep(config, sessions, sink).await;
+    }
 }
 
 /// Tournament rounds of disjoint pairs: within a round every pair runs

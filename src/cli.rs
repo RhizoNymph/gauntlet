@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::net_steps::NetStep;
 use crate::proto::Phase;
 
 /// `--phases` help, built from the phase table so a new phase shows up
@@ -10,6 +11,16 @@ fn phases_help() -> String {
     format!(
         "Restrict to a subset of phases, comma-separated: {}",
         Phase::help_list()
+    )
+}
+
+/// `--net-steps` help, built from the step table.
+fn net_steps_help() -> String {
+    format!(
+        "Network-phase steps to run, comma-separated (overrides [tests] net_steps): {}. \
+         Deselected steps record Skipped outcomes; e.g. `--phases network --net-steps nccl` \
+         is a quick NCCL-only check",
+        NetStep::help_list()
     )
 }
 
@@ -49,6 +60,9 @@ pub struct RunArgs {
     // Help generated from `Phase::PARSE_TABLE` (`phases_help`).
     #[arg(long, value_delimiter = ',', help = phases_help())]
     pub phases: Vec<String>,
+    // Help generated from `NetStep::PARSE_TABLE` (`net_steps_help`).
+    #[arg(long, value_delimiter = ',', help = net_steps_help())]
+    pub net_steps: Vec<String>,
     /// Sampled network mode: test only this many pairs per host instead of full mesh.
     #[arg(long)]
     pub sample_pairs: Option<usize>,

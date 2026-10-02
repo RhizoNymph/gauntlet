@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
+use crate::net_steps::{NetStep, NetSteps};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
     OverlapSpec, Phase,
@@ -35,6 +36,15 @@ pub enum ConfigError {
     BadBarrierFrac { got: f64 },
     #[error("unknown phase name: {name}")]
     UnknownPhase { name: String },
+    #[error(
+        "unknown network step name: {name} (expected one of: {})",
+        NetStep::help_list()
+    )]
+    UnknownNetStep { name: String },
+    /// The network-step selection (config, `--net-steps`, minus
+    /// `nccl_intranode = false`) leaves nothing to run.
+    #[error("no network steps selected; drop the network phase instead")]
+    NoNetSteps,
     /// `[nccl]` violates the NCCL env policy (non-NCCL key, empty or
     /// NUL-bearing value, NCCL_SOCKET_IFNAME set twice).
     #[error("invalid [nccl] section: {source}")]
@@ -131,6 +141,10 @@ pub struct TestConfig {
     /// GEMM (hot SDC screen). 0 disables.
     pub gemm_sdc_check_secs: u64,
     pub gpu_bandwidth_mib: u64,
+    /// Network-phase steps to run (`intranode`, `pairwise`, `nccl`,
+    /// `barrier`); defaults to all. Deselected steps record Skipped
+    /// outcomes ("disabled by config"). `--net-steps` overrides.
+    pub net_steps: Vec<NetStep>,
     pub net_latency_secs: u64,
     pub net_bandwidth_secs: u64,
     /// Base port for peer listeners; each concurrent pair gets base+i.
@@ -175,6 +189,7 @@ impl Default for TestConfig {
             gemm_dtypes: vec![GemmDtype::F32, GemmDtype::Bf16, GemmDtype::F16],
             gemm_sdc_check_secs: 5,
             gpu_bandwidth_mib: 1024,
+            net_steps: NetStep::ALL.to_vec(),
             net_latency_secs: 3,
             net_bandwidth_secs: 5,
             net_port_base: 29500,
@@ -290,6 +305,7 @@ impl FleetConfig {
             return Err(ConfigError::BadBarrierFrac { got: frac });
         }
         self.nccl_env()?;
+        self.resolve_net_steps(&[])?;
         Ok(())
     }
 
@@ -396,5 +412,27 @@ impl FleetConfig {
                 Phase::parse(name).ok_or_else(|| ConfigError::UnknownPhase { name: name.clone() })
             })
             .collect()
+    }
+
+    /// Resolve the network-phase step set: `--net-steps` strings when
+    /// given, else `tests.net_steps`; `tests.nccl_intranode = false` always
+    /// removes the intra-node step. Errors on unknown names and on an
+    /// empty result.
+    pub fn resolve_net_steps(&self, cli_steps: &[String]) -> Result<NetSteps, ConfigError> {
+        let mut steps: std::collections::BTreeSet<NetStep> = if cli_steps.is_empty() {
+            self.tests.net_steps.iter().copied().collect()
+        } else {
+            cli_steps
+                .iter()
+                .map(|name| {
+                    NetStep::parse(name)
+                        .ok_or_else(|| ConfigError::UnknownNetStep { name: name.clone() })
+                })
+                .collect::<Result<_, _>>()?
+        };
+        if !self.tests.nccl_intranode {
+            steps.remove(&NetStep::Intranode);
+        }
+        NetSteps::new(steps).ok_or(ConfigError::NoNetSteps)
     }
 }

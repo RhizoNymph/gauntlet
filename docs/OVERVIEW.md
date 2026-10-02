@@ -161,7 +161,11 @@ Features Index:
       rest of the world (remote kill), only the culprit is Failed, hosts
       it aborted are Skipped/warned; abandoned agents are always killed
       remotely; per-rank reports are accepted only from the owning host.
-    entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs]
+      Steps are a typed selection (tests.net_steps / --net-steps:
+      intranode, pairwise, nccl, barrier); deselected steps record
+      Skipped "disabled by config", so `--net-steps nccl` is a quick
+      NCCL-only check.
+    entry_points: [net_steps.rs, agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs]
     depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
   barrier_skew:

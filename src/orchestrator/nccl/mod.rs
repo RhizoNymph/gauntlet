@@ -506,11 +506,13 @@ fn report_violations(sink: &ObservationSink, violations: Vec<ownership::Ownershi
 
 /// Fleet-wide NCCL sweep: the lead host's event stream carries the
 /// measurements (timed on global rank 0); every rank contributes barrier
-/// timings when the barrier-skew benchmark rides along.
+/// timings when the barrier-skew benchmark rides along (`with_barrier`:
+/// the barrier network step is selected).
 pub(super) async fn nccl_sweep(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
+    with_barrier: bool,
     sink: &ObservationSink,
 ) {
     let world = nccl_world(sessions, inventories).await;
@@ -538,8 +540,10 @@ pub(super) async fn nccl_sweep(
     // Barrier-skew microbenchmark rides the same communicator. Skew needs
     // at least two independent arrivals, and the ranks of one host share
     // its launching thread's arrival, so a one-host world has none.
-    let barrier_spec =
-        (config.tests.barrier_iters > 0 && world.member_count() >= 2).then_some(BarrierSpec {
+    let barrier_spec = (with_barrier
+        && config.tests.barrier_iters > 0
+        && world.member_count() >= 2)
+        .then_some(BarrierSpec {
             iters: config.tests.barrier_iters,
             bytes: config.tests.barrier_bytes,
         });
