@@ -192,7 +192,9 @@ tail progress:
 `src/analysis/{stats,fit,schedule}.rs`,
 `src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
-`src/orchestrator/collect.rs` (`Collector::snapshot`).
+`src/orchestrator/collect.rs` (`Collector::snapshot`),
+`src/build_info.rs` (`BuildInfo`, `GitRevision`, `VERSION_LINE`),
+`build.rs` (`GAUNTLET_GIT_REVISION`).
 
 ## Invariants
 - SCHEMA_VERSION bumps on any field rename/removal in `RunResults`.
@@ -257,6 +259,20 @@ performance finding, not proof that a component is broken. The terminal
 header prints `verdict: <label> (exit <code>)` (labels: clean, outliers,
 host failures, test failures); the viewer colors outliers warn and both
 failure classes bad.
+
+## Build info (schema v13)
+
+`RunResults.gauntlet_version` records the producing binary — which is
+also the deployed agent (self-deploy, sha256-matched) — as
+`{ version: <CARGO_PKG_VERSION>, git: { state: "known", sha, dirty } |
+{ state: "unknown" } }` (`build_info::BuildInfo` / `GitRevision`).
+`build.rs` captures the short sha and a dirty flag (tracked files only)
+at build time as `GAUNTLET_GIT_REVISION`; a build outside a checkout of
+this crate (source tarball, no git, or a tarball unpacked inside another
+repository) records `unknown`. `gauntlet --version` prints the same as
+`<version> (<sha>[-dirty]|unknown)`; the table header prints a
+`gauntlet <version> (<revision>)` line. Serde-defaulted: older documents
+decode with `None`.
 
 ## Error-counter findings (schema v4)
 

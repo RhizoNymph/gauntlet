@@ -31,6 +31,7 @@ mod gpu_idle;
 use self::gpu_idle::gpu_idle_check;
 use super::deploy::ensure_agent;
 use super::session::HostSession;
+use crate::build_info::BuildInfo;
 use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
 use crate::nccl_env::NcclEnv;
@@ -38,11 +39,17 @@ use crate::proto::InventorySnapshot;
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
 /// viewer renders the same matrix from this document.
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `gauntlet_version` (crate version plus build-time git revision of
+/// the binary that bootstrapped, which is also the agent it deployed).
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapReport {
     pub schema_version: u32,
+    /// `None` = not recorded (v1 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub finished_epoch_secs: u64,
     pub hosts: Vec<HostReadiness>,
 }
@@ -169,6 +176,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     if args.json {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: Some(BuildInfo::current()),
             finished_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
@@ -1036,6 +1044,7 @@ mod tests {
         // `--json` carries the column and the probed occupancy.
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
             finished_epoch_secs: 1,
             hosts: rows,
         };
@@ -1050,6 +1059,7 @@ mod tests {
     fn readiness_report_round_trips_through_json() {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
             finished_epoch_secs: 1_700_000_000,
             hosts: vec![HostReadiness {
                 host: "10.0.0.1".into(),

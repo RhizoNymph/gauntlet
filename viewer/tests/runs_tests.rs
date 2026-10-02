@@ -120,6 +120,7 @@ fn results(run_id: &str, started: u64) -> RunResults {
         run_id: run_id.into(),
         started_epoch_secs: started,
         debug_build: false,
+        gauntlet_version: None,
         aggregates: Default::default(),
         finished_epoch_secs: started + 60,
         hosts: BTreeMap::new(),

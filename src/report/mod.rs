@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::analysis::fit::{AlphaBetaFit, FitBound, fit_alpha_beta};
 use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
+use crate::build_info::BuildInfo;
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::nccl_env::NcclEnv;
@@ -76,8 +77,10 @@ use crate::proto::{
 // v13: run-level `verdict` — "clean" / "outliers" / "host_failures" /
 // "failures", the classification behind the exit code (0 / 1 / 2 / 3;
 // failed tests and counter findings no longer share exit 1 with
-// statistical outliers). Serde-defaulted: pre-v13 documents decode with it
-// null, and `report::verdict` classifies them.
+// statistical outliers) — and run-level `gauntlet_version` (crate version
+// plus build-time git revision of the producing binary). Both
+// serde-defaulted: pre-v13 documents decode with them null, and
+// `report::verdict` classifies them.
 pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
@@ -112,6 +115,11 @@ pub struct RunResults {
     /// built without optimizations; such numbers are not comparable.
     #[serde(default)]
     pub debug_build: bool,
+    /// Crate version and git revision of the orchestrator binary — which
+    /// is also the deployed agent (self-deploy, sha256-matched). `None` =
+    /// not recorded (pre-v13 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub hosts: BTreeMap<String, HostObservations>,
     /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
     /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
@@ -483,6 +491,7 @@ pub fn build(
         started_epoch_secs,
         finished_epoch_secs,
         debug_build: false,
+        gauntlet_version: Some(BuildInfo::current()),
         hosts: observations,
         // `None` only for a config whose `[nccl]` never validated, which
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
@@ -1150,6 +1159,9 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         run_verdict,
         run_verdict.exit_code(),
     )?;
+    if let Some(version) = &results.gauntlet_version {
+        writeln!(out, "gauntlet {version}")?;
+    }
     writeln!(
         out,
         "nccl env: {}",

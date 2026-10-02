@@ -70,6 +70,7 @@ writes `performance` into every `cpufreq/scaling_governor` via
 - `src/orchestrator/deploy.rs` — `ensure_agent`, `local_sha256`,
   `AGENT_RELPATH`.
 - `src/orchestrator/session.rs` — `HostSession` (connect/exec/upload).
+- `src/build_info.rs` — `BuildInfo`, `GitRevision` (bootstrap `--json`).
 - `src/agent/mod.rs` — `probe()` prints `InventorySnapshot` JSON.
 
 ## Invariants
@@ -88,12 +89,16 @@ writes `performance` into every `cpufreq/scaling_governor` via
 ## Machine interface (`--json`)
 
 `gauntlet bootstrap --json` prints a `BootstrapReport` document to stdout
-instead of the table: `{ schema_version, finished_epoch_secs, hosts:
-[HostReadiness] }`, where each `HostReadiness` carries the ordered
-`ReadinessCheck` list (`name`, `status`: ok|warn|fail, one-line `detail`)
+instead of the table: `{ schema_version, gauntlet_version,
+finished_epoch_secs, hosts: [HostReadiness] }`, where each
+`HostReadiness` carries the ordered `ReadinessCheck` list (`name`,
+`status`: ok|warn|fail, one-line `detail`)
 plus the probed `InventorySnapshot` when available (including each GPU's
-`occupancy` since proto v10; additive and serde-defaulted, so
-`BOOTSTRAP_SCHEMA_VERSION` stays 1). The exit code contract
+`occupancy` since proto v10). `BOOTSTRAP_SCHEMA_VERSION` 2 adds
+`gauntlet_version` (`build_info::BuildInfo`: crate version plus the git
+revision captured at build time, `unknown` outside a checkout — the binary
+that bootstrapped, which is also the agent it deployed;
+serde-defaulted, `None` in v1 documents). The exit code contract
 is unchanged (non-zero when any host's worst status is fail). The GUI
 viewer runs bootstrap through this interface and renders the same matrix;
 `BOOTSTRAP_SCHEMA_VERSION` bumps on field renames.

@@ -44,7 +44,8 @@ Overview:
       Collector computes fleet median/MAD per metric, flags outliers beyond k
       MADs, applies optional absolute thresholds, renders table + JSON,
       classifies a typed Verdict (clean / outliers / host_failures /
-      failures -> exit 0 / 1 / 2 / 3) recorded in the JSON. Runs persisted for
+      failures -> exit 0 / 1 / 2 / 3) recorded in the JSON along with the
+      producing binary's version + git revision. Runs persisted for
       diffing against last known-good. With
       --repeat N, metrics aggregate into per-subject distribution moments
       (median/MAD/min/max/mean/stddev); outliers flag on medians and
@@ -74,7 +75,8 @@ Features Index:
       gpu_idle column), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
-      schema-versioned document (the GUI viewer's interface).
+      schema-versioned document (the GUI viewer's interface; v2 records
+      gauntlet_version).
     entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
     depends_on: []
     doc: docs/features/bootstrap.md
@@ -246,12 +248,13 @@ Features Index:
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
       overlay, run history, terminal table, typed verdict + exit codes
       (schema v13: hard failures exit 3, outliers only exit 1, host
-      failures exit 2). Live runs publish
+      failures exit 2), run-level gauntlet_version (build.rs git
+      revision; also `gauntlet --version`). Live runs publish
       periodic partial snapshots (runs/<run_id>.partial.json, written via
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    entry_points: [report/mod.rs, build_info.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
     doc: docs/features/reporting.md
   viewer:

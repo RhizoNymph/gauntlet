@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod analysis;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod nccl_env;

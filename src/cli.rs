@@ -27,7 +27,8 @@ fn net_steps_help() -> String {
 #[derive(Debug, Parser)]
 #[command(
     name = "gauntlet",
-    about = "Cluster pre-flight benchmark and health check"
+    about = "Cluster pre-flight benchmark and health check",
+    version = crate::build_info::VERSION_LINE
 )]
 pub struct Cli {
     /// Enable debug logging (stderr).
