@@ -15,12 +15,15 @@ pub mod counters;
 pub mod cpu;
 pub mod disk;
 pub mod gpu_occupancy;
+pub mod ib;
 pub mod intranode;
 pub mod inventory;
 pub mod mem;
 pub mod nccl;
 pub mod net;
+pub mod pci;
 pub mod sweep;
+pub mod sysfs;
 pub mod window;
 
 #[cfg(feature = "gpu")]

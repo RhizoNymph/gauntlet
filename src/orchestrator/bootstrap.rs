@@ -34,7 +34,7 @@ use super::session::HostSession;
 use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
 use crate::nccl_env::NcclEnv;
-use crate::proto::InventorySnapshot;
+use crate::proto::{InventorySnapshot, PortState};
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
 /// viewer renders the same matrix from this document.
@@ -510,13 +510,13 @@ fn ib_ports_check(inventory: &InventorySnapshot) -> ReadinessCheck {
     let active: Vec<&str> = inventory
         .ib_ports
         .iter()
-        .filter(|port| port.state.eq_ignore_ascii_case("active"))
+        .filter(|port| port.logical_state() == PortState::Active)
         .map(|port| port.device.as_str())
         .collect();
     let inactive: Vec<String> = inventory
         .ib_ports
         .iter()
-        .filter(|port| !port.state.eq_ignore_ascii_case("active"))
+        .filter(|port| port.logical_state() != PortState::Active)
         .map(|port| format!("{}:{} {}", port.device, port.port, port.state))
         .collect();
 
@@ -726,9 +726,17 @@ mod tests {
                 device: "mlx5_0".into(),
                 port: 1,
                 state: "Active".into(),
-                rate_gbps: Some(400.0),
+                rate: crate::proto::PortRate::Known {
+                    gbps: 400.0,
+                    lanes: None,
+                    speed: None,
+                },
                 link_downed_count: Some(0),
+                link_layer: Default::default(),
+                phys_state: Default::default(),
+                netdevs: Vec::new(),
             }],
+            ib_devices: Vec::new(),
             xid_errors: Vec::new(),
             gpu_libs: [("cuda", true), ("cublas", true), ("nccl", true)]
                 .into_iter()
@@ -758,6 +766,7 @@ mod tests {
                 memory_total_mib: Some(81_559),
                 compute_processes: Some(Vec::new()),
             },
+            pci: None,
         }
     }
 
@@ -829,8 +838,15 @@ mod tests {
             device: "mlx5_1".into(),
             port: 1,
             state: "Active".into(),
-            rate_gbps: Some(400.0),
+            rate: crate::proto::PortRate::Known {
+                gbps: 400.0,
+                lanes: None,
+                speed: None,
+            },
             link_downed_count: Some(0),
+            link_layer: Default::default(),
+            phys_state: Default::default(),
+            netdevs: Vec::new(),
         });
         assert_eq!(ib_ports_check(&inv).status, CheckStatus::Warn);
         inv.ib_ports.clear();

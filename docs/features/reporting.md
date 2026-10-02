@@ -21,11 +21,15 @@ started, finished)`:
    broken by the lexicographically smallest value). Optional fields
    (nvidia_driver, cuda_version) report "(absent)" rather than being
    skipped, so present-vs-absent skew dissents; `lib:<name>` fields carry
-   the dlopen probe results on GPU-bearing hosts.
+   the dlopen probe results on GPU-bearing hosts. Each host's
+   `NcclNicSummary::consistency_fields` (nccl_ib_ports /
+   nccl_ib_link_layer / nccl_ib_ceiling_gbps) join the vote.
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
-   straggler defines the node) and `links` alpha-beta fits → `calibration`.
+   straggler defines the node) and `links` alpha-beta fits →
+   `calibration`. (The per-host NCCL NIC summary and its ceiling live in
+   `hosts.*.nccl_nics` and the `nccl_nics.ceiling_gib_per_sec` metric.)
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any test outcome is Failed (including `gpu_idle`) or any
+   any test outcome is Failed (including `gpu_idle` and `nccl_nics`) or any
    outliers/violations exist; else Clean.
    Exit codes 2/1/0.
 
@@ -147,7 +151,8 @@ Per-host `NodeRoofline`:
 ## Rendering
 `render_table` (comfy-table, writer-injected for tests) emits a header line
 then sections: per-host summary (pass/fail/skip counts + key rooflines),
-silent data corruption, gpus in use (gpu_idle), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
+silent data corruption, gpus in use (gpu_idle), nccl nics (only when
+some host has an IB/RoCE port), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
 violations, inventory consistency dissenters, failed hosts, and the link
 alpha-beta digest (whose `bound` column shows the active constraint's
 label, e.g. `alpha=0`, or `-` for a clean fit). Empty sections either state "none" (outliers,
@@ -192,7 +197,7 @@ tail progress:
 
 ## Files
 `src/analysis/{stats,fit,schedule}.rs`,
-`src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
+`src/report/{mod,consistency,history,intranode,nccl_env,nccl_nics,gpu_idle}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`).
 
@@ -263,6 +268,47 @@ gauntlet agent ..."). It is a projection: failed GPUs come from
 `hosts.*.outcomes`, the detail from the same host's inventory; with no
 process to name (memory over the threshold only, or an old document) the
 outcome reason stands in. Omitted when no GPU is busy.
+
+## NCCL NICs and the NIC ceiling (schema v13)
+`hosts.<h>.nccl_nics: NcclNicSummary` (serde-defaulted; absent in pre-v13
+documents) is recorded by the collector from the orchestrator's
+`AgentEvent::NcclNics`, derived from the inventory under the run's env by
+`orchestrator::derive::derive_inventory_events`. The report reads it and
+never re-derives. It holds:
+- the env inputs: `hca`, `net`, `ib_disabled`;
+- `selected` ports: device, port, link_layer, typed `rate`, netdevs,
+  numa_node, gpu_locality;
+- `excluded` ports with a tagged `reason`: `net_socket`, `ib_disabled`,
+  `not_active` {state}, `unsupported_link_layer` or `filtered_by_hca`.
+
+The ceiling is a method, not a stored field. Details and NCCL_IB_HCA /
+NCCL_NET / NCCL_IB_DISABLE semantics: docs/features/nccl_nics.md.
+
+Fed into the analysis three ways, all recorded by the same derivation:
+- Outcome: hosts carry one Node-scope `nccl_nics` outcome. It is Failed
+  when IB/RoCE ports exist but none is selected, so NCCL would fall back
+  to sockets; that makes the verdict Stragglers. It is Skipped when the
+  host has no ports, or NCCL_NET=Socket, or NCCL_IB_DISABLE is set.
+- Metric: `nccl_nics.ceiling_gib_per_sec` (node scope, GibPerSec), on
+  hosts with IB/RoCE ports, the transport on and the ceiling known.
+  Normal aggregate/MAD/threshold handling.
+- Consistency: `report/consistency.rs` (the majority vote, moved out of
+  `mod.rs`) chains each recorded summary's `consistency_fields`
+  (`nccl_ib_ports`, `nccl_ib_link_layer`, `nccl_ib_ceiling_gbps`) after
+  the inventory fields. One host with fewer or slower selected NICs then
+  dissents even when the ceiling's MAD is zero.
+
+`report/nccl_nics.rs` renders "nccl nics (NCCL_IB_HCA=… | unset)" from the
+recorded summaries. Every string comes from the summary's own describers,
+the same ones the outcome reason uses. Per host it shows:
+- the selected ports ("mlx5_0:1 infiniband 200G (ibp28s0, gpu0
+  pcie_switch)": netdevs and the nearest GPUs);
+- the selection's link layer and the ceiling in GiB/s;
+- the excluded ports (`ExcludedPort::describe`);
+- a note: the FAIL or skip reason, the NCCL_NET plugin caveat, and why
+  the ceiling is unknown (each such port's typed rate error).
+
+Omitted when no host recorded an IB/RoCE port.
 
 ## Non-negative link fits (schema v12)
 

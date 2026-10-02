@@ -15,8 +15,12 @@ never an error; only unreadable /proc fails)
 - /proc: hostname, cpuinfo (model, logical cores), meminfo.
 - /sys/devices/system/node → NUMA node count.
 - /sys/class/net/*/{mtu,speed} → NicInventory (skip lo).
-- /sys/class/infiniband/*/ports/*/{state,rate,counters/link_downed} →
-  IbPortInventory.
+- /sys/class/infiniband/*/ports/*/{state,phys_state,rate,link_layer,
+  counters/link_downed,gid_attrs/types/*,gid_attrs/ndevs/*} plus
+  `<dev>/device/net/*/dev_port` → IbPortInventory; `<dev>/device` (the PCI
+  function, canonicalized) → IbDeviceInventory. See "InfiniBand inventory".
+- /sys/bus/pci/devices/<gpu bus id> → GpuInventory.pci (NUMA node,
+  upstream bridges).
 - /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor.
 - `nvidia-smi --query-gpu=index,name,uuid,vbios_version,memory.total,ecc.errors.uncorrected.volatile.total,remapped_rows.pending,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,persistence_mode,driver_version,pci.bus_id,memory.used --format=csv,noheader,nounits`
   — absent binary ⇒ no GPUs; per-field "N/A" / "[N/A]" / "[Not Supported]" ⇒
@@ -54,6 +58,65 @@ never an error; only unreadable /proc fails)
   GPUs), `proto::gpu_visibility_mismatch` produces a per-host finding:
   the inventory phase emits a Failed `inventory` outcome (Node scope)
   with the reason, making the verdict at least Stragglers.
+
+The `ib_ports` bootstrap column reads `IbPortInventory::logical_state()`
+(typed `PortState`) rather than comparing strings.
+
+## InfiniBand inventory (proto v11 / schema v13)
+
+### Scope
+Enough per-port and per-device fact to decide which ports NCCL would use
+and what they add up to (docs/features/nccl_nics.md), without guessing.
+Non-scope: the selection itself (orchestrator-side), firmware versions,
+GID indices (only the RoCE versions present are kept).
+
+### Collection (`src/agent/ib.rs`, `src/agent/pci.rs`, `src/agent/sysfs.rs`)
+`ib::probe(root)` walks `root/<dev>` (root = `/sys/class/infiniband` in
+production, a fixture tree in tests). Every read is best effort; a
+missing file leaves that field unknown. Attribute files are read with the
+shared `sysfs::read_trimmed` (also used by `inventory.rs`): missing,
+unreadable or empty-after-trim is `None`, since sysfs uses an empty read
+for an unset attribute.
+- Device: `pci::locate(<dev>/device)` canonicalizes the link and anchors
+  at the *innermost* host-bridge component (`pci<domain>:<bus>`). Behind
+  Intel VMD the path nests a second domain
+  (`pci0000:00/0000:00:0e.0/pci10000:e0/...`), and anchoring at the outer
+  bridge would make everything under one VMD controller look
+  switch-local. It records the function address (last component,
+  validated as a PCI address), the bridges from that host bridge down
+  (`upstream`), and `numa_node` (-1 → None). Devices without a PCI parent
+  (soft RoCE, siw) get `pci: None`.
+- Port: `state` keeps the symbolic half of "4: ACTIVE" (wire unchanged;
+  `logical_state()` gives a typed `PortState`); `phys_state` → typed
+  `PhysState` keyed on the numeric code; `rate` → typed `PortRate`:
+  `known {gbps, lanes, speed}`, `unparseable {error}` (the typed
+  `IbRateError` carrying the raw string, also logged at warn), or
+  `unreadable` (missing/empty file); `link_layer` → `LinkLayer`
+  (InfiniBand / Ethernet / Unknown), and on Ethernet the distinct RoCE
+  versions among readable `gid_attrs/types/*` (unpopulated GIDs are
+  unreadable or empty).
+- Port `netdevs`, sorted and deduplicated:
+  - On Ethernet (RoCE): the non-empty `gid_attrs/ndevs/*` names, the
+    interface RoCE traffic uses. A LAG device (`mlx5_bond_0`) reports
+    `bond0`, not a member PF; switchdev reports the uplink, never a VF
+    representor.
+  - Otherwise (IPoIB, or an empty GID table): `<dev>/device/net/*` whose
+    `dev_port` is port-1. Entries whose `phys_port_name` names a VF/SF
+    (`pf0vf3`, `pf0sf1`) are skipped, and an entry without `dev_port` is
+    not attributed.
+- GPUs: `parse_gpu_query` records the nvidia-smi bus id as an
+  address-only `PciLocation`; `probe_gpus` resolves it with
+  `pci::resolve(/sys/bus/pci/devices, ..)` (left address-only when sysfs
+  has nothing).
+
+### Invariants
+- Devices sorted by name, ports by (device, port), as before.
+- `LinkLayer::Ethernet` is the only place RoCE versions can live.
+- Old inventories decode: every new field is serde-defaulted (link layer
+  and phys state Unknown, no devices, no GPU placement). A v1-v10 port's
+  bare `rate_gbps` is lifted into `PortRate::Known` (lanes/speed
+  unknown) by the private `IbPortWire` decoder; unknown fields still
+  fail.
 
 ## GPU occupancy and gpu_idle (proto v10 / schema v11)
 
@@ -126,8 +189,10 @@ absorbs.
 
 ### Where outcomes are made
 Orchestrator-side, because the threshold is orchestrator config and the
-agent reports facts only: `orchestrator::node_phase` derives
-`gpu_idle_outcomes` from each `Inventory` event as it arrives and forwards
+agent reports facts only: `orchestrator::node_phase` passes each
+`Inventory` event as it arrives through `derive::derive_inventory_events`
+(the shared hook for inventory-derived tests), which maps
+`gpu_idle_outcomes` and forwards
 them as `TestId::GpuIdle` outcomes right behind the snapshot (so partial
 snapshots show them too). Failed feeds `report::verdict` like any failed
 test (Stragglers, never HostFailures: the host is reachable and the finding
@@ -168,12 +233,22 @@ site: they yield `None`.
   `PciBusIdError`, `ComputeApp`, `parse_compute_apps`, `AgentIdentity`,
   `parse_stat_ppid`, `exe_basename`, `classify`, `processes_by_bus`,
   `processes_for`.
+- `src/agent/ib.rs` — `INFINIBAND_ROOT`, `IbInventory`, `probe`.
+- `src/agent/pci.rs` — `PCI_DEVICES_ROOT`, `locate`, `resolve`.
+- `src/agent/sysfs.rs` — `read_trimmed` (shared attribute reader).
 - `src/proto/mod.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
-  `IbPortInventory`, `consistency_fields`, `gpu_visibility_mismatch`.
+  `consistency_fields`, `gpu_visibility_mismatch`.
+- `src/proto/ib.rs` — `IbPortInventory`, `IbDeviceInventory`, `PortRate`,
+  `PortState`, `PhysState`, `LinkLayer`, `RoceVersion`, `IbSpeed`,
+  `IbRate`, `IbRateError`, `PciLocation`, `PciLocality`, `pci_locality`,
+  `payload_gbps`, `gbps_to_gib_per_sec`.
 - `src/proto/occupancy.rs` — `GpuOccupancy`, `GpuProcess`,
   `ProcessOwner`, `GpuIdleAssessment`, `MemoryOverage`, `assess_gpu_idle`,
   `gpu_idle_outcomes`.
-- `src/orchestrator/mod.rs` (`node_phase`) — derives the gpu_idle outcomes.
+- `src/orchestrator/derive.rs` — `derive_inventory_events`, the one hook
+  `node_phase` runs on every arriving inventory: the gpu_idle outcomes and
+  the nccl_nics outcome, ceiling metric and summary
+  (docs/features/nccl_nics.md).
 
 ## Invariants
 - `collect()` must complete in < 5s on a healthy node.

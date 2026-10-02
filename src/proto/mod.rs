@@ -12,8 +12,17 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod ib;
+pub mod nccl_nics;
 mod occupancy;
 mod ranks;
+
+pub use ib::{
+    IbDeviceInventory, IbPortInventory, IbRate, IbRateError, IbSpeed, LinkLayer, PciLocality,
+    PciLocation, PhysState, PortRate, PortState, RoceVersion, gbps_to_gib_per_sec, payload_gbps,
+    pci_locality,
+};
+pub use nccl_nics::NcclNicSummary;
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
@@ -53,7 +62,16 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-pub const PROTO_VERSION: u32 = 10;
+// v11: InfiniBand inventory — `ib_ports` entries carry `link_layer`
+// (InfiniBand / Ethernet with its RoCE versions), `phys_state`, the parsed
+// rate `lanes` / `speed` and the bound `netdevs`; the snapshot lists
+// `ib_devices` (PCI address, NUMA node, upstream bridges) and every
+// `GpuInventory` its `pci` placement, so NIC<->GPU locality can be derived.
+// A port's bare `rate_gbps` became a typed `rate` (known / unparseable with
+// its error / unreadable). The orchestrator-derived `nccl_nics` test id and
+// `nccl_nics` event ride the wire. Older inventories decode with link layer
+// and placement unknown and `rate_gbps` lifted into `rate`.
+pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -149,6 +167,12 @@ pub enum AgentEvent {
     /// from the baseline the orchestrator handed back in the task spec.
     CounterDeltas {
         deltas: Box<CounterDeltas>,
+    },
+    /// Orchestrator-derived from a host's inventory under the run's NCCL
+    /// env (`orchestrator::derive`): which IB/RoCE ports NCCL would use.
+    /// Agents never emit it; the collector records it per host.
+    NcclNics {
+        summary: Box<NcclNicSummary>,
     },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
@@ -248,6 +272,11 @@ pub enum TestId {
     /// Derived orchestrator-side (`report::build`): overlapped/isolated
     /// ratios. Agents never emit this test id.
     OverlapRetention,
+    /// Which IB/RoCE ports NCCL would use under the run's `NCCL_IB_HCA`,
+    /// and their summed line rate (`ceiling_gib_per_sec`). Derived
+    /// orchestrator-side from the inventory (`crate::nccl_ib`); agents
+    /// never emit this test id.
+    NcclNics,
 }
 
 /// What a metric is *about*. Per-core / per-GPU granularity is the point:
@@ -341,6 +370,10 @@ pub struct InventorySnapshot {
     pub gpus: Vec<GpuInventory>,
     pub nics: Vec<NicInventory>,
     pub ib_ports: Vec<IbPortInventory>,
+    /// RDMA devices and their PCI placement (proto v11); ports join on
+    /// `IbPortInventory.device`.
+    #[serde(default)]
+    pub ib_devices: Vec<IbDeviceInventory>,
     /// Xid error codes seen in the kernel log since boot.
     pub xid_errors: Vec<u32>,
     /// Runtime-loadability of the GPU library stack ("cuda", "cublas",
@@ -399,6 +432,11 @@ pub struct GpuInventory {
     /// "nothing known" for older inventories.
     #[serde(default)]
     pub occupancy: GpuOccupancy,
+    /// PCI placement (proto v11): the nvidia-smi bus id, resolved against
+    /// sysfs for NUMA node and upstream bridges. `None` when nvidia-smi
+    /// reported no bus id (and for older inventories).
+    #[serde(default)]
+    pub pci: Option<PciLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -407,16 +445,6 @@ pub struct NicInventory {
     pub name: String,
     pub mtu: u32,
     pub speed_mbps: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IbPortInventory {
-    pub device: String,
-    pub port: u32,
-    pub state: String,
-    pub rate_gbps: Option<f64>,
-    pub link_downed_count: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1026,7 @@ mod tests {
             nvlinks_active: None,
             persistence_mode: None,
             occupancy: GpuOccupancy::default(),
+            pci: None,
         };
         InventorySnapshot {
             hostname: "n1".into(),
@@ -1013,6 +1042,7 @@ mod tests {
             gpus: vec![gpu; listed],
             nics: vec![],
             ib_ports: vec![],
+            ib_devices: vec![],
             xid_errors: vec![],
             gpu_libs: BTreeMap::new(),
             cuda_visible_gpus: visible,
