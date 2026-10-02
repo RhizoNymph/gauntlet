@@ -5,7 +5,7 @@
 //! World: one NCCL rank per GPU (`layout::RankLayout`). Each NCCL-capable
 //! host contributes a contiguous rank block ordered by local GPU index,
 //! sized by the GPUs *CUDA* can open there (phase-0 inventory
-//! `cuda_visible_gpus`); one `agent nccl` process — one ssh session, one
+//! `cuda_visible_gpus`); one `agent nccl` process — one session, one
 //! supervised task — per host drives its whole block.
 //!
 //! The host holding global rank 0 mints the rendezvous id in-process (the
@@ -408,7 +408,8 @@ async fn run_host(
     )
     .await;
     if outcome.is_err() {
-        // Dropping the future only closed our end of the ssh channel; the
+        // Dropping the future only closed our end of the channel (ssh
+        // session or local srun process); the
         // remote agent may sit blocked in a collective indefinitely.
         kill_remote_agent(session, "nccl").await;
     }

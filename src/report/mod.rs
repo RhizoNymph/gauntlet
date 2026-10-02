@@ -22,6 +22,7 @@ use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
+use crate::launch::LaunchRecord;
 use crate::nccl_env::NcclEnv;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
@@ -73,7 +74,10 @@ use crate::proto::{
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
 // is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
-pub const SCHEMA_VERSION: u32 = 12;
+// v13: run-level `launch` — how the agents were started: `{"mode":"ssh"}`
+// or `{"mode":"srun","job_id":N}` (srun steps inside Slurm job N).
+// Serde-defaulted: pre-v13 documents decode with it null ("not recorded").
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -118,6 +122,11 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// How the agents were launched (ssh, or srun inside a named Slurm
+    /// job). `None` = not recorded (pre-v13 documents, or a document built
+    /// outside `gauntlet run`).
+    #[serde(default)]
+    pub launch: Option<LaunchRecord>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -424,6 +433,9 @@ pub fn build(
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
         // than guessed.
         nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
+        // Known only to the orchestrator (`--launch` override, allocation
+        // env); `gauntlet run` stamps it after building.
+        launch: None,
         fleet,
         aggregates,
         calibration,
@@ -1064,6 +1076,9 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "nccl env: {}",
         nccl_env::format_nccl_env(results.nccl_env.as_ref())
     )?;
+    if let Some(launch) = &results.launch {
+        writeln!(out, "launch: {launch}")?;
+    }
 
     render_hosts(results, out)?;
     render_sdc(results, out)?;

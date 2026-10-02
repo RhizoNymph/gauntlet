@@ -124,6 +124,7 @@ fn results(run_id: &str, started: u64) -> RunResults {
         finished_epoch_secs: started + 60,
         hosts: BTreeMap::new(),
         nccl_env: None,
+        launch: None,
         fleet: FleetAnalysis::default(),
         calibration: Calibration::default(),
     }

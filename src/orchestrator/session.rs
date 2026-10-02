@@ -1,20 +1,21 @@
-//! One persistent ssh session per host, via the `openssh` crate
-//! (native-mux). Sessions honor ~/.ssh/config (jump hosts, agent auth,
-//! aliases); `ssh.user` / `ssh.key` from the fleet config override when set.
+//! One session per host, over whichever transport the run launches with
+//! (`transport::Launcher`: persistent ssh, or srun job steps). Every agent
+//! interaction — run to completion streaming events, capture a JSON
+//! document, start in the background, kill — goes through here, so the
+//! rest of the orchestrator never knows which transport is in use.
 
 use std::path::Path;
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
-use openssh::{KnownHosts, Session, SessionBuilder, Stdio};
-use openssh_sftp_client::{Sftp, SftpOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 
 use super::deploy::AGENT_RELPATH;
-use crate::config::{HostConfig, SshConfig};
+use super::transport::{AgentChild, AgentCommand, HostTransport, Pipe, SpawnStdio};
+use crate::config::HostConfig;
+use crate::launch::LaunchMode;
 use crate::nccl_env::NcclEnv;
 use crate::proto::{AgentEvent, PROTO_VERSION, decode_event};
 
@@ -27,6 +28,14 @@ pub struct RemoteOutput {
 }
 
 impl RemoteOutput {
+    pub(crate) fn from_output(output: std::process::Output) -> Self {
+        Self {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    }
+
     pub fn success(&self) -> bool {
         self.status.success()
     }
@@ -64,73 +73,47 @@ fn exit_code(status: &ExitStatus) -> i32 {
 
 pub struct HostSession {
     pub host: HostConfig,
-    session: Arc<Session>,
-    /// `ssh.remote_dir` after remote `~` expansion; always absolute.
+    transport: HostTransport,
+    /// The agent directory after node-side resolution; always absolute.
     remote_dir: String,
     /// `<remote_dir>/bin/gauntlet-agent`.
     agent_path: String,
-    /// Pre-quoted `KEY=value` words placed between `env` and the agent
-    /// binary on every spawn (`agent_env_words`).
-    env_words: Vec<String>,
+    /// The environment every agent spawn starts under (`agent_env_vars`):
+    /// rendered as quoted `env` words over ssh, set on the local srun
+    /// process (and exported to the task) over srun.
+    agent_env: Vec<(String, String)>,
 }
 
 impl HostSession {
-    /// Establish a session. `connect_timeout_secs` applies; errors carry the
-    /// host address for attribution.
-    /// `nccl_env` is set on every agent spawn of this session.
-    pub async fn connect(
+    /// Finish opening a session over an established `transport`: create
+    /// and resolve the agent directory on the node (`dir` as configured;
+    /// a leading `~` is the *node's* home), bounded by `timeout`.
+    pub(crate) async fn establish(
         host: HostConfig,
-        ssh: &SshConfig,
+        transport: HostTransport,
+        dir: &str,
         nccl_env: &NcclEnv,
+        timeout: Duration,
     ) -> Result<HostSession> {
-        let timeout = Duration::from_secs(ssh.connect_timeout_secs.max(1));
-
-        let mut builder = SessionBuilder::default();
-        builder
-            .known_hosts_check(KnownHosts::Add)
-            .connect_timeout(timeout)
-            .server_alive_interval(Duration::from_secs(30));
-        if let Some(user) = &ssh.user {
-            builder.user(user.clone());
-        }
-        if let Some(key) = &ssh.key {
-            builder.keyfile(key);
-        }
-
-        let session = tokio::time::timeout(timeout, builder.connect_mux(&host.addr))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "ssh connect to {} timed out after {}s",
-                    host.addr,
-                    timeout.as_secs()
-                )
-            })?
-            .with_context(|| format!("ssh connect to {}", host.addr))?;
-        let session = Arc::new(session);
-
-        let remote_dir = tokio::time::timeout(
-            timeout,
-            resolve_remote_dir(&session, &host.addr, &ssh.remote_dir),
-        )
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "resolving remote_dir on {} timed out after {}s",
-                host.addr,
-                timeout.as_secs()
-            )
-        })??;
-
+        let remote_dir =
+            tokio::time::timeout(timeout, resolve_remote_dir(&transport, &host.addr, dir))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "resolving the agent directory {dir} on {} timed out after {}s",
+                        host.addr,
+                        timeout.as_secs()
+                    )
+                })??;
         let agent_path = format!("{remote_dir}/{AGENT_RELPATH}");
-        let env_words = agent_env_words(&remote_dir, nccl_env);
-        debug!(host = %host.addr, remote_dir = %remote_dir, "ssh session established");
+        let agent_env = agent_env_vars(&remote_dir, nccl_env);
+        debug!(host = %host.addr, remote_dir = %remote_dir, "session established");
         Ok(HostSession {
             host,
-            session,
+            transport,
             remote_dir,
             agent_path,
-            env_words,
+            agent_env,
         })
     }
 
@@ -138,7 +121,14 @@ impl HostSession {
         &self.host.addr
     }
 
-    /// Absolute scratch directory on the node (no `~`).
+    pub fn launch_mode(&self) -> LaunchMode {
+        match self.transport {
+            HostTransport::Ssh(_) => LaunchMode::Ssh,
+            HostTransport::Srun(_) => LaunchMode::Srun,
+        }
+    }
+
+    /// Absolute agent directory on the node (no `~`).
     pub fn remote_dir(&self) -> &str {
         &self.remote_dir
     }
@@ -146,12 +136,6 @@ impl HostSession {
     /// Absolute path of the deployed agent binary.
     pub fn agent_path(&self) -> &str {
         &self.agent_path
-    }
-
-    /// The remote words after the `env` program for an `agent <args>` spawn
-    /// (`agent_spawn_args`), shared by every spawn path.
-    fn spawn_args(&self, args: &[&str]) -> Vec<String> {
-        agent_spawn_args(&self.env_words, &self.agent_path, args)
     }
 
     /// Run a short remote command, capturing stdout (used by deploy for
@@ -171,111 +155,70 @@ impl HostSession {
     /// Like [`HostSession::exec`] but a non-zero exit is returned instead of
     /// raised: bootstrap tuning reports refusals as warnings.
     pub async fn exec_capture(&self, command: &str) -> Result<RemoteOutput> {
-        run_shell(&self.session, &self.host.addr, command).await
+        self.transport.exec_capture(&self.host.addr, command).await
     }
 
-    /// Upload a local file to `remote_path` (sftp), creating parent dirs,
-    /// setting the executable bit when `executable`.
-    ///
-    /// The bytes land in a sibling temp file that is then renamed into place,
-    /// so a concurrently running copy of the old binary cannot make the write
-    /// fail with `ETXTBSY` and readers never observe a half-written file.
+    /// Upload a local file over the session (ssh/sftp only; srun deploys
+    /// fleet-wide through `deploy::ensure_fleet`). Staged then renamed, so
+    /// a running copy of the old binary cannot make the write fail with
+    /// `ETXTBSY` and readers never observe a half-written file.
     pub async fn upload(&self, local: &Path, remote_path: &str, executable: bool) -> Result<()> {
-        let bytes = tokio::fs::read(local)
-            .await
-            .with_context(|| format!("reading local file {}", local.display()))?;
-        let parent = remote_path
-            .rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .filter(|parent| !parent.is_empty())
-            .unwrap_or(".");
-        self.exec(&format!("mkdir -p {}", single_quote(parent)))
-            .await
-            .with_context(|| format!("creating remote directory {parent}"))?;
-
-        let staging = format!("{remote_path}.staging");
-        self.sftp_write(&staging, &bytes)
-            .await
-            .with_context(|| format!("uploading {} to {}", local.display(), staging))?;
-
-        let mode = if executable { "755" } else { "644" };
-        self.exec(&format!(
-            "chmod {mode} {staging} && mv -f {staging} {dest}",
-            staging = single_quote(&staging),
-            dest = single_quote(remote_path),
-        ))
-        .await
-        .with_context(|| format!("installing {remote_path}"))?;
-        debug!(
-            host = %self.host.addr,
-            remote_path,
-            bytes = bytes.len(),
-            "uploaded file"
-        );
-        Ok(())
-    }
-
-    async fn sftp_write(&self, remote_path: &str, bytes: &[u8]) -> Result<()> {
-        let mut child = self
-            .session
-            .subsystem("sftp")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .await
-            .context("spawning sftp subsystem")?;
-        let stdin = child.stdin().take().context("sftp stdin unavailable")?;
-        let stdout = child.stdout().take().context("sftp stdout unavailable")?;
-
-        let sftp = Sftp::new(stdin, stdout, SftpOptions::default())
-            .await
-            .context("sftp handshake")?;
-        let result = async {
-            let mut options = sftp.options();
-            options.write(true).create(true).truncate(true);
-            let mut file = options
-                .open(remote_path)
+        match self.transport.ssh_session() {
+            Some(session) => {
+                super::transport::ssh_upload(
+                    session,
+                    &self.host.addr,
+                    local,
+                    remote_path,
+                    executable,
+                )
                 .await
-                .with_context(|| format!("opening {remote_path} for write"))?;
-            file.write_all(bytes)
-                .await
-                .with_context(|| format!("writing {remote_path}"))?;
-            file.close().await.context("closing remote file")?;
-            Ok::<(), anyhow::Error>(())
+            }
+            None => bail!(
+                "{}: per-host upload is not available in srun launch mode",
+                self.host.addr
+            ),
         }
-        .await;
-        sftp.close().await.context("closing sftp session")?;
-        result?;
-        child.wait().await.context("waiting for sftp subsystem")?;
-        Ok(())
     }
 
-    /// Spawn the deployed agent with `args`, write `stdin_doc` (a single
-    /// JSON line) to its stdin, and stream decoded events to `on_event`
-    /// until EOF. Returns the remote exit status.
-    pub async fn run_agent(
+    async fn spawn(&self, args: &[&str], stdio: SpawnStdio) -> Result<AgentChild> {
+        self.transport
+            .spawn(
+                AgentCommand {
+                    host: &self.host.addr,
+                    env: &self.agent_env,
+                    agent_path: &self.agent_path,
+                    args,
+                },
+                stdio,
+            )
+            .await
+            .with_context(|| format!("spawning agent {args:?} on {}", self.host.addr))
+    }
+
+    /// Spawn with stdin piped when there is a document to send, write it
+    /// (one JSON line) and close stdin so the agent sees EOF and starts.
+    async fn spawn_with_document(
         &self,
         args: &[&str],
         stdin_doc: Option<String>,
-        mut on_event: impl FnMut(AgentEvent) + Send,
-    ) -> Result<ExitStatus> {
-        let mut command = self.session.command("env");
-        command
-            .raw_args(self.spawn_args(args))
-            .stdin(if stdin_doc.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .await
-            .with_context(|| format!("spawning agent {args:?} on {}", self.host.addr))?;
-
+    ) -> Result<AgentChild> {
+        let mut child = self
+            .spawn(
+                args,
+                SpawnStdio {
+                    stdin: if stdin_doc.is_some() {
+                        Pipe::Piped
+                    } else {
+                        Pipe::Null
+                    },
+                    stdout: Pipe::Piped,
+                    stderr: Pipe::Piped,
+                },
+            )
+            .await?;
         if let Some(doc) = stdin_doc {
-            let mut stdin = child.stdin().take().context("agent stdin unavailable")?;
+            let mut stdin = child.take_stdin().context("agent stdin unavailable")?;
             stdin
                 .write_all(doc.as_bytes())
                 .await
@@ -288,13 +231,25 @@ impl HostSession {
             // Dropping closes the pipe, so the agent sees EOF and starts work.
             drop(stdin);
         }
+        Ok(child)
+    }
+
+    /// Spawn the deployed agent with `args`, write `stdin_doc` (a single
+    /// JSON line) to its stdin, and stream decoded events to `on_event`
+    /// until EOF. Returns the remote exit status.
+    pub async fn run_agent(
+        &self,
+        args: &[&str],
+        stdin_doc: Option<String>,
+        mut on_event: impl FnMut(AgentEvent) + Send,
+    ) -> Result<ExitStatus> {
+        let mut child = self.spawn_with_document(args, stdin_doc).await?;
 
         let stderr_task = child
-            .stderr()
-            .take()
+            .take_stderr()
             .map(|stderr| tokio::spawn(drain_stderr(self.host.addr.clone(), stderr)));
 
-        let stdout = child.stdout().take().context("agent stdout unavailable")?;
+        let stdout = child.take_stdout().context("agent stdout unavailable")?;
         let mut lines = BufReader::new(stdout).lines();
         let mut checked_hello = false;
         while let Some(line) = lines
@@ -343,65 +298,63 @@ impl HostSession {
         args: &[&str],
         stdin_doc: Option<String>,
     ) -> Result<RemoteOutput> {
-        let mut command = self.session.command("env");
-        command
-            .raw_args(self.spawn_args(args))
-            .stdin(if stdin_doc.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .await
-            .with_context(|| format!("spawning agent {args:?} on {}", self.host.addr))?;
-
-        if let Some(doc) = stdin_doc {
-            let mut stdin = child.stdin().take().context("agent stdin unavailable")?;
-            stdin
-                .write_all(doc.as_bytes())
-                .await
-                .context("writing agent stdin document")?;
-            stdin
-                .write_all(b"\n")
-                .await
-                .context("writing agent stdin")?;
-            stdin.flush().await.context("flushing agent stdin")?;
-            drop(stdin);
-        }
-
-        let output = child
-            .wait_with_output()
+        let mut child = self.spawn_with_document(args, stdin_doc).await?;
+        let stdout = child.take_stdout().context("agent stdout unavailable")?;
+        let stderr = child.take_stderr().context("agent stderr unavailable")?;
+        let (stdout, stderr) = tokio::try_join!(read_all(stdout), read_all(stderr))
+            .with_context(|| format!("running agent {args:?} on {}", self.host.addr))?;
+        let status = child
+            .wait()
             .await
             .with_context(|| format!("running agent {args:?} on {}", self.host.addr))?;
         Ok(RemoteOutput {
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            status,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         })
     }
 
     /// Start the agent in the background and hand back the child. The handle
-    /// owns a clone of the session, so it outlives this borrow (phase 3 keeps
-    /// a `peer serve` running while it drives the other end of the pair).
-    pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
-        let mut command = Arc::clone(&self.session).arc_command("env");
-        command
-            .raw_args(self.spawn_args(args))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut child = command
-            .spawn()
-            .await
-            .with_context(|| format!("spawning agent {args:?} on {}", self.host.addr))?;
-        if let Some(stderr) = child.stderr().take() {
+    /// owns what it needs (a session clone, or the local srun process), so
+    /// it outlives this borrow (phase 3 keeps a `peer serve` running while
+    /// it drives the other end of the pair).
+    pub async fn spawn_agent(&self, args: &[&str]) -> Result<AgentChild> {
+        let mut child = self
+            .spawn(
+                args,
+                SpawnStdio {
+                    stdin: Pipe::Null,
+                    stdout: Pipe::Null,
+                    stderr: Pipe::Piped,
+                },
+            )
+            .await?;
+        if let Some(stderr) = child.take_stderr() {
             tokio::spawn(drain_stderr(self.host.addr.clone(), stderr));
         }
         Ok(child)
     }
+
+    /// Kill this host's agent running `agent <args...>` (word prefix:
+    /// `barrier serve --port 29500` also matches its trailing flags).
+    /// Dropping the local future on a timeout does not stop the remote
+    /// process — it can sit blocked in a collective or a socket and never
+    /// write to stdout again, so it never even dies of SIGPIPE — so every
+    /// timeout that abandons an agent ends here. ssh: `pkill -f` on the
+    /// node; srun: `scancel --signal=KILL` of the matching step. Best
+    /// effort: a failure is logged, not raised.
+    pub async fn kill_agent(&self, args: &str) {
+        match self.transport.kill_agent(&self.host.addr, args).await {
+            Ok(action) => debug!(host = %self.addr(), args, action, "remote agent cleanup sent"),
+            Err(error) => warn!(host = %self.addr(), args, %error, "remote agent cleanup failed"),
+        }
+    }
+}
+
+async fn read_all(mut stream: super::transport::AgentOutput) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).await?;
+    Ok(buffer)
 }
 
 fn check_hello(host: &str, event: &AgentEvent) -> Result<()> {
@@ -426,7 +379,7 @@ fn check_hello(host: &str, event: &AgentEvent) -> Result<()> {
     }
 }
 
-async fn drain_stderr(host: String, stderr: openssh::ChildStderr) {
+async fn drain_stderr(host: String, stderr: impl AsyncRead + Unpin) {
     let mut lines = BufReader::new(stderr).lines();
     loop {
         match lines.next_line().await {
@@ -444,43 +397,34 @@ async fn drain_stderr(host: String, stderr: openssh::ChildStderr) {
     }
 }
 
-/// `mkdir -p` the scratch directory and report its absolute path. The
-/// expansion happens on the node: `~` means the *remote* home directory.
-async fn resolve_remote_dir(session: &Session, addr: &str, remote_dir: &str) -> Result<String> {
-    let quoted = shell_path(remote_dir);
+/// `mkdir -p` the agent directory and report its absolute path. The
+/// expansion happens on the node: `~` means the *node's* home directory.
+async fn resolve_remote_dir(transport: &HostTransport, addr: &str, dir: &str) -> Result<String> {
+    let quoted = shell_path(dir);
     let script = format!("mkdir -p {quoted} && cd {quoted} && pwd");
-    let output = run_shell(session, addr, &script).await?;
+    let output = transport.exec_capture(addr, &script).await?;
     if !output.success() {
         bail!(
-            "cannot prepare remote_dir {remote_dir} on {addr}: {}",
+            "cannot prepare agent directory {dir} on {addr}: {}",
             output.detail()
         );
     }
     let path = output.stdout.trim().to_string();
     if path.is_empty() {
-        bail!("remote_dir {remote_dir} on {addr} resolved to an empty path");
+        bail!("agent directory {dir} on {addr} resolved to an empty path");
     }
     Ok(path)
 }
 
-async fn run_shell(session: &Session, addr: &str, script: &str) -> Result<RemoteOutput> {
-    let output = session
-        .command("sh")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .await
-        .with_context(|| format!("running `{script}` on {addr}"))?;
-    Ok(RemoteOutput {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-    })
+/// `pkill -f` pattern for a deployed agent running `agent <args>`. The
+/// remote command line is `<remote_dir>/bin/gauntlet-agent agent <args>`
+/// (`HostSession::run_agent`); the bracket keeps the pattern from matching
+/// the `pkill` invocation itself.
+pub(crate) fn agent_kill_pattern(args: &str) -> String {
+    format!("[g]auntlet-agent agent {args}")
 }
 
-/// Environment words for every agent invocation, in order, each already a
-/// single quoted POSIX-sh word (they go through `raw_arg`, unescaped by
-/// openssh):
+/// The environment of every agent invocation, in order:
 ///
 /// - `LD_LIBRARY_PATH=<remote_dir>/lib`: `<remote_dir>/lib` holds shim
 ///   symlinks bootstrap may have created for runtime-only libraries (e.g.
@@ -491,16 +435,32 @@ async fn run_shell(session: &Session, addr: &str, script: &str) -> Result<Remote
 ///   puts them in the environment before the agent starts any thread. The
 ///   agent itself never calls `set_var` — it runs on a multi-threaded tokio
 ///   runtime, where mutating the environment is unsound.
-///
-/// Keys are validated `^NCCL_[A-Z0-9_]+$` (literal shell words); values are
-/// single-quoted, so spaces, quotes, `$`, backticks and globs stay literal.
+pub(crate) fn agent_env_vars(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<(String, String)> {
+    std::iter::once(("LD_LIBRARY_PATH".to_string(), format!("{remote_dir}/lib")))
+        .chain(
+            nccl_env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string())),
+        )
+        .collect()
+}
+
+/// `KEY='value'` words for the ssh `env` command line, each a single quoted
+/// POSIX-sh word (they go through `raw_arg`, unescaped by openssh). Keys
+/// are literal shell words (`LD_LIBRARY_PATH`, validated
+/// `^NCCL_[A-Z0-9_]+$`); values are single-quoted, so spaces, quotes, `$`,
+/// backticks and globs stay literal.
+pub(crate) fn env_words(vars: &[(String, String)]) -> Vec<String> {
+    vars.iter()
+        .map(|(key, value)| format!("{key}={}", single_quote(value)))
+        .collect()
+}
+
+/// `agent_env_vars` rendered as ssh `env` words (what `transport::ssh`
+/// puts on the remote command line).
+#[cfg(test)]
 pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<String> {
-    std::iter::once(format!(
-        "LD_LIBRARY_PATH={}",
-        single_quote(&format!("{remote_dir}/lib"))
-    ))
-    .chain(nccl_env_words(nccl_env))
-    .collect()
+    env_words(&agent_env_vars(remote_dir, nccl_env))
 }
 
 /// Every remote word after the `env` program of an agent spawn, each already
@@ -528,6 +488,7 @@ pub(crate) fn agent_spawn_args(
 
 /// `KEY='value'` words for the NCCL env, in key order; empty for an empty
 /// env (no prefix at all).
+#[cfg(test)]
 pub(crate) fn nccl_env_words(nccl_env: &NcclEnv) -> Vec<String> {
     nccl_env
         .iter()
