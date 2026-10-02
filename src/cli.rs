@@ -2,6 +2,17 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::proto::Phase;
+
+/// `--phases` help, built from the phase table so a new phase shows up
+/// without anyone remembering to edit a doc comment.
+fn phases_help() -> String {
+    format!(
+        "Restrict to a subset of phases, comma-separated: {}",
+        Phase::help_list()
+    )
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "gauntlet",
@@ -35,8 +46,8 @@ pub struct RunArgs {
     /// Write results JSON here (default: runs/<run-id>.json).
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// Restrict to a subset of phases (inventory, cpu_mem, gpu, network).
-    #[arg(long, value_delimiter = ',')]
+    // Help generated from `Phase::PARSE_TABLE` (`phases_help`).
+    #[arg(long, value_delimiter = ',', help = phases_help())]
     pub phases: Vec<String>,
     /// Sampled network mode: test only this many pairs per host instead of full mesh.
     #[arg(long)]

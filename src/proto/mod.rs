@@ -178,15 +178,57 @@ impl Phase {
         Phase::Overlap,
     ];
 
-    pub fn parse(s: &str) -> Option<Phase> {
-        match s {
-            "inventory" => Some(Phase::Inventory),
-            "cpu_mem" | "cpu" => Some(Phase::CpuMem),
-            "gpu" => Some(Phase::Gpu),
-            "network" | "net" => Some(Phase::Network),
-            "overlap" => Some(Phase::Overlap),
-            _ => None,
+    /// Every accepted `--phases` spelling: each phase's canonical `name`
+    /// plus short aliases. `parse` and the generated CLI help both read
+    /// this table, so neither can drift from the other.
+    pub const PARSE_TABLE: &'static [(&'static str, Phase)] = &[
+        ("inventory", Phase::Inventory),
+        ("cpu_mem", Phase::CpuMem),
+        ("cpu", Phase::CpuMem),
+        ("gpu", Phase::Gpu),
+        ("network", Phase::Network),
+        ("net", Phase::Network),
+        ("overlap", Phase::Overlap),
+    ];
+
+    /// Canonical name: the serde spelling and the config/CLI spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Phase::Inventory => "inventory",
+            Phase::CpuMem => "cpu_mem",
+            Phase::Gpu => "gpu",
+            Phase::Network => "network",
+            Phase::Overlap => "overlap",
         }
+    }
+
+    pub fn parse(s: &str) -> Option<Phase> {
+        Self::PARSE_TABLE
+            .iter()
+            .find(|(alias, _)| *alias == s)
+            .map(|(_, phase)| *phase)
+    }
+
+    /// Run-order list of canonical names with their aliases, e.g.
+    /// `inventory, cpu_mem (cpu), gpu, network (net), overlap`, for help
+    /// text.
+    pub fn help_list() -> String {
+        Self::ALL
+            .iter()
+            .map(|phase| {
+                let aliases: Vec<&str> = Self::PARSE_TABLE
+                    .iter()
+                    .filter(|(alias, target)| target == phase && *alias != phase.name())
+                    .map(|(alias, _)| *alias)
+                    .collect();
+                if aliases.is_empty() {
+                    phase.name().to_string()
+                } else {
+                    format!("{} ({})", phase.name(), aliases.join(", "))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
