@@ -129,9 +129,12 @@ Orchestrator-side, because the threshold is orchestrator config and the
 agent reports facts only: `orchestrator::node_phase` derives
 `gpu_idle_outcomes` from each `Inventory` event as it arrives and forwards
 them as `TestId::GpuIdle` outcomes right behind the snapshot (so partial
-snapshots show them too). Failed feeds `report::verdict` like any failed
-test (Failures, never HostFailures: the host is reachable and the finding
-is actionable). Bootstrap applies the same `assess_gpu_idle` with the same
+snapshots show them too). Failed feeds `report::verdict` in the *soft* tier
+(`Outliers`, exit 1 — `report::failed_outcome_tier`): another tenant's
+process is an environmental finding, not broken hardware, so it never
+outranks host failures or hard evidence, and never reads as
+HostFailures either (the host is reachable and the finding is
+actionable). Bootstrap applies the same `assess_gpu_idle` with the same
 threshold to its probe (`gpu_idle` matrix column); the report renders a
 "gpus in use (gpu_idle)" section (docs/features/reporting.md).
 

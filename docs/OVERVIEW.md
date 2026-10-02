@@ -103,7 +103,8 @@ Features Index:
       orchestrator derives one TestId::GpuIdle outcome per GPU as the
       inventory arrives (proto::assess_gpu_idle against
       thresholds.gpu_idle_max_used_mib, default 1024): Failed names each
-      process, pid and MiB and makes the verdict Failures; unknown is
+      process, pid and MiB and makes the verdict Outliers (soft tier:
+      environmental, not broken hardware); unknown is
       Skipped. Bootstrap shows the same policy as its gpu_idle column
       (warn); the report adds a "gpus in use" section. Detection only: no
       phase is auto-skipped.
@@ -250,8 +251,10 @@ Features Index:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
       overlay, run history, terminal table, typed verdict + exit codes
-      (schema v13: hard failures exit 3, outliers only exit 1, host
-      failures exit 2), run-level gauntlet_version (build.rs git
+      (schema v13, monotonic in severity: 0 clean, 1 outliers/soft
+      incl. gpu_idle, 2 host failures, 3 hard evidence; 4 = error before
+      any verdict, CLI usage errors included; null verdict = run in
+      flight), run-level gauntlet_version (build.rs git
       revision; also `gauntlet --version`). Live runs publish
       periodic partial snapshots (runs/<run_id>.partial.json, written via
       temp+rename, removed on completion) under a run id fixed at startup;

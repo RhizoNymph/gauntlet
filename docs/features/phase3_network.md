@@ -15,11 +15,18 @@ fleet sweep) and `barrier` (both barrier-skew probes). Default: all.
 `--net-steps` (comma-separated, help generated from
 `NetStep::PARSE_TABLE`) overrides `tests.net_steps`;
 `tests.nccl_intranode = false` always removes `intranode`.
-`FleetConfig::resolve_net_steps` is the only constructor of the resolved
-`NetSteps`, so the set the orchestrator sees is validated (unknown names
-are `ConfigError::UnknownNetStep`) and non-empty (`ConfigError::NoNetSteps`
-— drop the network phase instead). `validate` resolves it once, so a bad
-`net_steps` fails at load.
+Config, CLI and serde share one spelling table (`crate::names`), so
+`net_steps = ["tcp"]` in the config works exactly like `--net-steps tcp`;
+an unknown name fails at load (config) or with
+`ConfigError::UnknownNetStep` (CLI). The set is resolved by
+`FleetConfig::run_plan` *after* the `--net-steps` override is merged and
+*only* when the network phase is selected (`RunPlan::net_steps` is
+`Some` exactly then): a config whose own selection empties out (say
+`nccl_intranode = false` with `net_steps = ["intranode"]`) still loads,
+bootstraps, and runs `--phases gpu`; a network run with an empty resolved
+set is `ConfigError::NoNetSteps` (drop the network phase instead).
+`resolve_net_steps` is the only constructor of `NetSteps`, so the set the
+orchestrator sees is never empty.
 
 A quick NCCL-only check is `gauntlet run --phases network --net-steps
 nccl` (add `intranode` for both NCCL levels). Before any step runs,
@@ -368,7 +375,9 @@ Intra-node level and shared sweep loop:
   `TestId::{NcclIntraAllReduce, NcclIntraAllGather}`, `nccl_metric` name
   consts and helpers (`bus_peak`, `gpu_class_suffix`); PROTO_VERSION 8.
 - `src/config.rs` — `tests.nccl_intranode`, `intranode_sweep_spec`,
-  `tests.net_steps`, `resolve_net_steps`.
+  `tests.net_steps`, `resolve_net_steps`, `run_plan` / `RunPlan`.
+- `src/names.rs` — `NameTable`, `parse`, `help_list`, `parse_named`,
+  `serde_via_name_table!` (shared with `Phase`).
 - `src/net_steps.rs` — `NetStep` (`ALL`, `PARSE_TABLE`, `name`, `parse`,
   `help_list`, `tests`), `NetSteps` (`contains`, `iter`, `nccl_barrier`),
   `disabled_outcomes`, `DISABLED_REASON`.
