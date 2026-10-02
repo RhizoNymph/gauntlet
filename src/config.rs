@@ -108,6 +108,27 @@ impl Default for SshConfig {
     }
 }
 
+/// How the fleet NCCL sweep lays out its world (`[tests] nccl_world`).
+///
+/// - `rank_per_gpu` (default): one rank per GPU on every NCCL-capable
+///   host — what training runs; the ring mixes NVLink/PCIe with the
+///   fabric.
+/// - `rank_per_node`: one rank per host, on its GPU 0. Every peer is on
+///   another node, so all collective traffic crosses the NIC (pure
+///   inter-node, the nccl-tests one-GPU-per-node shape).
+/// - `per_rail`: one world per local GPU index `r` (rail `r`), each one
+///   rank per host on that host's GPU `r` (hosts with more than `r` GPUs
+///   join), run one rail after another so each rail's NIC/PCIe path is
+///   measured alone and its number is attributable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NcclWorldShape {
+    #[default]
+    RankPerGpu,
+    RankPerNode,
+    PerRail,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TestConfig {
@@ -142,6 +163,9 @@ pub struct TestConfig {
     /// node, NVLink/PCIe) before the pairwise and fleet levels. Reuses
     /// `nccl_sizes` / `nccl_iters_per_size`.
     pub nccl_intranode: bool,
+    /// World shape of the fleet NCCL sweep (the barrier probe and the
+    /// fleet overlap step always run rank-per-GPU).
+    pub nccl_world: NcclWorldShape,
     /// Barrier-skew microbenchmark iterations (0 disables it).
     pub barrier_iters: u32,
     /// Payload of the tiny barrier all-reduce, in bytes.
@@ -182,6 +206,7 @@ impl Default for TestConfig {
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
             nccl_intranode: true,
+            nccl_world: NcclWorldShape::RankPerGpu,
             barrier_iters: 2000,
             barrier_bytes: 8,
             overlap_secs: 30,

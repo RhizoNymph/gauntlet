@@ -1,0 +1,175 @@
+//! Report handling of the fleet-level NCCL sweep headlines and the
+//! inter-node world shapes (proto v11 / schema v13).
+
+use std::collections::BTreeMap;
+
+use gauntlet::config::FleetConfig;
+use gauntlet::orchestrator::collect::HostObservations;
+use gauntlet::proto::{MetricRecord, Scope, TestId, Unit};
+use gauntlet::report;
+
+fn config_for(hosts: &[String]) -> FleetConfig {
+    let list = hosts
+        .iter()
+        .map(|h| format!("\"{h}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config: FleetConfig = toml::from_str(&format!("hosts = [{list}]")).expect("test config");
+    config.validate().expect("valid");
+    config
+}
+
+fn node(test: TestId, name: &str, value: f64, unit: Unit, repeat: u32) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope: Scope::Node,
+        name: name.into(),
+        value,
+        unit,
+        repeat,
+    }
+}
+
+/// Per-size series (alpha 10 us + 1 us/KiB) under `test`, for one repeat.
+fn sweep_series(obs: &mut HostObservations, test: TestId, repeat: u32) {
+    for kib in [1u64, 4, 16, 64, 256] {
+        let bytes = (kib * 1024) as f64;
+        let elapsed = 10.0 + kib as f64;
+        obs.metrics
+            .push(node(test, "elapsed_us", elapsed, Unit::Micros, repeat));
+        obs.metrics
+            .push(node(test, "msg_bytes", bytes, Unit::Bytes, repeat));
+        obs.metrics.push(node(
+            test,
+            "bus_gib_per_sec",
+            bytes / elapsed,
+            Unit::GibPerSec,
+            repeat,
+        ));
+    }
+}
+
+fn hosts(n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("10.0.0.{i}")).collect()
+}
+
+#[test]
+fn the_fleet_headline_aggregates_across_repeats_but_never_enters_mad() {
+    let names = hosts(6);
+    let config = config_for(&names);
+    let mut observations: BTreeMap<String, HostObservations> = names
+        .iter()
+        .map(|host| (host.clone(), HostObservations::default()))
+        .collect();
+    // The lead carries one fleet-level value per repeat; one repeat is
+    // wildly off (a jittery fabric), which must show in the moments.
+    let lead = observations.get_mut(&names[0]).expect("lead");
+    for (repeat, value) in [(0, 20.0), (1, 21.0), (2, 2.0), (3, 20.5)] {
+        lead.metrics.push(node(
+            TestId::NcclAllReduce,
+            "bus_gib_per_sec_peak",
+            value,
+            Unit::GibPerSec,
+            repeat,
+        ));
+    }
+    let results = report::build(&config, observations, 1, 2);
+
+    let group = "nccl_all_reduce.bus_gib_per_sec_peak";
+    let subjects = &results.aggregates[group];
+    assert_eq!(subjects.len(), 1, "one subject: the lead host");
+    let moments = &subjects[&names[0]].moments;
+    assert_eq!(moments.n, 4);
+    assert!(moments.min < moments.median, "{moments:?}");
+    // Never a degenerate one-subject MAD group, nor a jitter group.
+    assert!(!results.fleet.outliers.contains_key(group));
+    assert!(!results.fleet.jitter_outliers.contains_key(group));
+}
+
+#[test]
+fn a_low_fleet_headline_still_trips_an_absolute_floor() {
+    let names = hosts(2);
+    let mut config = config_for(&names);
+    config.thresholds.absolute.insert(
+        "nccl_inter_all_reduce.bus_gib_per_sec_peak".to_string(),
+        toml::from_str("min = 10.0").expect("bound"),
+    );
+    let mut lead = HostObservations::default();
+    lead.metrics.push(node(
+        TestId::NcclInterAllReduce,
+        "bus_gib_per_sec_peak",
+        4.0,
+        Unit::GibPerSec,
+        0,
+    ));
+    let observations = BTreeMap::from([
+        (names[0].clone(), lead),
+        (names[1].clone(), HostObservations::default()),
+    ]);
+    let results = report::build(&config, observations, 1, 2);
+    assert_eq!(
+        results.fleet.threshold_violations["nccl_inter_all_reduce.bus_gib_per_sec_peak"],
+        [names[0].clone()]
+    );
+}
+
+#[test]
+fn inter_node_series_fit_their_own_link_classes() {
+    let names = hosts(2);
+    let config = config_for(&names);
+    let mut lead = HostObservations::default();
+    // Two rails, both led by the same host: their series pool into one
+    // inter-node class, never into the rank-per-GPU one.
+    sweep_series(&mut lead, TestId::NcclInterAllReduce, 0);
+    sweep_series(&mut lead, TestId::NcclInterAllReduce, 0);
+    sweep_series(&mut lead, TestId::NcclInterAllGather, 0);
+    let observations = BTreeMap::from([
+        (names[0].clone(), lead),
+        (names[1].clone(), HostObservations::default()),
+    ]);
+    let results = report::build(&config, observations, 1, 2);
+    let links = &results.calibration.links;
+    let fit = links["nccl_allreduce_inter_node"];
+    assert!((fit.alpha_us - 10.0).abs() < 1e-6, "{fit:?}");
+    assert!(links.contains_key("nccl_allgather_inter_node"));
+    assert!(!links.contains_key("nccl_allreduce_rank_per_gpu"));
+    // Per-size series repeat their sample key: never aggregated, never MAD.
+    assert!(
+        !results
+            .aggregates
+            .contains_key("nccl_inter_all_reduce.bus_gib_per_sec")
+    );
+}
+
+#[test]
+fn per_rail_headlines_are_fleet_level_too() {
+    let names = hosts(5);
+    let config = config_for(&names);
+    let mut observations: BTreeMap<String, HostObservations> = names
+        .iter()
+        .map(|host| (host.clone(), HostObservations::default()))
+        .collect();
+    // Rail leads can differ (a host without GPU r cannot lead rail r);
+    // even spread over several hosts these are not fleet peers.
+    for (index, host) in names.iter().enumerate() {
+        let obs = observations.get_mut(host).expect("host");
+        obs.metrics.push(node(
+            TestId::NcclInterAllGather,
+            "bus_gib_per_sec_peak_rail0",
+            if index == 0 { 1.0 } else { 20.0 },
+            Unit::GibPerSec,
+            0,
+        ));
+    }
+    let results = report::build(&config, observations, 1, 2);
+    assert!(
+        !results
+            .fleet
+            .outliers
+            .contains_key("nccl_inter_all_gather.bus_gib_per_sec_peak_rail0")
+    );
+    assert_eq!(
+        report::test_display_name(TestId::NcclInterAllGather),
+        "nccl_inter_all_gather"
+    );
+}

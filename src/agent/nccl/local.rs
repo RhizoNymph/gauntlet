@@ -86,10 +86,10 @@ impl PreparedRanks {
     pub(super) fn new(assignment: RankAssignment) -> Result<Self> {
         let block = assignment.block();
         let visible = CudaContext::device_count().context("counting cuda devices")?;
-        check_local_devices(block.count(), visible)?;
+        // The block's highest GPU must exist: `gpus().end` devices.
+        check_local_devices(block.gpus().end, visible)?;
         let mut ranks = Vec::with_capacity(block.count() as usize);
-        for global in block.ranks() {
-            let local = global - block.base();
+        for (global, local) in block.ranks().zip(block.gpus()) {
             let ctx = CudaContext::new(local as usize)
                 .with_context(|| format!("creating cuda context for local gpu {local}"))?;
             ctx.bind_to_thread()
@@ -195,7 +195,8 @@ impl LocalRank {
     }
 }
 
-/// Every rank of this host's block, local GPU `i` at index `i`, connected.
+/// Every rank of this host's block, connected; index `i` is block position
+/// `i` (rank `base + i`, on GPU `first_gpu + i`).
 pub(super) struct LocalRanks {
     assignment: RankAssignment,
     ranks: Vec<LocalRank>,

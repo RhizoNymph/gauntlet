@@ -53,7 +53,14 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-pub const PROTO_VERSION: u32 = 10;
+// v11: NCCL world shapes — `RankBlock` carries the local GPU its ranks
+// start on (`first_gpu`, serde-defaulted to 0 and omitted when 0), the
+// sweep workload carries its `SweepSeries` (serde-defaulted to
+// rank-per-GPU), `NcclWorkload::Barrier` runs the barrier probe alone,
+// and the `nccl_inter_all_reduce` / `nccl_inter_all_gather` test ids ride
+// the wire. The lead of every fleet sweep also emits a fleet-level
+// `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline.
+pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -232,6 +239,12 @@ pub enum TestId {
     NcclIntraAllReduce,
     /// Intra-node all-gather sweep, same communicator as the all-reduce.
     NcclIntraAllGather,
+    /// Pure inter-node all-reduce sweep (`tests.nccl_world` =
+    /// `rank_per_node` or `per_rail`): one rank per host, so every peer is
+    /// on another node and all collective traffic crosses the NIC.
+    NcclInterAllReduce,
+    /// Pure inter-node all-gather sweep, same world as the all-reduce.
+    NcclInterAllGather,
     /// Barrier-skew microbenchmark over the NCCL group (tiny all-reduce).
     NcclBarrier,
     /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
@@ -600,13 +613,31 @@ pub mod nccl_metric {
     pub const MSG_BYTES: &str = "msg_bytes";
     /// Bus bandwidth at one message size.
     pub const BUS: &str = "bus_gib_per_sec";
-    /// Intra-node only: prefix of the per-node headline, the best bus
-    /// bandwidth across the sweep's sizes. Always emitted keyed by
-    /// communicator size (`bus_peak`), never bare.
+    /// Prefix of every sweep headline: the best bus bandwidth across the
+    /// sweep's sizes. The intra-node headline is always keyed by
+    /// communicator size (`bus_peak`); the fleet-level headlines are
+    /// `BUS_PEAK` (bare) and `bus_peak_rail`.
     pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
+    /// Fleet-level headline of a fleet or inter-node sweep (proto v11):
+    /// one value per run, attributed to the world's lead host at node
+    /// scope. Not fleet-comparable within a run (it has no peers); the
+    /// report aggregates it across repeats but keeps it out of MAD.
+    pub const BUS_PEAK: &str = BUS_PEAK_PREFIX;
     /// Intra-node only: ranks (local GPUs) in the communicator; keys the
     /// intra-node calibration link class.
     pub const RANKS: &str = "ranks";
+
+    /// Rail suffix of the per-rail headlines: `rail<r>`.
+    pub fn rail_suffix(rail: u32) -> String {
+        format!("rail{rail}")
+    }
+
+    /// Per-rail inter-node headline: `bus_gib_per_sec_peak_rail<r>`, the
+    /// best bus bandwidth of rail `r`'s world (GPU `r` of every host that
+    /// has one), attributed to that rail's lead host.
+    pub fn bus_peak_rail(rail: u32) -> String {
+        format!("{BUS_PEAK_PREFIX}_{}", rail_suffix(rail))
+    }
 
     /// Topology suffix shared by the intra-node headline and the intra-node
     /// calibration link classes: `<n>gpu`.
@@ -741,11 +772,77 @@ pub enum NcclWorkload {
         iters_per_size: u32,
         #[serde(default)]
         barrier: Option<BarrierSpec>,
+        /// Which world shape this sweep's world was laid out in, and so
+        /// which test ids and headline name the lead emits under (proto
+        /// v11; absent = rank-per-GPU).
+        #[serde(default)]
+        series: SweepSeries,
     },
     /// Fleet overlap protocol: isolated all-reduce baseline, then the same
     /// all-reduce under GEMM load on every local GPU; every rank reports
     /// an `OverlapFleetReport`.
     Overlap(OverlapSpec),
+    /// The barrier-skew microbenchmark alone (proto v11): run on the
+    /// rank-per-GPU world when the sweep itself ran in a different world
+    /// shape, so barrier subjects stay `host:gpuN` whatever the shape.
+    Barrier(BarrierSpec),
+}
+
+/// Which fleet sweep a `NcclWorkload::Sweep` is: the world shape it was
+/// laid out in (`tests.nccl_world`). Decides the test ids of the lead's
+/// per-size series and the name of its headline:
+///
+/// - `RankPerGpu` (default): `nccl_all_*`, headline
+///   `bus_gib_per_sec_peak`.
+/// - `RankPerNode`: one rank per host on its GPU 0, every peer on another
+///   node — `nccl_inter_all_*`, headline `bus_gib_per_sec_peak`.
+/// - `Rail { rail }`: one rank per host on its GPU `rail` —
+///   `nccl_inter_all_*`, headline `bus_gib_per_sec_peak_rail<r>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SweepSeries {
+    #[default]
+    RankPerGpu,
+    RankPerNode,
+    Rail {
+        rail: u32,
+    },
+}
+
+impl SweepSeries {
+    /// Whether every peer of the world is on another node, so the sweep
+    /// measures the NIC path alone.
+    pub fn is_inter_node(self) -> bool {
+        !matches!(self, SweepSeries::RankPerGpu)
+    }
+
+    /// Name of the headline the world's lead emits for this sweep.
+    pub fn headline(self) -> String {
+        match self {
+            SweepSeries::RankPerGpu | SweepSeries::RankPerNode => nccl_metric::BUS_PEAK.to_string(),
+            SweepSeries::Rail { rail } => nccl_metric::bus_peak_rail(rail),
+        }
+    }
+
+    /// The two test ids this sweep's records land under (all-reduce,
+    /// all-gather).
+    pub fn tests(self) -> [TestId; 2] {
+        if self.is_inter_node() {
+            [TestId::NcclInterAllReduce, TestId::NcclInterAllGather]
+        } else {
+            [TestId::NcclAllReduce, TestId::NcclAllGather]
+        }
+    }
+}
+
+impl std::fmt::Display for SweepSeries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SweepSeries::RankPerGpu => f.write_str("rank-per-gpu"),
+            SweepSeries::RankPerNode => f.write_str("rank-per-node"),
+            SweepSeries::Rail { rail } => write!(f, "rail {rail}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -885,6 +982,79 @@ mod tests {
     }
 
     #[test]
+    fn sweep_workloads_default_to_the_rank_per_gpu_series() {
+        // A pre-v11 sweep workload has no series: it is the rank-per-GPU
+        // sweep.
+        let json = r#"{"kind":"sweep","sizes":[1024],"iters_per_size":20}"#;
+        let workload: NcclWorkload = serde_json::from_str(json).expect("decode");
+        let NcclWorkload::Sweep { series, .. } = workload else {
+            panic!("expected a sweep");
+        };
+        assert_eq!(series, SweepSeries::RankPerGpu);
+    }
+
+    #[test]
+    fn sweep_series_round_trip_and_name_their_headline() {
+        for (series, json, headline, tests) in [
+            (
+                SweepSeries::RankPerGpu,
+                r#"{"shape":"rank_per_gpu"}"#,
+                "bus_gib_per_sec_peak",
+                [TestId::NcclAllReduce, TestId::NcclAllGather],
+            ),
+            (
+                SweepSeries::RankPerNode,
+                r#"{"shape":"rank_per_node"}"#,
+                "bus_gib_per_sec_peak",
+                [TestId::NcclInterAllReduce, TestId::NcclInterAllGather],
+            ),
+            (
+                SweepSeries::Rail { rail: 7 },
+                r#"{"shape":"rail","rail":7}"#,
+                "bus_gib_per_sec_peak_rail7",
+                [TestId::NcclInterAllReduce, TestId::NcclInterAllGather],
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&series).expect("serialize"), json);
+            let back: SweepSeries = serde_json::from_str(json).expect("deserialize");
+            assert_eq!(back, series);
+            assert_eq!(series.headline(), headline);
+            assert_eq!(series.tests(), tests);
+            assert_eq!(series.is_inter_node(), series != SweepSeries::RankPerGpu);
+        }
+        assert!(serde_json::from_str::<SweepSeries>(r#"{"shape":"rail"}"#).is_err());
+        for (test, wire) in [
+            (TestId::NcclInterAllReduce, "\"nccl_inter_all_reduce\""),
+            (TestId::NcclInterAllGather, "\"nccl_inter_all_gather\""),
+        ] {
+            assert_eq!(serde_json::to_string(&test).expect("serialize"), wire);
+        }
+    }
+
+    #[test]
+    fn barrier_only_workloads_round_trip() {
+        let directive = NcclDirective::Lead {
+            assignment: assignment(0, 4, 8),
+            workload: NcclWorkload::Barrier(BarrierSpec {
+                iters: 2000,
+                bytes: 8,
+            }),
+        };
+        let json = serde_json::to_string(&directive).expect("serialize");
+        assert!(json.contains(r#""kind":"barrier""#), "{json}");
+        let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, directive);
+    }
+
+    #[test]
+    fn rail_headline_names_carry_the_rail() {
+        assert_eq!(nccl_metric::bus_peak_rail(0), "bus_gib_per_sec_peak_rail0");
+        assert_eq!(nccl_metric::rail_suffix(3), "rail3");
+        assert!(nccl_metric::bus_peak_rail(2).starts_with(nccl_metric::BUS_PEAK_PREFIX));
+        assert_eq!(nccl_metric::BUS_PEAK, "bus_gib_per_sec_peak");
+    }
+
+    #[test]
     fn barrier_specs_ride_the_sweep_workload() {
         let directive = NcclDirective::Participate {
             unique_id_b64: "abc".into(),
@@ -896,6 +1066,7 @@ mod tests {
                     iters: 2000,
                     bytes: 8,
                 }),
+                series: SweepSeries::RankPerGpu,
             },
         };
         let json = serde_json::to_string(&directive).expect("serialize");

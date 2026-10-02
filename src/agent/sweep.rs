@@ -16,7 +16,7 @@ use std::num::NonZeroU32;
 use std::time::Instant;
 
 use crate::agent::nccl::{F32_BYTES, all_gather_bus_gib_per_sec, all_reduce_bus_gib_per_sec};
-use crate::proto::{MetricRecord, Scope, TestId, Unit, nccl_metric};
+use crate::proto::{MetricRecord, Scope, SweepSeries, TestId, Unit, nccl_metric};
 
 /// Untimed full-size all-reduces before the first measured size, so channel
 /// setup and algorithm selection stay out of the sweep.
@@ -47,17 +47,31 @@ impl Collective {
 /// records land under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SweepLevel {
-    /// One rank per node across the fleet (`nccl_all_*`).
+    /// One rank per GPU across the fleet (`nccl_all_*`).
     Fleet,
+    /// One rank per host across the fleet — rank-per-node or one rail —
+    /// so every peer is on another node (`nccl_inter_all_*`).
+    InterNode,
     /// One rank per local GPU on one node (`nccl_intra_all_*`).
     IntraNode,
 }
 
 impl SweepLevel {
+    /// The fleet-wide level a sweep of the given world shape measures.
+    pub fn fleet(series: SweepSeries) -> Self {
+        if series.is_inter_node() {
+            SweepLevel::InterNode
+        } else {
+            SweepLevel::Fleet
+        }
+    }
+
     pub fn test(self, collective: Collective) -> TestId {
         match (self, collective) {
             (SweepLevel::Fleet, Collective::AllReduce) => TestId::NcclAllReduce,
             (SweepLevel::Fleet, Collective::AllGather) => TestId::NcclAllGather,
+            (SweepLevel::InterNode, Collective::AllReduce) => TestId::NcclInterAllReduce,
+            (SweepLevel::InterNode, Collective::AllGather) => TestId::NcclInterAllGather,
             (SweepLevel::IntraNode, Collective::AllReduce) => TestId::NcclIntraAllReduce,
             (SweepLevel::IntraNode, Collective::AllGather) => TestId::NcclIntraAllGather,
         }
@@ -378,6 +392,42 @@ mod tests {
             SweepLevel::IntraNode.test(Collective::AllGather),
             TestId::NcclIntraAllGather
         );
+    }
+
+    #[test]
+    fn world_shapes_pick_the_fleet_level() {
+        assert_eq!(
+            SweepLevel::fleet(SweepSeries::RankPerGpu),
+            SweepLevel::Fleet
+        );
+        assert_eq!(
+            SweepLevel::fleet(SweepSeries::RankPerNode),
+            SweepLevel::InterNode
+        );
+        assert_eq!(
+            SweepLevel::fleet(SweepSeries::Rail { rail: 2 }),
+            SweepLevel::InterNode
+        );
+        assert_eq!(
+            SweepLevel::InterNode.test(Collective::AllReduce),
+            TestId::NcclInterAllReduce
+        );
+        assert_eq!(
+            SweepLevel::InterNode.test(Collective::AllGather),
+            TestId::NcclInterAllGather
+        );
+        // The level and the series agree on the test ids.
+        for series in [
+            SweepSeries::RankPerGpu,
+            SweepSeries::RankPerNode,
+            SweepSeries::Rail { rail: 0 },
+        ] {
+            let level = SweepLevel::fleet(series);
+            assert_eq!(
+                series.tests(),
+                Collective::ALL.map(|collective| level.test(collective))
+            );
+        }
     }
 
     #[test]

@@ -66,6 +66,16 @@ intra-node straggler headline. Its name carries the GPU count, so nodes
 are only compared within their own topology (the same keying as the
 `_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
 
+Fleet-level headlines (schema v13) are the opposite case: one value per
+*run*, attributed to the world's lead host at node scope —
+`nccl_all_{reduce,gather}.bus_gib_per_sec_peak` and
+`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak[_rail<r>]`. They
+have no fleet peers, so `report::fleet_nccl::is_fleet_level` excludes
+them from the outlier and jitter passes by rule (a one-subject MAD group
+is degenerate: MAD 0, the subject is its own median). They still
+aggregate — moments across `--repeat` are the run-to-run jitter of the
+fleet number — and absolute thresholds check their median.
+
 ## Statistics contracts (stats.rs)
 - `median`: ignores non-finite; None on empty (after filtering).
 - `mad`: scaled by 1.4826; None for <2 finite values.
@@ -118,6 +128,12 @@ Per-host `NodeRoofline`:
   (distinct mount points are not comparable, so the best is the headline).
 
 `calibration.links`:
+- `nccl_allreduce_inter_node` / `nccl_allgather_inter_node` (schema
+  v13): the `nccl_inter_all_*` series of the NIC-forcing world shapes
+  (`tests.nccl_world = "rank_per_node" | "per_rail"`), every rail pooled
+  into one class, same emission-order join and fit as below
+  (`report::fleet_nccl::link_fits`, which also owns the rank-per-GPU
+  classes).
 - `nccl_allreduce_rank_per_gpu` / `nccl_allgather_rank_per_gpu` (named
   `nccl_*_fleet` before schema v8; renamed because the world changed
   meaning, see below): within each host's
@@ -192,7 +208,9 @@ tail progress:
 
 ## Files
 `src/analysis/{stats,fit,schedule}.rs`,
-`src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
+`src/report/{mod,history,intranode,nccl_env,gpu_idle,fleet_nccl}.rs`
+(`fleet_nccl`: `is_fleet_level`, fleet/inter-node `link_fits`; `mod`:
+`mad_groups`),
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`).
 
@@ -212,6 +230,8 @@ tail progress:
   result away from OLS.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
+- Fleet-level sweep headlines never enter the outlier or jitter passes;
+  they always aggregate and always face absolute thresholds.
 
 ## Error-counter findings (schema v4)
 

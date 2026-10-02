@@ -5,6 +5,7 @@
 //! bump SCHEMA_VERSION. The terminal table is a projection of it, never a
 //! second source of truth.
 
+mod fleet_nccl;
 pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
@@ -17,7 +18,7 @@ use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::fit::{AlphaBetaFit, FitBound, fit_alpha_beta};
+use crate::analysis::fit::{AlphaBetaFit, FitBound};
 use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
@@ -73,7 +74,16 @@ use crate::proto::{
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
 // is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
-pub const SCHEMA_VERSION: u32 = 12;
+// v13: fleet-level NCCL sweep headlines and world shapes. The fleet sweep's
+// lead emits `nccl_all_{reduce,gather}.bus_gib_per_sec_peak` (max across
+// sizes, one value per run, kept out of MAD and jitter — see
+// `fleet_nccl`); `[tests] nccl_world = "rank_per_node" | "per_rail"` adds
+// the nccl_inter_all_reduce / nccl_inter_all_gather groups (per-size
+// series, `bus_gib_per_sec_peak`, per-rail `bus_gib_per_sec_peak_rail<r>`)
+// and the calibration.links classes nccl_{allreduce,allgather}_inter_node.
+// A one-host fleet no longer runs the fleet sweep (Skipped outcomes). No
+// field changed shape.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -264,6 +274,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NcclAllGather => "nccl_all_gather",
         TestId::NcclIntraAllReduce => "nccl_intra_all_reduce",
         TestId::NcclIntraAllGather => "nccl_intra_all_gather",
+        TestId::NcclInterAllReduce => "nccl_inter_all_reduce",
+        TestId::NcclInterAllGather => "nccl_inter_all_gather",
         TestId::NcclBarrier => "nccl_barrier",
         TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
@@ -328,8 +340,10 @@ pub fn build(
 
     // Fleet-relative straggler detection over per-subject medians, so
     // run-to-run noise inside one subject cannot masquerade as slowness.
+    // Fleet-level headlines (one value per run, on the lead host) have no
+    // fleet peers: they skip both MAD passes (`fleet_nccl`).
     let mut outliers = BTreeMap::new();
-    for (group, subjects) in &aggregates {
+    for (group, subjects) in mad_groups(&aggregates) {
         let samples: Vec<Sample> = subjects
             .iter()
             .map(|(key, aggregate)| Sample {
@@ -346,7 +360,7 @@ pub fn build(
     // Jitter: a subject whose spread is a high-side fleet outlier. Only
     // meaningful with repeats (n >= 2).
     let mut jitter_outliers = BTreeMap::new();
-    for (group, subjects) in &aggregates {
+    for (group, subjects) in mad_groups(&aggregates) {
         let spreads: Vec<Sample> = subjects
             .iter()
             .filter(|(_, aggregate)| aggregate.moments.n >= 2)
@@ -428,6 +442,17 @@ pub fn build(
         aggregates,
         calibration,
     }
+}
+
+/// The aggregate groups that enter the fleet-relative MAD passes (outliers
+/// and jitter): every group but the fleet-level sweep headlines, which
+/// have one subject per run and so no peers to be compared against.
+fn mad_groups(
+    aggregates: &Aggregates,
+) -> impl Iterator<Item = (&String, &BTreeMap<String, MetricAggregate>)> {
+    aggregates
+        .iter()
+        .filter(|(group, _)| !fleet_nccl::is_fleet_level(group))
 }
 
 /// Reduce raw (possibly repeated) metric records into per-subject
@@ -914,20 +939,12 @@ fn reduce(obs: &HostObservations, test: TestId, name: &str, how: Reduce) -> Opti
 }
 
 fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<String, AlphaBetaFit> {
-    let mut links = BTreeMap::new();
-    for (test, key) in [
-        // "rank_per_gpu": the fleet world became one rank per GPU in
-        // schema v8 — n is total GPUs and the ring mixes NVLink with the
-        // fabric — so these fits are not the v7 per-node `*_fleet` fits
-        // and must not be compared against them under the same name.
-        (TestId::NcclAllReduce, "nccl_allreduce_rank_per_gpu"),
-        (TestId::NcclAllGather, "nccl_allgather_rank_per_gpu"),
-    ] {
-        let points = sweep_points(observations, test);
-        if let Ok(fit) = fit_alpha_beta(&points) {
-            links.insert(key.to_string(), fit);
-        }
-    }
+    // "rank_per_gpu": the fleet world became one rank per GPU in schema v8
+    // — n is total GPUs and the ring mixes NVLink with the fabric — so
+    // those fits are not the v7 per-node `*_fleet` fits and must not be
+    // compared against them under the same name. "inter_node" (v13): the
+    // NIC-forcing world shapes.
+    let mut links = fleet_nccl::link_fits(observations);
     if let Some(fit) = tcp_pairwise_fit(observations) {
         links.insert("tcp_pairwise".to_string(), fit);
     }

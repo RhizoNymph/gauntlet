@@ -52,7 +52,7 @@ pub(super) fn host_overlap_records(
     let mut metrics = Vec::new();
     let mut outcomes = Vec::new();
     for rank in block.ranks() {
-        let Some(index) = block.local_index(rank) else {
+        let Some(index) = block.gpu(rank) else {
             continue;
         };
         let gpu = Scope::Gpu { index };

@@ -200,7 +200,9 @@ without a GPU):
 ### Flow
 1. Orchestrator (`orchestrator/nccl/mod.rs::overlap_fleet_sweep`, inside the
    Overlap phase arm after the node-local fan-out, gated on
-   `tests.overlap_fleet` and ≥ 2 hosts from `nccl_world`): builds an
+   `tests.overlap_fleet` and ≥ 2 hosts from `rank_per_gpu_world(nccl_hosts(..))` — always
+   rank-per-GPU, whatever `tests.nccl_world` says, because retention
+   compares every GPU against its own phase-2 baseline): builds an
    `NcclJob` with `NcclWorkload::Overlap(spec)` and runs it through
    `drive_fleet_nccl` — the rendezvous-relay + participant-supervision
    driver shared with the phase-3 sweep — in `WarnOnly` failure mode.
@@ -299,7 +301,7 @@ self-contained).
 - `src/agent/mod.rs` — phase dispatch (`overlap_phase`, gpu/non-gpu).
 - `src/orchestrator/mod.rs` — Overlap phase arm (node-local fan-out then
   the fleet step).
-- `src/orchestrator/nccl/mod.rs` — `nccl_world` / `NcclJob` /
+- `src/orchestrator/nccl/mod.rs` — `nccl_hosts` + `rank_per_gpu_world` / `NcclJob` /
   `drive_fleet_nccl` (returns the per-host failure map) shared with the
   phase-3 sweep; `overlap_fleet_sweep`.
 - `src/orchestrator/nccl/records.rs` — `host_overlap_records` (takes the
