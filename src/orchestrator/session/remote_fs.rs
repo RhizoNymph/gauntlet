@@ -77,16 +77,28 @@ pub(super) fn remote_dir_word(remote_dir: &RemoteDir) -> String {
         .collect()
 }
 
-/// Create the scratch directory (mode 700 when this creates it), refuse one
-/// owned by another user — a world-writable parent like /tmp lets anyone
-/// pre-create `/tmp/gauntlet-<you>` and plant a binary there — and print
-/// its absolute path.
+/// Create the scratch directory (mode 700 when this creates it), refuse it
+/// when it is not the login user's, and print its *physical* path.
+///
+/// - A world-writable parent like /tmp lets anyone pre-create
+///   `/tmp/gauntlet-<you>` (or a symlink by that name) and plant a binary,
+///   so the directory must be owned by the login user (`[ -O . ]` after
+///   `cd`), and when the last component is a symlink, the link itself must
+///   be the user's too (`find -user` does not follow it).
+/// - The path printed — and later used for every upload and exec — is
+///   `pwd -P`, the directory that was checked, not a logical path whose
+///   symlinks could be repointed afterwards.
 pub(super) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
     let word = remote_dir_word(remote_dir);
     format!(
-        "mkdir -p -m 700 {word} && cd {word} && \
-         {{ [ -O . ] || {{ echo \"remote_dir $(pwd) is not owned by $(id -un)\" >&2; exit 1; }}; }} && \
-         pwd"
+        "d={word}; \
+         case \"$d\" in /) ;; */) d=\"${{d%/}}\" ;; esac; \
+         mkdir -p -m 700 \"$d\" || exit 1; \
+         if [ -L \"$d\" ] && [ -z \"$(find \"$d\" -maxdepth 0 -user \"$(id -u)\" -print)\" ]; then \
+         echo \"remote_dir $d is a symlink not owned by $(id -un)\" >&2; exit 1; fi; \
+         cd \"$d\" || exit 1; \
+         [ -O . ] || {{ echo \"remote_dir $(pwd -P) is not owned by $(id -un)\" >&2; exit 1; }}; \
+         pwd -P"
     )
 }
 
@@ -185,18 +197,44 @@ mod tests {
     }
 
     #[test]
-    fn a_scratch_dir_owned_by_someone_else_is_refused() {
-        // `/` is owned by root; unless the tests run as root, `[ -O ]`
-        // fails and the script must refuse instead of printing a path.
-        if login_name() == "root" {
+    fn the_resolved_path_is_physical_through_an_owned_symlink() {
+        let base = scratch("physical");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let physical = real.canonicalize().expect("canonical");
+        for spelled in [link.display().to_string(), format!("{}/", link.display())] {
+            let dir = RemoteDir::parse(&spelled).expect("valid");
+            let output = sh(&remote_dir_script(&dir), &base);
+            assert!(output.status.success(), "{spelled}: {output:?}");
+            // The exact string, not a canonicalized comparison: the path
+            // stored and used later must already be the checked one.
+            assert_eq!(
+                String::from_utf8(output.stdout).expect("utf8").trim(),
+                physical.to_str().expect("utf8"),
+                "{spelled}"
+            );
+        }
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn a_symlink_owned_by_someone_else_is_refused() {
+        // `/bin` is a root-owned symlink on merged-/usr systems; it needs a
+        // non-root test user and such a system to exercise this branch.
+        let is_symlink = std::fs::symlink_metadata("/bin")
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if login_name() == "root" || !is_symlink {
             return;
         }
-        let dir = RemoteDir::parse("/").expect("valid");
+        let dir = RemoteDir::parse("/bin").expect("valid");
         let output = sh(&remote_dir_script(&dir), &std::env::temp_dir());
         assert!(!output.status.success(), "{output:?}");
-        assert!(output.stdout.is_empty());
+        assert!(output.stdout.is_empty(), "no path may be reported");
         let stderr = String::from_utf8(output.stderr).expect("utf8");
-        assert!(stderr.contains("not owned by"), "{stderr}");
+        assert!(stderr.contains("is a symlink not owned by"), "{stderr}");
     }
 
     #[test]
