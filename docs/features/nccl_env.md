@@ -20,12 +20,26 @@ arrays and tables are rejected with `NcclEnvError::UnsupportedValueType`.
 A TOML datetime reaches serde as its string form and is passed through
 verbatim.
 
+Per-level overrides (proto v11 / schema v13) layer a map on top of the
+global env for one NCCL call site only, e.g. force Ring on the NVLink
+sweep, or disable P2P/SHM for the fleet sweep so every hop crosses the
+NICs:
+
+```toml
+[nccl.levels.intranode]
+env = { NCCL_ALGO = "Ring" }
+[nccl.levels.fleet]
+env = { NCCL_P2P_DISABLE = 1, NCCL_SHM_DISABLE = 1 }
+```
+
 Non-scope:
+- Unsetting a global key for one level. Values must be non-empty, so an
+  override can replace a global value but not remove it.
 - Non-NCCL variables (LD_PRELOAD, LD_LIBRARY_PATH, CUDA_VISIBLE_DEVICES,
   UCX_*, ...). Rejected by design; see the allowlist rationale.
-- Per-host env. One map is resolved from one config and used for every
-  host; per-host tuning would make the fleet-relative MAD comparison
-  compare differently-configured nodes.
+- Per-host env. One map per level is resolved from one config and used
+  for every host; per-host tuning would make the fleet-relative MAD
+  comparison compare differently-configured nodes.
 - Capturing NCCL_* variables a node would otherwise *inherit*. Keys not in
   the map are left as the remote shell provides them and are not recorded.
 - Validating values against NCCL's own grammar (e.g. that NCCL_ALGO names
@@ -59,6 +73,76 @@ long as a value stays on one line: a newline inside single quotes breaks
 those shells. That is why values may not contain ASCII control
 characters (see below). Gauntlet assumes a POSIX-compatible login shell
 on nodes, as it already did for LD_LIBRARY_PATH.
+
+## Per-level overrides
+
+### Levels
+`NcclLevel` (`src/nccl_level.rs`) names every NCCL call site, and each
+level has its own agent process:
+
+| level | process | communicator |
+|---|---|---|
+| `intranode` | `agent run`, network phase | intra-node sweep (`ncclCommInitAll`) |
+| `fleet` | `agent nccl`, `NcclWorkload::Sweep` | rank-per-GPU fleet sweep |
+| `barrier` | `agent nccl` | NCCL barrier-skew probe |
+| `overlap_intranode` | `agent run`, overlap phase | node-local overlap step |
+| `overlap_fleet` | `agent nccl`, `NcclWorkload::Overlap` | fleet overlap step |
+
+The mapping has one source of truth each side reads:
+`Phase::nccl_level()` (network -> intranode, overlap ->
+overlap_intranode, other phases none) and `NcclWorkload::level()`
+(sweep -> fleet, overlap -> overlap_fleet, barrier -> barrier). The
+orchestrator picks the spawn env from it and the agent labels its
+transport record with it.
+
+### Resolution
+`[nccl.levels.<level>] env` (`NcclLevelsConfig` / `NcclLevelConfig`,
+`deny_unknown_fields`, so an unknown level name is a parse error) goes
+through the same stringify + `NcclEnv::from_map` validation as the global
+map; a failure is `ConfigError::NcclLevel { level, source }`. The effective
+env of a level is `global.overlay(override)`: override keys replace or add,
+every other global key survives. `NcclLevelEnvs` holds the global env and
+one effective env per level (a struct with one field per level, so a
+lookup cannot miss). An override of NCCL_SOCKET_IFNAME is allowed even
+when `[nccl] socket_ifname` is set: the both-places conflict rule applies
+to the global section only, and layering is the point of a level.
+
+`FleetConfig::nccl_levels()` resolves and caches the whole section once
+(`validate` runs it); `nccl_env()` returns its global part, so a config
+with an invalid level override yields no env at all.
+
+### Co-hosted levels
+Per-level env is only possible because no agent process hosts two levels
+with different envs:
+- `agent run`: the orchestrator sends exactly one phase per spawn
+  (`node_phase` with `[phase]`), so the intra-node sweep (network phase)
+  and the node-local overlap (overlap phase) are separate processes.
+  A hand-run `agent run --phases network,overlap` would host both under
+  whatever env it was started with; the orchestrator never does that.
+- `agent nccl`: the barrier probe historically rides the fleet sweep's
+  communicator (`NcclWorkload::Sweep { barrier }`). When the barrier and
+  fleet effective envs are identical (`barrier_shares_fleet_comm`) it
+  still does. When they differ, the orchestrator splits the spawn: the
+  sweep runs without the probe, then a second fleet job runs
+  `NcclWorkload::Barrier(spec)` on its own communicator (same rank
+  layout) under the barrier env (`BarrierPlacement` in
+  `orchestrator/nccl/mod.rs`). The split costs one extra communicator
+  init; results land in the same `nccl_barrier` metric groups.
+
+### Spawn env selection
+`HostSession` holds the resolved `NcclLevelEnvs` and every spawn names its
+`AgentEnv`:
+- `AgentEnv::Base` (inventory, cpu/mem, gpu, counter passes, probe, peer,
+  TCP barrier): LD_LIBRARY_PATH plus the global env, exactly the words
+  `agent_env_words` produced before.
+- `AgentEnv::Nccl(level)` (`node_phase` for network/overlap, every fleet
+  `agent nccl` job via `NcclJob::spawn_env`): LD_LIBRARY_PATH, the level's
+  effective env, and the NCCL debug-log variables of transport capture
+  (docs/features/nccl_transport.md), merged in key order. Capture never
+  names a key the level env sets, so no word is duplicated.
+
+`spawn_env_words` builds both forms; still single-quoted, still on the
+`env` command line, still never `set_var`.
 
 ## Library stdout isolation
 Setting NCCL_DEBUG makes NCCL write its logs to fd 1, and CUDA and other
@@ -152,7 +236,8 @@ plane story (docs/features/phase3_network.md) is documented around it.
    NCCL env is on the wire. `NcclDirective` is now
    `deny_unknown_fields`, so a stale `socket_ifname` fails loudly instead
    of being ignored.
-6. **Reporting** (`report/mod.rs`, `report/nccl_env.rs`, SCHEMA_VERSION 10).
+6. **Reporting** (`report/mod.rs`, `report/nccl_env.rs`, SCHEMA_VERSION 10;
+   per-level fields since 13).
    `report::build` sets the run-level field `RunResults.nccl_env:
    Option<BTreeMap<String, String>>` from `config.nccl_env()`. It is
    recorded orchestrator-side because the orchestrator knows exactly what
@@ -160,7 +245,12 @@ plane story (docs/features/phase3_network.md) is documented around it.
    documents get this through the serde default, so old history still
    loads. `Some(empty)` means an untuned run. The terminal table prints
    `nccl env: K=V ...`, `(none)` or `(not recorded)` under the header
-   line.
+   line. Since schema v13 `RunResults.nccl_level_env:
+   Option<BTreeMap<NcclLevel, BTreeMap<String, String>>>` records every
+   level's effective env (`NcclLevelEnvs::to_record`; the capture
+   variables are not part of it, their path is per host). The table adds
+   `nccl env [<level>]: ...` for every level whose env differs from the
+   global one (`format_level_overrides`).
 7. **Viewer** (`viewer/src/model.rs`, `diff.rs`, `ui/table.rs`).
    `ViewModel.nccl_env` mirrors the document. `DiffView.nccl_env_drift =
    report::nccl_env::nccl_env_drift(baseline, current)` lists
@@ -168,7 +258,12 @@ plane story (docs/features/phase3_network.md) is documented around it.
    either run did not record its env, so a pre-v10 baseline never produces
    invented `+NCCL_SOCKET_IFNAME` drift. Diff mode shows an "nccl env drift" chip
    plus one line per change; the overview shows the run's env. Drift is
-   context, never a per-node regression.
+   context, never a per-node regression. `DiffView.nccl_level_env_drift =
+   nccl_level_env_drift(baseline, current, global_drift)` adds per-level
+   changes the global drift does not already list (a changed global key
+   is shown once, not once per level), as `[level] change` lines; it is
+   `None` when either run predates v13. The overview lists level
+   overrides under the global env.
 
 ### Why run-level, not per-host
 The env is fleet-uniform by construction: one config, one resolved map,
@@ -184,15 +279,28 @@ baseline diff compares it.
   string/integer/boolean, anything else rejected) + `stringify_raw`,
   `NcclEnv` (`from_map`, `resolve`, `get`, `iter`, `len`,
   `to_string_map`), `NcclEnvError` / `NcclEnvValueError`, `SOCKET_IFNAME`.
-- `src/config.rs` — `NcclConfig` (raw section, `resolve`),
-  `ConfigError::Nccl`, `FleetConfig::from_toml_str`,
-  `FleetConfig::nccl_env` (cached, `-> Result<&NcclEnv, ConfigError>`).
+- `src/nccl_env.rs` also has `NcclEnv::overlay` (level layering).
+- `src/nccl_level.rs` — `NcclLevel` (`ALL`, `as_str`, serde snake_case),
+  `NcclLevelEnvs` (`resolve`, `uniform`, `global`, `level`,
+  `barrier_shares_fleet_comm`, `to_record`).
+- `src/config.rs` — `NcclConfig` (raw section, `resolve`,
+  `resolve_levels`), `NcclLevelsConfig` / `NcclLevelConfig`,
+  `ConfigError::{Nccl, NcclLevel}`, `FleetConfig::from_toml_str`,
+  `FleetConfig::nccl_levels` (cached) and `FleetConfig::nccl_env` (its
+  global part).
 - `src/agent/channel.rs` — `isolate_stdout`, `protocol_writer`,
   `write_line`, the hidden `isolation_check` mode; `src/main.rs` calls
   `isolate_stdout` for agent subcommands before building the runtime.
 - `tests/stdout_isolation_tests.rs` — end-to-end protocol isolation.
-- `src/orchestrator/session.rs` — `HostSession::connect(host, ssh,
-  nccl_env)`, `agent_env_words`, `nccl_env_words`, the three spawn paths.
+- `src/orchestrator/session.rs` — `AgentEnv`, `HostSession::connect(host,
+  ssh, Arc<NcclLevelEnvs>)`, `spawn_env_words`, `agent_env_words`,
+  `nccl_env_words`, the three spawn paths (`run_agent` takes an
+  `AgentEnv`; `run_agent_capture` and `spawn_agent` are always `Base`).
+- `src/orchestrator/nccl/mod.rs` — `NcclJob::spawn_env`,
+  `BarrierPlacement` (barrier on the sweep communicator vs its own world).
+- `src/proto/mod.rs` — `Phase::nccl_level`, `NcclWorkload::{Barrier,
+  level}`; PROTO_VERSION 11.
+- `src/agent/nccl/` — runs `NcclWorkload::Barrier` (`sweep::run_barrier`).
 - `src/orchestrator/mod.rs`, `src/orchestrator/bootstrap.rs` — pass
   `config.nccl_env()` into every session.
 - `src/proto/mod.rs` — `socket_ifname` removed from the directives
@@ -201,7 +309,8 @@ baseline diff compares it.
 - `src/agent/nccl/mod.rs`, `src/orchestrator/nccl/mod.rs` —
   `set_socket_ifname` and `NcclJob.socket_ifname` removed.
 - `src/report/nccl_env.rs` — `NcclEnvChange`, `nccl_env_drift`,
-  `format_nccl_env`.
+  `format_nccl_env`, `LevelEnvMap`, `nccl_level_env_drift`,
+  `format_level_overrides`.
 - `src/report/mod.rs` — `RunResults.nccl_env`, table line; SCHEMA_VERSION 10.
 - `viewer/src/{model,diff}.rs`, `viewer/src/ui/table.rs` — display + drift.
 
@@ -218,8 +327,17 @@ baseline diff compares it.
   Single-quoted one-line values are also safe under csh/tcsh.
 - The agent never calls `std::env::set_var`. NCCL env reaches it only via
   the spawn command line, so it is present before any thread exists.
-- Every agent spawn of a session carries the same env words; there is no
-  spawn path that bypasses `env_words`.
+- Every agent spawn picks its words through `spawn_env_words` by its
+  `AgentEnv`; there is no spawn path that bypasses it. Spawns of the same
+  `AgentEnv` carry the same words on every host (except the per-host
+  remote_dir inside LD_LIBRARY_PATH and NCCL_DEBUG_FILE).
+- A level's effective env is the global env overlaid with that level's
+  override, and nothing else (plus capture variables the config does not
+  set).
+- No agent process the orchestrator starts hosts two NCCL levels with
+  different effective envs: one phase per `agent run`, one workload per
+  `agent nccl`, and the barrier probe rides the fleet communicator only
+  when both levels' envs are identical.
 - Values are single-quoted; a POSIX shell hands them to the process byte
   for byte (tested against a real `sh` with adversarial values: quotes,
   `$`, `$(…)`, backticks, globs, newlines, `;|&<>`).

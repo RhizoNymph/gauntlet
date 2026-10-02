@@ -16,7 +16,23 @@ use tracing::{debug, warn};
 use super::deploy::AGENT_RELPATH;
 use crate::config::{HostConfig, SshConfig};
 use crate::nccl_env::NcclEnv;
+use crate::nccl_level::{NcclLevel, NcclLevelEnvs};
+use crate::nccl_transport::debug::{DebugSettings, LOG_DIR, capture_additions, managed_log_path};
 use crate::proto::{AgentEvent, PROTO_VERSION, decode_event};
+
+/// Which environment an agent spawn is started with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentEnv {
+    /// The process hosts no NCCL communicator (inventory, cpu/mem, gpu,
+    /// counters, probe, peer, TCP barrier): LD_LIBRARY_PATH plus the
+    /// global `[nccl]` env — harmless there, and uniform.
+    Base,
+    /// The process hosts the communicator of this level: LD_LIBRARY_PATH,
+    /// the level's effective env (global <- `[nccl.levels.<level>]`), and
+    /// the NCCL debug-log variables transport capture needs, never
+    /// overriding one the config sets (`nccl_transport::debug`).
+    Nccl(NcclLevel),
+}
 
 /// Captured result of a remote command that was allowed to fail.
 #[derive(Debug, Clone)]
@@ -69,19 +85,20 @@ pub struct HostSession {
     remote_dir: String,
     /// `<remote_dir>/bin/gauntlet-agent`.
     agent_path: String,
-    /// Pre-quoted `KEY=value` words placed between `env` and the agent
-    /// binary on every spawn (`agent_env_words`).
-    env_words: Vec<String>,
+    /// The resolved NCCL env of every level; each spawn picks its words
+    /// from it by `AgentEnv` (`spawn_env_words`).
+    nccl: Arc<NcclLevelEnvs>,
 }
 
 impl HostSession {
     /// Establish a session. `connect_timeout_secs` applies; errors carry the
     /// host address for attribution.
-    /// `nccl_env` is set on every agent spawn of this session.
+    /// Every agent spawn of this session carries the env `nccl` resolves
+    /// for its `AgentEnv`.
     pub async fn connect(
         host: HostConfig,
         ssh: &SshConfig,
-        nccl_env: &NcclEnv,
+        nccl: Arc<NcclLevelEnvs>,
     ) -> Result<HostSession> {
         let timeout = Duration::from_secs(ssh.connect_timeout_secs.max(1));
 
@@ -123,14 +140,13 @@ impl HostSession {
         })??;
 
         let agent_path = format!("{remote_dir}/{AGENT_RELPATH}");
-        let env_words = agent_env_words(&remote_dir, nccl_env);
         debug!(host = %host.addr, remote_dir = %remote_dir, "ssh session established");
         Ok(HostSession {
             host,
             session,
             remote_dir,
             agent_path,
-            env_words,
+            nccl,
         })
     }
 
@@ -150,8 +166,9 @@ impl HostSession {
 
     /// The remote words after the `env` program for an `agent <args>` spawn
     /// (`agent_spawn_args`), shared by every spawn path.
-    fn spawn_args(&self, args: &[&str]) -> Vec<String> {
-        agent_spawn_args(&self.env_words, &self.agent_path, args)
+    fn spawn_args(&self, env: AgentEnv, args: &[&str]) -> Vec<String> {
+        let words = spawn_env_words(&self.remote_dir, &self.nccl, env);
+        agent_spawn_args(&words, &self.agent_path, args)
     }
 
     /// Run a short remote command, capturing stdout (used by deploy for
@@ -255,13 +272,14 @@ impl HostSession {
     /// until EOF. Returns the remote exit status.
     pub async fn run_agent(
         &self,
+        env: AgentEnv,
         args: &[&str],
         stdin_doc: Option<String>,
         mut on_event: impl FnMut(AgentEvent) + Send,
     ) -> Result<ExitStatus> {
         let mut command = self.session.command("env");
         command
-            .raw_args(self.spawn_args(args))
+            .raw_args(self.spawn_args(env, args))
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
             } else {
@@ -345,7 +363,7 @@ impl HostSession {
     ) -> Result<RemoteOutput> {
         let mut command = self.session.command("env");
         command
-            .raw_args(self.spawn_args(args))
+            .raw_args(self.spawn_args(AgentEnv::Base, args))
             .stdin(if stdin_doc.is_some() {
                 Stdio::piped()
             } else {
@@ -389,7 +407,7 @@ impl HostSession {
     pub async fn spawn_agent(&self, args: &[&str]) -> Result<openssh::Child<Arc<Session>>> {
         let mut command = Arc::clone(&self.session).arc_command("env");
         command
-            .raw_args(self.spawn_args(args))
+            .raw_args(self.spawn_args(AgentEnv::Base, args))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -448,7 +466,9 @@ async fn drain_stderr(host: String, stderr: openssh::ChildStderr) {
 /// expansion happens on the node: `~` means the *remote* home directory.
 async fn resolve_remote_dir(session: &Session, addr: &str, remote_dir: &str) -> Result<String> {
     let quoted = shell_path(remote_dir);
-    let script = format!("mkdir -p {quoted} && cd {quoted} && pwd");
+    // `nccl-logs` holds the NCCL INFO logs transport capture parses; NCCL
+    // cannot create directories, so it must exist before any spawn.
+    let script = format!("mkdir -p {quoted} && cd {quoted} && mkdir -p {LOG_DIR} && pwd");
     let output = run_shell(session, addr, &script).await?;
     if !output.success() {
         bail!(
@@ -495,12 +515,47 @@ async fn run_shell(session: &Session, addr: &str, script: &str) -> Result<Remote
 /// Keys are validated `^NCCL_[A-Z0-9_]+$` (literal shell words); values are
 /// single-quoted, so spaces, quotes, `$`, backticks and globs stay literal.
 pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<String> {
-    std::iter::once(format!(
+    std::iter::once(ld_library_path_word(remote_dir))
+        .chain(nccl_env_words(nccl_env))
+        .collect()
+}
+
+/// Environment words for a spawn of kind `env` (see `AgentEnv`), each a
+/// quoted POSIX-sh word: `AgentEnv::Base` is `agent_env_words` with the
+/// global env; `AgentEnv::Nccl(level)` uses the level's effective env plus
+/// the NCCL debug-log additions (`capture_additions`, whose keys never
+/// collide with the env's), all in key order after LD_LIBRARY_PATH.
+pub(crate) fn spawn_env_words(
+    remote_dir: &str,
+    nccl: &NcclLevelEnvs,
+    env: AgentEnv,
+) -> Vec<String> {
+    let level = match env {
+        AgentEnv::Base => return agent_env_words(remote_dir, nccl.global()),
+        AgentEnv::Nccl(level) => level,
+    };
+    let level_env = nccl.level(level);
+    let additions = capture_additions(
+        DebugSettings::from_env(level_env),
+        &managed_log_path(remote_dir, level),
+    );
+    let mut entries: Vec<(&str, &str)> = level_env.iter().collect();
+    entries.extend(additions.iter().map(|(key, value)| (*key, value.as_str())));
+    entries.sort_by_key(|(key, _)| *key);
+    std::iter::once(ld_library_path_word(remote_dir))
+        .chain(
+            entries
+                .into_iter()
+                .map(|(key, value)| format!("{key}={}", single_quote(value))),
+        )
+        .collect()
+}
+
+fn ld_library_path_word(remote_dir: &str) -> String {
+    format!(
         "LD_LIBRARY_PATH={}",
         single_quote(&format!("{remote_dir}/lib"))
-    ))
-    .chain(nccl_env_words(nccl_env))
-    .collect()
+    )
 }
 
 /// Every remote word after the `env` program of an agent spawn, each already
@@ -625,6 +680,106 @@ mod tests {
                 "NCCL_IB_HCA='mlx5_0,mlx5_1'".to_string(),
                 "NCCL_SOCKET_IFNAME='bond0'".to_string(),
             ]
+        );
+    }
+
+    fn level_envs() -> NcclLevelEnvs {
+        let global = nccl_env(&[("NCCL_IB_HCA", "mlx5_0")]);
+        let overrides = std::collections::BTreeMap::from([
+            (NcclLevel::Intranode, nccl_env(&[("NCCL_ALGO", "Ring")])),
+            (NcclLevel::OverlapFleet, nccl_env(&[("NCCL_DEBUG", "WARN")])),
+        ]);
+        NcclLevelEnvs::resolve(global, &overrides)
+    }
+
+    #[test]
+    fn base_spawns_carry_the_global_env_without_capture_variables() {
+        let envs = level_envs();
+        assert_eq!(
+            spawn_env_words("/opt/g", &envs, AgentEnv::Base),
+            agent_env_words("/opt/g", envs.global())
+        );
+        assert_eq!(
+            spawn_env_words("/opt/g", &envs, AgentEnv::Base),
+            vec![
+                "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
+                "NCCL_IB_HCA='mlx5_0'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn nccl_spawns_carry_their_levels_env_plus_capture_variables() {
+        let envs = level_envs();
+        assert_eq!(
+            spawn_env_words("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Intranode)),
+            vec![
+                "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
+                "NCCL_ALGO='Ring'".to_string(),
+                "NCCL_DEBUG='INFO'".to_string(),
+                "NCCL_DEBUG_FILE='/opt/g/nccl-logs/intranode.%h.log'".to_string(),
+                "NCCL_DEBUG_SUBSYS='INIT,NET'".to_string(),
+                "NCCL_IB_HCA='mlx5_0'".to_string(),
+            ]
+        );
+        // The intra-node override stays out of the fleet process.
+        let fleet = spawn_env_words("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Fleet));
+        assert!(
+            !fleet.iter().any(|word| word.starts_with("NCCL_ALGO=")),
+            "{fleet:?}"
+        );
+        assert!(
+            fleet.contains(&"NCCL_DEBUG_FILE='/opt/g/nccl-logs/fleet.%h.log'".to_string()),
+            "{fleet:?}"
+        );
+    }
+
+    #[test]
+    fn a_configured_nccl_debug_is_never_overridden() {
+        let words = spawn_env_words(
+            "/opt/g",
+            &level_envs(),
+            AgentEnv::Nccl(NcclLevel::OverlapFleet),
+        );
+        assert_eq!(
+            words,
+            vec![
+                "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
+                "NCCL_DEBUG='WARN'".to_string(),
+                "NCCL_IB_HCA='mlx5_0'".to_string(),
+            ]
+        );
+        // Every key appears once, even with capture additions.
+        for level in NcclLevel::ALL {
+            let words = spawn_env_words("/opt/g", &level_envs(), AgentEnv::Nccl(level));
+            let keys: Vec<&str> = words
+                .iter()
+                .filter_map(|word| word.split_once('=').map(|(key, _)| key))
+                .collect();
+            let mut unique = keys.clone();
+            unique.dedup();
+            assert_eq!(keys, unique, "{level}: {words:?}");
+        }
+    }
+
+    #[test]
+    fn the_debug_file_pattern_reaches_nccl_unexpanded() {
+        // `%h` is NCCL's placeholder, not the shell's: it must arrive as is.
+        let words = spawn_env_words(
+            "/home/u/.gauntlet dir",
+            &NcclLevelEnvs::default(),
+            AgentEnv::Nccl(NcclLevel::Barrier),
+        );
+        let script = format!("env {} printenv NCCL_DEBUG_FILE", words.join(" "));
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run sh");
+        assert!(output.status.success(), "{script}");
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("utf8"),
+            "/home/u/.gauntlet dir/nccl-logs/barrier.%h.log\n"
         );
     }
 

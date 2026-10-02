@@ -199,9 +199,11 @@ pub mod imp {
 
     use super::fleet_overlap::{OverlapBuffers, overlap_fleet};
     use super::local::{PreparedRanks, nccl_error};
-    use super::sweep::{SweepBuffers, run_sweep};
+    use super::sweep::{BarrierBuffers, SweepBuffers, run_barrier, run_sweep};
     use super::watchdog::{CascadeAbort, exit_cascade};
     use crate::agent::EventSink;
+    use crate::agent::transport::CaptureWindow;
+    use crate::nccl_transport::CommSpan;
     use crate::proto::{AgentEvent, NcclDirective, NcclWorkload};
 
     pub use super::local::{decode_id, encode_id};
@@ -258,6 +260,9 @@ pub mod imp {
             }
         };
 
+        // Before the first NCCL call: NCCL's debug log is only this
+        // process's if it was written after this point.
+        let capture = CaptureWindow::open();
         // Stage 1, no NCCL: device check, contexts, binds, buffers. The
         // lead finishes it before minting the id, so a lead that cannot
         // run never recruits the followers.
@@ -268,6 +273,9 @@ pub mod imp {
             }
             NcclWorkload::Overlap(spec) => {
                 Buffers::Overlap(OverlapBuffers::alloc(&prepared, spec)?)
+            }
+            NcclWorkload::Barrier(spec) => {
+                Buffers::Barrier(BarrierBuffers::alloc(&prepared, spec)?)
             }
         };
         let id = match rendezvous {
@@ -282,7 +290,7 @@ pub mod imp {
         };
         // Stage 2: grouped communicator init.
         let ranks = prepared.connect(id)?;
-        match (workload, buffers) {
+        let outcome = match (workload, buffers) {
             (
                 NcclWorkload::Sweep {
                     sizes,
@@ -294,14 +302,24 @@ pub mod imp {
             (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
                 overlap_fleet(sink, &ranks, buffers, spec)
             }
+            (NcclWorkload::Barrier(spec), Buffers::Barrier(buffers)) => {
+                run_barrier(sink, &ranks, buffers, *spec)
+            }
             _ => bail!("workload buffers do not match the workload"),
-        }
+        };
+        // The communicator is up and has carried traffic (or failed trying):
+        // record which transports NCCL chose, before any error propagates —
+        // a socket fallback is exactly what makes a workload crawl.
+        let span = CommSpan::from_world(assignment.block().count(), assignment.world_size());
+        capture.emit(sink, workload.level(), span);
+        outcome
     }
 
     /// The workload's buffers, allocated in stage 1.
     enum Buffers {
         Sweep(SweepBuffers),
         Overlap(OverlapBuffers),
+        Barrier(BarrierBuffers),
     }
 }
 

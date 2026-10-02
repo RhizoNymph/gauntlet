@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
+use crate::nccl_level::{NcclLevel, NcclLevelEnvs};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
     OverlapSpec, Phase,
@@ -39,6 +40,12 @@ pub enum ConfigError {
     /// NUL-bearing value, NCCL_SOCKET_IFNAME set twice).
     #[error("invalid [nccl] section: {source}")]
     Nccl { source: NcclEnvError },
+    /// `[nccl.levels.<level>] env` violates the same policy as `[nccl] env`.
+    #[error("invalid [nccl.levels.{level}] section: {source}")]
+    NcclLevel {
+        level: NcclLevel,
+        source: NcclEnvError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,11 +60,12 @@ pub struct FleetConfig {
     pub thresholds: Thresholds,
     #[serde(default)]
     pub nccl: NcclConfig,
-    /// `nccl` resolved and validated, filled once by `validate` (or on
-    /// first access). Private and write-once: the only value it can ever
-    /// hold is one `NcclConfig::resolve` accepted.
+    /// `nccl` resolved and validated (global env plus every level's
+    /// effective env), filled once by `validate` (or on first access).
+    /// Private and write-once: the only value it can ever hold is one
+    /// `NcclConfig::resolve_levels` accepted.
     #[serde(skip)]
-    resolved_nccl_env: OnceLock<NcclEnv>,
+    resolved_nccl: OnceLock<NcclLevelEnvs>,
 }
 
 /// Hosts may be written as a bare address string or a full table.
@@ -241,13 +249,74 @@ pub struct NcclConfig {
     /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`; string,
     /// integer or boolean values).
     pub env: BTreeMap<String, RawNcclEnvValue>,
+    /// Per-level overrides layered on top of `env` (`[nccl.levels.<level>]`).
+    pub levels: NcclLevelsConfig,
+}
+
+/// `[nccl.levels]`: one optional override table per NCCL call site. Field
+/// names are the `NcclLevel` names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelsConfig {
+    pub intranode: NcclLevelConfig,
+    pub fleet: NcclLevelConfig,
+    pub barrier: NcclLevelConfig,
+    pub overlap_intranode: NcclLevelConfig,
+    pub overlap_fleet: NcclLevelConfig,
+}
+
+/// `[nccl.levels.<level>]` as written in the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelConfig {
+    /// NCCL knobs for this level only, layered over `[nccl] env` (same key
+    /// and value rules). NCCL_SOCKET_IFNAME may be overridden here even
+    /// when `[nccl] socket_ifname` sets it globally: layering is the point.
+    pub env: BTreeMap<String, RawNcclEnvValue>,
+}
+
+impl NcclLevelsConfig {
+    pub fn get(&self, level: NcclLevel) -> &NcclLevelConfig {
+        match level {
+            NcclLevel::Intranode => &self.intranode,
+            NcclLevel::Fleet => &self.fleet,
+            NcclLevel::Barrier => &self.barrier,
+            NcclLevel::OverlapIntranode => &self.overlap_intranode,
+            NcclLevel::OverlapFleet => &self.overlap_fleet,
+        }
+    }
+
+    /// Validate every non-empty override table, in `NcclLevel::ALL` order
+    /// (the first failure is reported with its level).
+    pub fn resolve(&self) -> Result<BTreeMap<NcclLevel, NcclEnv>, ConfigError> {
+        NcclLevel::ALL
+            .into_iter()
+            .filter(|level| !self.get(*level).env.is_empty())
+            .map(|level| {
+                stringify_raw(&self.get(level).env)
+                    .and_then(|raw| NcclEnv::from_map(&raw))
+                    .map(|env| (level, env))
+                    .map_err(|source| ConfigError::NcclLevel { level, source })
+            })
+            .collect()
+    }
 }
 
 impl NcclConfig {
-    /// Validate the section into the single resolved env: `env` stringified,
-    /// plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
+    /// Validate the global part into the single run-wide env: `env`
+    /// stringified, plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
     pub fn resolve(&self) -> Result<NcclEnv, NcclEnvError> {
         NcclEnv::resolve(self.socket_ifname.as_deref(), &stringify_raw(&self.env)?)
+    }
+
+    /// Validate the whole section: the global env, then every level's
+    /// override layered on top of it.
+    pub fn resolve_levels(&self) -> Result<NcclLevelEnvs, ConfigError> {
+        let global = self
+            .resolve()
+            .map_err(|source| ConfigError::Nccl { source })?;
+        let overrides = self.levels.resolve()?;
+        Ok(NcclLevelEnvs::resolve(global, &overrides))
     }
 }
 
@@ -289,7 +358,7 @@ impl FleetConfig {
         if !(frac > 0.0 && frac <= 1.0) {
             return Err(ConfigError::BadBarrierFrac { got: frac });
         }
-        self.nccl_env()?;
+        self.nccl_levels()?;
         Ok(())
     }
 
@@ -347,14 +416,21 @@ impl FleetConfig {
     /// way every `NcclEnv` handed out passed `NcclConfig::resolve`, so an
     /// invalid env can never be observed. After `load` this cannot fail.
     pub fn nccl_env(&self) -> Result<&NcclEnv, ConfigError> {
-        if let Some(env) = self.resolved_nccl_env.get() {
-            return Ok(env);
+        self.nccl_levels().map(NcclLevelEnvs::global)
+    }
+
+    /// The resolved NCCL env of every level (`[nccl]` global env with each
+    /// `[nccl.levels.<level>]` override layered on top). The orchestrator
+    /// starts each NCCL-hosting agent process with its level's env.
+    ///
+    /// Same caching and validation guarantees as `nccl_env`: resolved once
+    /// (by `validate`), and only ever a value `resolve_levels` accepted.
+    pub fn nccl_levels(&self) -> Result<&NcclLevelEnvs, ConfigError> {
+        if let Some(envs) = self.resolved_nccl.get() {
+            return Ok(envs);
         }
-        let env = self
-            .nccl
-            .resolve()
-            .map_err(|source| ConfigError::Nccl { source })?;
-        Ok(self.resolved_nccl_env.get_or_init(|| env))
+        let envs = self.nccl.resolve_levels()?;
+        Ok(self.resolved_nccl.get_or_init(|| envs))
     }
 
     /// The intra-node sweep parameters, or `None` when the sweep is

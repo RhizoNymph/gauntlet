@@ -15,6 +15,9 @@ use crate::agent::intranode::{self, MultiGpuWorld};
 use crate::agent::sweep::{
     Collective, SweepCollectives, SweepLevel, SweepPlan, SweepStep, point_records, run_plan,
 };
+use crate::agent::transport::CaptureWindow;
+use crate::nccl_level::NcclLevel;
+use crate::nccl_transport::CommSpan;
 use crate::proto::{LogLevel, NcclSweepSpec};
 
 /// Run the intra-node sweep on this node. Never errors: every failure
@@ -40,6 +43,7 @@ pub fn run(sink: &EventSink, spec: &NcclSweepSpec) -> Result<()> {
 }
 
 fn execute(sink: &EventSink, spec: &NcclSweepSpec, world: MultiGpuWorld) -> Result<()> {
+    let capture = CaptureWindow::open();
     let node = NodeComm::init(world.get())?;
     let plan = SweepPlan::new(&spec.sizes, world.non_zero());
     let mut collectives = NodeCollectives {
@@ -48,12 +52,16 @@ fn execute(sink: &EventSink, spec: &NcclSweepSpec, world: MultiGpuWorld) -> Resu
         node: &node,
     };
     let mut points = Vec::with_capacity(plan.steps().len());
-    run_plan(&mut collectives, &plan, spec.iters_per_size, |point| {
+    let swept = run_plan(&mut collectives, &plan, spec.iters_per_size, |point| {
         for record in point_records(SweepLevel::IntraNode, point, world.get()) {
             sink.metric(record);
         }
         points.push(*point);
-    })?;
+    });
+    // Peers are connected by now (or the sweep failed trying): record the
+    // transports NCCL chose before any error propagates.
+    capture.emit(sink, NcclLevel::Intranode, CommSpan::SingleHost);
+    swept?;
     intranode::emit_summary(sink, &points, world);
     Ok(())
 }

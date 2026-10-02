@@ -36,7 +36,10 @@ use super::node_comm::{NodeComm, nccl_error};
 use super::worker::GemmLoad;
 use crate::agent::EventSink;
 use crate::agent::nccl::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
+use crate::agent::transport::CaptureWindow;
 use crate::agent::window::hard_deadline_secs;
+use crate::nccl_level::NcclLevel;
+use crate::nccl_transport::CommSpan;
 use crate::proto::{
     LogLevel, MetricRecord, OverlapSpec, Scope, TestId, TestOutcome, Unit, overlap_metric,
 };
@@ -102,13 +105,15 @@ fn execute(sink: &EventSink, spec: &OverlapSpec, device_count: u32) -> Result<()
     let message_bytes = (elements * F32_BYTES) as f64;
 
     // One context per GPU; the default stream carries the collective.
+    let capture = CaptureWindow::open();
     let node = NodeComm::init(device_count)?;
     let sends = node.alloc_per_rank(elements)?;
     let mut recvs = node.alloc_per_rank(elements)?;
 
-    for _ in 0..WARMUP_ROUNDS {
-        all_reduce_round(&node, &sends, &mut recvs)?;
-    }
+    let warmed = (0..WARMUP_ROUNDS).try_for_each(|_| all_reduce_round(&node, &sends, &mut recvs));
+    // The warmup connected every peer: record the transports NCCL chose.
+    capture.emit(sink, NcclLevel::OverlapIntranode, CommSpan::SingleHost);
+    warmed?;
 
     // Isolated baseline: same communicator, quiet SMs (the GEMM workers are
     // not even spawned yet).

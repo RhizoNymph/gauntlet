@@ -39,6 +39,7 @@ fn vm(run_id: &str, hosts: &[&str], rows: Vec<MetricRow>) -> ViewModel {
         verdict: Verdict::Clean,
         debug_build: false,
         nccl_env: Default::default(),
+        nccl_level_env: Default::default(),
         schema_version: gauntlet::report::SCHEMA_VERSION,
         nodes: hosts.iter().map(|h| node(h)).collect(),
         edges: Vec::new(),

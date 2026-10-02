@@ -7,8 +7,9 @@
 
 use std::collections::BTreeMap;
 
+use gauntlet::nccl_level::NcclLevel;
 use gauntlet::proto::Unit;
-use gauntlet::report::nccl_env::{NcclEnvChange, nccl_env_drift};
+use gauntlet::report::nccl_env::{NcclEnvChange, nccl_env_drift, nccl_level_env_drift};
 
 use crate::model::{Attribution, Issue, MetricRow, Severity, ViewModel, attribute, format_value};
 
@@ -101,6 +102,10 @@ pub struct DiffView {
     /// their deltas are not like-for-like. `None` when either run did not
     /// record its env — nothing is shown rather than invented drift.
     pub nccl_env_drift: Option<Vec<NcclEnvChange>>,
+    /// Per-level NCCL tuning that differs from the baseline beyond the
+    /// global drift (levels without such changes are omitted). `None` when
+    /// either run did not record per-level envs.
+    pub nccl_level_env_drift: Option<BTreeMap<NcclLevel, Vec<NcclEnvChange>>>,
 }
 
 struct Finding {
@@ -203,6 +208,11 @@ impl DiffView {
             nccl_env_drift: nccl_env_drift(baseline.nccl_env.as_ref(), current.nccl_env.as_ref()),
             ..DiffView::default()
         };
+        view.nccl_level_env_drift = nccl_level_env_drift(
+            baseline.nccl_level_env.as_ref(),
+            current.nccl_level_env.as_ref(),
+            view.nccl_env_drift.as_deref().unwrap_or_default(),
+        );
         for (host, findings) in node_findings {
             let (severity, issues) = finalize(findings);
             view.node_severity.insert(host.clone(), severity);

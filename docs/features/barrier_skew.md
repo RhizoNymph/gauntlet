@@ -10,7 +10,10 @@ integrate into one per-rank number. Two probes share one analysis:
 - **NCCL barrier** (`nccl_barrier`): a 4–8 byte all-reduce over the same
   fleet-wide communicator the phase-3 sweep already sets up — one rank
   per GPU (proto v7), so per-rank results are per GPU. GPU/NCCL fleets
-  only.
+  only. When `[nccl.levels.barrier]` makes the barrier's effective NCCL
+  env differ from the fleet sweep's, it runs instead on a communicator
+  of its own (same rank layout) under its own env
+  (`NcclWorkload::Barrier`, proto v11; docs/features/nccl_env.md).
 - **TCP barrier** (`tcp_barrier`): a star barrier over plain TCP, run
   across the *whole* fleet regardless of GPUs — the CPU-only fallback, and
   a fabric-independent complement on GPU fleets.
@@ -98,7 +101,10 @@ straggler experiences.
    (from `tests.barrier_iters` / `tests.barrier_bytes`, only when the NCCL
    world spans ≥ 2 *hosts* — one host's ranks share one arrival, so a
    single-host world has no skew to measure) to the `Lead` and
-   `Participate` directives. After the sweep, every host's process runs
+   `Participate` directives — or, when the barrier and fleet levels'
+   NCCL envs differ, runs it afterwards as a separate
+   `NcclWorkload::Barrier(spec)` job under the barrier env, with the same
+   intercept and analysis. After the sweep, every host's process runs
    warmup + `iters` timed tiny grouped all-reduces over its local ranks
    and emits one `AgentEvent::NcclBarrierTimings { rank, elapsed_us }` per
    local rank (participants included — the one time they speak). The

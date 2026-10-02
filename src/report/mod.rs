@@ -9,6 +9,7 @@ pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
 pub mod nccl_env;
+pub mod nccl_transport;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -23,6 +24,7 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
     CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
@@ -73,7 +75,17 @@ use crate::proto::{
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
 // is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
-pub const SCHEMA_VERSION: u32 = 12;
+// v13: per-level NCCL env and transport capture — run-level
+// `nccl_level_env` (the effective env of every NCCL level, global <-
+// `[nccl.levels.<level>]`; `nccl_env` stays the global map),
+// `hosts.*.nccl_transports` (the network/peer transports each NCCL-hosting
+// process's communicator used, parsed from NCCL's INFO log, or why
+// unknown) and `fleet.socket_fallbacks` (a multi-host communicator on TCP
+// sockets without IB disabled; part of the verdict as Stragglers).
+// Serde-defaulted: pre-v13 documents decode with no level envs ("not
+// recorded", which suppresses level drift), no transports and no
+// findings.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -118,6 +130,12 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// The effective NCCL env of every level (`[nccl] env` with that
+    /// level's `[nccl.levels.<level>]` override layered on top): what each
+    /// NCCL-hosting process was started with, minus the debug-log
+    /// variables transport capture adds. `None` = not recorded (pre-v13).
+    #[serde(default)]
+    pub nccl_level_env: Option<nccl_env::LevelEnvMap>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -161,6 +179,11 @@ pub struct FleetAnalysis {
     /// margin-passing iterations. Part of the verdict.
     #[serde(default)]
     pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
+    /// Hosts whose multi-host NCCL communicator fell back to TCP sockets
+    /// while IB was not disabled by the level's env, per level. Part of the
+    /// verdict (Stragglers).
+    #[serde(default)]
+    pub socket_fallbacks: BTreeMap<String, Vec<nccl_transport::SocketFallback>>,
 }
 
 /// One flagged subject from the barrier-skew slowest-rank tally.
@@ -388,6 +411,11 @@ pub fn build(
         }
     }
 
+    // `None` only for a config whose `[nccl]` never validated, which
+    // `FleetConfig::load` rules out; recorded as "not recorded" rather than
+    // guessed.
+    let nccl_level_env = config.nccl_levels().ok().map(NcclLevelEnvs::to_record);
+
     let failed_hosts: BTreeMap<String, Vec<String>> = observations
         .iter()
         .filter(|(_, obs)| !obs.errors.is_empty())
@@ -403,6 +431,7 @@ pub fn build(
         sdc_failures: sdc_failures(&observations),
         counter_findings: counter_findings(&observations),
         barrier_stragglers: barrier_straggler_flags(&aggregates, &config.thresholds),
+        socket_fallbacks: nccl_transport::socket_fallbacks(&observations, nccl_level_env.as_ref()),
     };
     let calibration = Calibration {
         rooflines: rooflines(&observations),
@@ -424,6 +453,7 @@ pub fn build(
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
         // than guessed.
         nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
+        nccl_level_env,
         fleet,
         aggregates,
         calibration,
@@ -675,11 +705,17 @@ pub fn verdict(results: &RunResults) -> Verdict {
         .counter_findings
         .values()
         .any(|findings| !findings.is_empty());
+    let has_socket_fallbacks = results
+        .fleet
+        .socket_fallbacks
+        .values()
+        .any(|findings| !findings.is_empty());
     if has_failed_tests
         || has_outliers
         || has_violations
         || has_barrier_stragglers
         || has_counter_findings
+        || has_socket_fallbacks
     {
         Verdict::Stragglers
     } else {
@@ -1064,6 +1100,11 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "nccl env: {}",
         nccl_env::format_nccl_env(results.nccl_env.as_ref())
     )?;
+    for (level, env) in
+        nccl_env::format_level_overrides(results.nccl_env.as_ref(), results.nccl_level_env.as_ref())
+    {
+        writeln!(out, "nccl env [{level}]: {env}")?;
+    }
 
     render_hosts(results, out)?;
     render_sdc(results, out)?;
@@ -1072,6 +1113,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     render_jitter(results, out)?;
     render_barrier_stragglers(results, out)?;
     render_counter_findings(results, out)?;
+    nccl_transport::render(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
     render_failures(results, out)?;

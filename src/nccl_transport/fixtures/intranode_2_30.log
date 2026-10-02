@@ -1,0 +1,16 @@
+node0:3301:3301 [0] NCCL INFO Bootstrap: Using bond0:10.1.1.10<0>
+node0:3301:3301 [0] NCCL INFO NET/Plugin: Could not find: libnccl-net.so.
+node0:3301:3301 [0] NCCL INFO cudaDriverVersion 13000
+NCCL version 2.30.7+cuda13.0
+node0:3301:3301 [0] NCCL INFO NCCL version 2.30.7+cuda13.0
+node0:3301:3301 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_1:1/IB [RO]; OOB bond0:10.1.1.10<0>
+node0:3301:3301 [0] NCCL INFO Using network IB
+node0:3301:3301 [0] NCCL INFO ncclCommInitAll comm 0x60a1b2c0 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 1000 commId 0x2c - Init START
+node0:3301:3301 [1] NCCL INFO ncclCommInitAll comm 0x60a1b8d0 rank 1 nranks 4 cudaDev 1 nvmlDev 1 busId 2000 commId 0x2c - Init START
+node0:3301:3301 [0] NCCL INFO comm 0x60a1b2c0 rank 0 nRanks 4 nNodes 1 localRanks 4 localRank 0 MNNVL 0
+node0:3301:3301 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+node0:3301:3301 [1] NCCL INFO Channel 00/0 : 1[1] -> 2[2] via P2P/CUMEM/read
+node0:3301:3301 [2] NCCL INFO Channel 00 : 2[2] -> 3[3] via SHM/direct/direct
+node0:3301:3301 [3] NCCL INFO Channel 00 : 3[3] -> 0[0] via SHM/direct/direct
+node0:3301:3301 [0] NCCL INFO Connected all rings
+node0:3301:3301 [0] NCCL INFO ncclCommInitAll comm 0x60a1b2c0 rank 0 nranks 4 cudaDev 0 nvmlDev 0 busId 1000 commId 0x2c - Init COMPLETE
