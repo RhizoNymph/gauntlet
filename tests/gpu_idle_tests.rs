@@ -34,6 +34,7 @@ fn gpu(index: u32, occupancy: GpuOccupancy) -> GpuInventory {
         nvlinks_active: None,
         persistence_mode: Some(true),
         occupancy,
+        pci: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn inventory(host: &str, gpus: Vec<GpuInventory>) -> InventorySnapshot {
         gpus,
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: Some(1),

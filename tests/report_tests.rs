@@ -35,6 +35,7 @@ fn inventory(host: &str, kernel: &str) -> InventorySnapshot {
         gpus: vec![],
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: None,
@@ -293,6 +294,7 @@ fn rooflines_take_the_worst_gpu() {
             nvlinks_active: Some(18),
             persistence_mode: Some(true),
             occupancy: Default::default(),
+            pci: None,
         }];
         obs.inventory = Some(inv);
         for (gpu, gflops) in [(0u32, 900_000.0), (1u32, 850_000.0)] {

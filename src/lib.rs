@@ -3,6 +3,7 @@ pub mod analysis;
 pub mod cli;
 pub mod config;
 pub mod nccl_env;
+pub mod nccl_ib;
 pub mod orchestrator;
 pub mod proto;
 pub mod report;

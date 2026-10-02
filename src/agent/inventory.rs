@@ -17,9 +17,10 @@ use anyhow::{Context, Result};
 
 use crate::agent::EventSink;
 use crate::agent::gpu_occupancy::{self, AgentIdentity, PciBusId};
+use crate::agent::{ib, pci};
 use crate::proto::{
-    AgentEvent, GpuInventory, GpuOccupancy, IbPortInventory, InventorySnapshot, NicInventory,
-    Scope, TestId, TestOutcome, gpu_visibility_mismatch,
+    AgentEvent, GpuInventory, GpuOccupancy, InventorySnapshot, NicInventory, PciLocation, Scope,
+    TestId, TestOutcome, gpu_visibility_mismatch,
 };
 
 /// Upper bound on any single external probe. `collect()` runs at most a
@@ -74,6 +75,8 @@ pub fn collect() -> Result<InventorySnapshot> {
         probe_cuda_version()
     };
 
+    let ib = ib::probe(Path::new(ib::INFINIBAND_ROOT));
+
     Ok(InventorySnapshot {
         hostname,
         kernel: kernel_release(),
@@ -87,7 +90,8 @@ pub fn collect() -> Result<InventorySnapshot> {
         cuda_version,
         gpus,
         nics: probe_nics(),
-        ib_ports: probe_ib_ports(),
+        ib_ports: ib.ports,
+        ib_devices: ib.devices,
         xid_errors: probe_xid_errors(),
         gpu_libs: probe_gpu_libs(),
         cuda_visible_gpus: probe_cuda_visible_gpus(),
@@ -244,47 +248,6 @@ fn probe_nics() -> Vec<NicInventory> {
     nics
 }
 
-fn probe_ib_ports() -> Vec<IbPortInventory> {
-    let Ok(devices) = std::fs::read_dir("/sys/class/infiniband") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for device in devices.flatten() {
-        let device_name = device.file_name().to_string_lossy().into_owned();
-        let Ok(port_dirs) = std::fs::read_dir(device.path().join("ports")) else {
-            continue;
-        };
-        for port_dir in port_dirs.flatten() {
-            let Ok(port) = port_dir.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let path = port_dir.path();
-            // `state` reads as "4: ACTIVE"; keep the symbolic half.
-            let state = read_trimmed(path.join("state"))
-                .map(|raw| {
-                    raw.split_once(':')
-                        .map(|(_, name)| name.trim().to_string())
-                        .unwrap_or(raw)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            // `rate` reads as "100 Gb/sec (4X EDR)".
-            let rate_gbps = read_trimmed(path.join("rate"))
-                .and_then(|raw| raw.split_whitespace().next()?.parse::<f64>().ok());
-            let link_downed_count = read_trimmed(path.join("counters/link_downed"))
-                .and_then(|raw| raw.parse::<u64>().ok());
-            ports.push(IbPortInventory {
-                device: device_name.clone(),
-                port,
-                state,
-                rate_gbps,
-                link_downed_count,
-            });
-        }
-    }
-    ports.sort_by(|a, b| (&a.device, a.port).cmp(&(&b.device, b.port)));
-    ports
-}
-
 // ---------------------------------------------------------------------------
 // nvidia-smi
 // ---------------------------------------------------------------------------
@@ -309,12 +272,17 @@ fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
         ],
         PROBE_TIMEOUT,
     );
-    gpus_from_nvidia_smi(
+    let (mut gpus, driver) = gpus_from_nvidia_smi(
         &gpu_query,
         compute_apps.as_deref(),
         &AgentIdentity::current(),
         gpu_occupancy::exe_basename,
-    )
+    );
+    let pci_root = Path::new(pci::PCI_DEVICES_ROOT);
+    for location in gpus.iter_mut().filter_map(|gpu| gpu.pci.as_mut()) {
+        pci::resolve(pci_root, location);
+    }
+    (gpus, driver)
 }
 
 /// Pure core of `probe_gpus`: the `GPU_QUERY` CSV joined with the
@@ -397,6 +365,9 @@ fn parse_gpu_query(output: &str) -> (Vec<(GpuInventory, Option<PciBusId>)>, Opti
                 memory_total_mib,
                 compute_processes: None,
             },
+            // The address only; `probe_gpus` resolves NUMA node and
+            // upstream bridges against sysfs.
+            pci: bus_id.map(|bus| PciLocation::address_only(bus.to_string())),
         };
         gpus.push((gpu, bus_id));
     }

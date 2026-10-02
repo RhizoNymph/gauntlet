@@ -44,6 +44,7 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::nccl_env::NcclEnv;
+use crate::nccl_ib::{NcclIbConfig, nccl_nic_events};
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit, gpu_idle_outcomes,
@@ -461,12 +462,16 @@ async fn node_phase(
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
+    // `FleetConfig::load` validated the env, so `None` is unreachable in a
+    // run; it only means "derive no nccl_nics outcome".
+    let nccl_ib = config.nccl_env().ok().map(NcclIbConfig::from_env);
 
     let mut tasks = JoinSet::new();
     for session in sessions {
         let session = Arc::clone(session);
         let sink = sink.clone();
         let document = document.clone();
+        let nccl_ib = nccl_ib.clone();
         tasks.spawn(async move {
             let addr = session.addr().to_string();
             let mut inventory = None;
@@ -477,12 +482,20 @@ async fn node_phase(
                     // threshold is orchestrator config, the agent reports
                     // facts only. One outcome per GPU, right behind the
                     // inventory it judges.
-                    let gpu_idle = match &event {
+                    // nccl_nics likewise: which ports NCCL would use under
+                    // the run's NCCL_IB_HCA is orchestrator knowledge.
+                    let (gpu_idle, nccl_nics) = match &event {
                         AgentEvent::Inventory { snapshot } => {
                             inventory = Some(snapshot.clone());
-                            gpu_idle_outcomes(snapshot, gpu_idle_max_used_mib)
+                            (
+                                gpu_idle_outcomes(snapshot, gpu_idle_max_used_mib),
+                                nccl_ib
+                                    .as_ref()
+                                    .map(|config| nccl_nic_events(snapshot, config))
+                                    .unwrap_or_default(),
+                            )
                         }
-                        _ => Vec::new(),
+                        _ => (Vec::new(), Vec::new()),
                     };
                     sink.event(&addr, event);
                     for (scope, outcome) in gpu_idle {
@@ -494,6 +507,9 @@ async fn node_phase(
                                 outcome,
                             },
                         );
+                    }
+                    for derived in nccl_nics {
+                        sink.event(&addr, derived);
                     }
                 }),
             )

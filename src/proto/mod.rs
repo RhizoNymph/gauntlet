@@ -12,8 +12,14 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod ib;
 mod occupancy;
 mod ranks;
+
+pub use ib::{
+    IbDeviceInventory, IbRate, IbRateError, IbSpeed, LinkLayer, PciLocality, PciLocation,
+    PhysState, PortState, RoceVersion, gbps_to_gib_per_sec, payload_gbps, pci_locality,
+};
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
@@ -53,7 +59,15 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-pub const PROTO_VERSION: u32 = 10;
+// v11: InfiniBand inventory — `ib_ports` entries carry `link_layer`
+// (InfiniBand / Ethernet with its RoCE versions), `phys_state`, the parsed
+// rate `lanes` / `speed` and the bound `netdevs`; the snapshot lists
+// `ib_devices` (PCI address, NUMA node, upstream bridges) and every
+// `GpuInventory` its `pci` placement, so NIC<->GPU locality can be derived.
+// The orchestrator-derived `nccl_nics` test id rides the wire. All
+// serde-defaulted: older inventories decode with link layer and placement
+// unknown.
+pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -248,6 +262,11 @@ pub enum TestId {
     /// Derived orchestrator-side (`report::build`): overlapped/isolated
     /// ratios. Agents never emit this test id.
     OverlapRetention,
+    /// Which IB/RoCE ports NCCL would use under the run's `NCCL_IB_HCA`,
+    /// and their summed line rate (`ceiling_gib_per_sec`). Derived
+    /// orchestrator-side from the inventory (`crate::nccl_ib`); agents
+    /// never emit this test id.
+    NcclNics,
 }
 
 /// What a metric is *about*. Per-core / per-GPU granularity is the point:
@@ -341,6 +360,10 @@ pub struct InventorySnapshot {
     pub gpus: Vec<GpuInventory>,
     pub nics: Vec<NicInventory>,
     pub ib_ports: Vec<IbPortInventory>,
+    /// RDMA devices and their PCI placement (proto v11); ports join on
+    /// `IbPortInventory.device`.
+    #[serde(default)]
+    pub ib_devices: Vec<IbDeviceInventory>,
     /// Xid error codes seen in the kernel log since boot.
     pub xid_errors: Vec<u32>,
     /// Runtime-loadability of the GPU library stack ("cuda", "cublas",
@@ -399,6 +422,11 @@ pub struct GpuInventory {
     /// "nothing known" for older inventories.
     #[serde(default)]
     pub occupancy: GpuOccupancy,
+    /// PCI placement (proto v11): the nvidia-smi bus id, resolved against
+    /// sysfs for NUMA node and upstream bridges. `None` when nvidia-smi
+    /// reported no bus id (and for older inventories).
+    #[serde(default)]
+    pub pci: Option<PciLocation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -414,9 +442,42 @@ pub struct NicInventory {
 pub struct IbPortInventory {
     pub device: String,
     pub port: u32,
+    /// Symbolic logical state ("ACTIVE", "DOWN", ...); typed reading via
+    /// [`IbPortInventory::logical_state`].
     pub state: String,
+    /// The number of the sysfs rate string ("200 Gb/sec (4X HDR)" -> 200),
+    /// as printed; [`IbPortInventory::payload_gbps`] corrects it for the
+    /// link encoding.
     pub rate_gbps: Option<f64>,
     pub link_downed_count: Option<u64>,
+    /// Lanes from the rate string ("4X" -> 4) (proto v11).
+    #[serde(default)]
+    pub lanes: Option<u32>,
+    /// Speed name from the rate string (proto v11).
+    #[serde(default)]
+    pub speed: Option<IbSpeed>,
+    /// `link_layer` (proto v11); `Unknown` for older inventories.
+    #[serde(default)]
+    pub link_layer: LinkLayer,
+    /// `phys_state` (proto v11).
+    #[serde(default)]
+    pub phys_state: PhysState,
+    /// Network interfaces bound to this port (`device/net/*` filtered by
+    /// `dev_port`, else the GID table's `ndevs`), sorted (proto v11).
+    #[serde(default)]
+    pub netdevs: Vec<String>,
+}
+
+impl IbPortInventory {
+    pub fn logical_state(&self) -> PortState {
+        PortState::parse(&self.state)
+    }
+
+    /// Encoding-corrected line rate in Gb/s, when the rate was readable.
+    pub fn payload_gbps(&self) -> Option<f64> {
+        self.rate_gbps
+            .map(|rate| payload_gbps(rate, self.speed, &self.link_layer))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -998,6 +1059,7 @@ mod tests {
             nvlinks_active: None,
             persistence_mode: None,
             occupancy: GpuOccupancy::default(),
+            pci: None,
         };
         InventorySnapshot {
             hostname: "n1".into(),
@@ -1013,6 +1075,7 @@ mod tests {
             gpus: vec![gpu; listed],
             nics: vec![],
             ib_ports: vec![],
+            ib_devices: vec![],
             xid_errors: vec![],
             gpu_libs: BTreeMap::new(),
             cuda_visible_gpus: visible,
