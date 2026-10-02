@@ -126,8 +126,14 @@ with different envs:
   sweep runs without the probe, then a second fleet job runs
   `NcclWorkload::Barrier(spec)` on its own communicator (same rank
   layout) under the barrier env (`BarrierPlacement` in
-  `orchestrator/nccl/mod.rs`). The split costs one extra communicator
-  init; results land in the same `nccl_barrier` metric groups.
+  `orchestrator/nccl/barrier_job.rs`). The split costs one extra
+  communicator init; results land in the same `nccl_barrier` metric
+  groups. The separate job runs only after a clean sweep: if the sweep
+  attributed a failure to a host, the probe is recorded Skipped on every
+  member (`nccl_barrier`, node scope, naming the failed host) instead of
+  re-forming a world that includes the culprit. The comparison reads
+  `HostSession::nccl_levels()`, the levels resolved and validated when
+  the config loaded, so it cannot fail at use time.
 
 ### Spawn env selection
 `HostSession` holds the resolved `NcclLevelEnvs` and every spawn names its
@@ -137,12 +143,17 @@ with different envs:
   `agent_env_words` produced before.
 - `AgentEnv::Nccl(level)` (`node_phase` for network/overlap, every fleet
   `agent nccl` job via `NcclJob::spawn_env`): LD_LIBRARY_PATH, the level's
-  effective env, and the NCCL debug-log variables of transport capture
-  (docs/features/nccl_transport.md), merged in key order. Capture never
-  names a key the level env sets, so no word is duplicated.
+  effective env overlaid with the NCCL debug-log variables of transport
+  capture as one `NcclEnv` (`nccl_transport::debug::capture_env`;
+  docs/features/nccl_transport.md). Capture never names a key the level
+  env sets, so no word is duplicated.
 
-`spawn_env_words` builds both forms; still single-quoted, still on the
-`env` command line, still never `set_var`.
+`spawn_env_words` builds both forms through `agent_env_words`, the single
+quoting path: still single-quoted, still on the `env` command line, still
+never `set_var`. `HostSession::connect` precomputes every list once
+(`SpawnWords`: `Base` plus one per level, held in a `PerLevel`), so a
+spawn only picks its list; a remote_dir that cannot form a valid debug
+log path fails the connect, not a later spawn.
 
 ## Library stdout isolation
 Setting NCCL_DEBUG makes NCCL write its logs to fd 1, and CUDA and other

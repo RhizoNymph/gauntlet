@@ -73,9 +73,11 @@ gpu_idle_max_used_mib = 1024
 # NCCL_DEBUG_FILE=<remote_dir>/nccl-logs/<level>.%h.log, and the run records
 # which transport each communicator used (IB/RoCE ports, socket interfaces,
 # net plugin, P2P/SHM/NET peer channels). A multi-host communicator on TCP
-# sockets is flagged unless that level sets NCCL_IB_DISABLE=1 or
-# NCCL_NET=Socket. Debug variables set here are never overridden; an
-# NCCL_DEBUG below INFO turns capture off (recorded as unknown).
+# sockets is flagged only on hosts with an ACTIVE IB/RoCE port (an
+# Ethernet-only fleet is fine) and unless that level sets
+# NCCL_IB_DISABLE=1 or NCCL_NET=Socket. Debug variables set here are never
+# overridden; an NCCL_DEBUG below INFO, or an NCCL_DEBUG_SUBSYS without
+# INIT, turns capture off (recorded as unknown).
 
 # Per-level overrides, layered on top of [nccl] env for one NCCL call site
 # only (same key/value rules). Levels: intranode (intra-node sweep), fleet

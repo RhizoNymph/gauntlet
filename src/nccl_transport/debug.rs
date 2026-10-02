@@ -22,10 +22,11 @@
 //! (`log_source`), so the orchestrator's additions and the agent's reading
 //! cannot disagree.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::UnknownTransport;
-use crate::nccl_env::NcclEnv;
+use crate::nccl_env::{NcclEnv, NcclEnvError};
 use crate::nccl_level::NcclLevel;
 
 pub const NCCL_DEBUG: &str = "NCCL_DEBUG";
@@ -92,20 +93,39 @@ pub fn managed_log_path(remote_dir: &str, level: NcclLevel) -> String {
 
 /// The variables gauntlet adds to a level's spawn env so NCCL writes a
 /// parsable log, in key order. Never names a variable `user` already sets.
+/// Adds nothing at all when the config's own settings rule capture out
+/// (a level below INFO, or a subsystem mask without INIT): capture is then
+/// unknown anyway, and gauntlet must not switch on logging nobody asked
+/// for.
 pub fn capture_additions(user: DebugSettings<'_>, log_path: &str) -> Vec<(&'static str, String)> {
     let mut added = Vec::new();
     let effective_level = user.level.unwrap_or(CAPTURE_LEVEL);
+    if !level_logs_info(effective_level) || !subsys_admits_init(user.subsys) {
+        return added;
+    }
     if user.level.is_none() {
         added.push((NCCL_DEBUG, CAPTURE_LEVEL.to_string()));
         if user.subsys.is_none() {
             added.push((NCCL_DEBUG_SUBSYS, CAPTURE_SUBSYS.to_string()));
         }
     }
-    if user.file.is_none() && level_logs_info(effective_level) {
+    if user.file.is_none() {
         added.push((NCCL_DEBUG_FILE, log_path.to_string()));
     }
     added.sort_by_key(|(key, _)| *key);
     added
+}
+
+/// `capture_additions` as a validated `NcclEnv`, ready to overlay on the
+/// level's env (its keys never collide with the env's own). Fails only
+/// when the log path is not a valid env value (a control character in
+/// remote_dir).
+pub fn capture_env(user: DebugSettings<'_>, log_path: &str) -> Result<NcclEnv, NcclEnvError> {
+    let raw: BTreeMap<String, String> = capture_additions(user, log_path)
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value))
+        .collect();
+    NcclEnv::from_map(&raw)
 }
 
 /// Where NCCL wrote this process's INFO log, from the variables in the
@@ -224,6 +244,42 @@ mod tests {
         assert_eq!(
             capture_additions(settings(Some("trace"), None, None), PATH),
             vec![(NCCL_DEBUG_FILE, PATH.to_string())]
+        );
+    }
+
+    #[test]
+    fn a_subsys_without_init_adds_no_logging_at_all() {
+        // Rule 4: capture is impossible, so no NCCL_DEBUG=INFO nobody asked
+        // for and no file.
+        for subsys in ["NET,GRAPH", "^INIT", "COLL"] {
+            assert_eq!(
+                capture_additions(settings(None, Some(subsys), None), PATH),
+                vec![],
+                "{subsys}"
+            );
+            assert_eq!(
+                log_source(settings(None, Some(subsys), None), "n", 1),
+                Err(UnknownTransport::DebugLevel { level: None }),
+                "{subsys}"
+            );
+        }
+        assert_eq!(
+            capture_additions(settings(Some("INFO"), Some("GRAPH"), None), PATH),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn capture_env_is_a_validated_env() {
+        let env = capture_env(DebugSettings::default(), PATH).expect("valid");
+        assert_eq!(env.get(NCCL_DEBUG), Some("INFO"));
+        assert_eq!(env.get(NCCL_DEBUG_FILE), Some(PATH));
+        assert_eq!(env.len(), 3);
+        assert!(capture_env(DebugSettings::default(), "/bad\npath").is_err());
+        assert!(
+            capture_env(settings(Some("WARN"), None, None), PATH)
+                .expect("valid")
+                .is_empty()
         );
     }
 

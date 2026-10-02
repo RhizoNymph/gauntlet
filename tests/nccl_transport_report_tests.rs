@@ -43,6 +43,13 @@ fn report(level: NcclLevel, span: CommSpan, capture: TransportCapture) -> AgentE
 fn observations() -> BTreeMap<String, HostObservations> {
     let mut collector = Collector::new();
     for (host, fleet_log) in [("n1", SOCKET_LOG), ("n2", IB_LOG)] {
+        // Both hosts have an ACTIVE IB port, so n1's sockets are a fallback.
+        collector.ingest(
+            host,
+            AgentEvent::Inventory {
+                snapshot: Box::new(inventory_with_active_ib()),
+            },
+        );
         for event in [
             report(
                 NcclLevel::Intranode,
@@ -57,6 +64,36 @@ fn observations() -> BTreeMap<String, HostObservations> {
         }
     }
     collector.into_observations()
+}
+
+fn inventory_with_active_ib() -> gauntlet::proto::InventorySnapshot {
+    serde_json::from_value(serde_json::json!({
+        "hostname": "n", "kernel": "6.8", "cpu_model": "x", "logical_cores": 8,
+        "numa_nodes": 1, "mem_total_bytes": 1, "cpu_governor": null,
+        "clock_offset_ms": null, "nvidia_driver": null, "cuda_version": null,
+        "gpus": [], "nics": [], "xid_errors": [],
+        "ib_ports": [{"device": "mlx5_0", "port": 1, "state": "ACTIVE",
+                      "rate_gbps": 200.0, "link_downed_count": 0}]
+    }))
+    .expect("inventory")
+}
+
+#[test]
+fn an_ethernet_only_fleet_on_sockets_is_clean() {
+    let mut observations = observations();
+    for obs in observations.values_mut() {
+        if let Some(inventory) = obs.inventory.as_mut() {
+            inventory.ib_ports.clear();
+        }
+    }
+    let results = report::build(&config(""), observations, 1, 2);
+    assert!(results.fleet.socket_fallbacks.is_empty());
+    assert_eq!(report::verdict(&results), Verdict::Clean);
+    // The socket transport is still recorded and shown.
+    let mut table = Vec::new();
+    report::render_table(&results, &mut table).expect("render");
+    let table = String::from_utf8(table).expect("utf8");
+    assert!(table.contains("Socket bond0(10.20.4.12)"), "{table}");
 }
 
 fn build(config: &FleetConfig) -> RunResults {

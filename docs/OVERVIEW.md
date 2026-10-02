@@ -217,14 +217,18 @@ Features Index:
       Transport capture (proto v11 / schema v13): NCCL-hosting processes
       are started with NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,NET and a
       per-host/level NCCL_DEBUG_FILE (never overriding config values; a
-      config NCCL_DEBUG below INFO records "unknown"). After the workload
-      the agent parses the log (pure parser, NCCL 2.18-2.30 fixtures) into
-      an `nccl_transport` event: network transport (IB/RoCE ports, socket
-      interfaces, net plugin), peer channel counts (P2P/SHM/NET/GDR/
-      COLLNET), NCCL version. A multi-host communicator on TCP sockets
-      without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env is a
-      `fleet.socket_fallbacks` finding (verdict Stragglers); the table
-      shows a "nccl transports" section.
+      config NCCL_DEBUG below INFO, or a subsys mask without INIT, adds
+      nothing and records "unknown"). The agent clears the log path before
+      NCCL starts and, on every exit after its first NCCL call (init
+      failures included), parses the log (pure parser, NCCL 2.18-2.30
+      fixtures) into one `nccl_transport` event: network transport
+      (IB/RoCE ports, socket interfaces, net plugin), peer channel counts
+      (P2P/SHM/NET/GDR/COLLNET), NCCL version. A multi-host communicator on
+      TCP sockets, on a host whose inventory shows an ACTIVE IB/RoCE port,
+      without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env, is a
+      `fleet.socket_fallbacks` finding (verdict Stragglers); Ethernet-only
+      hosts are never flagged. The table shows a "nccl transports"
+      section.
     entry_points: [nccl_transport/, agent/transport.rs, orchestrator/session.rs, report/nccl_transport.rs]
     depends_on: [nccl_env, phase3_network, overlap_phase]
     doc: docs/features/nccl_transport.md

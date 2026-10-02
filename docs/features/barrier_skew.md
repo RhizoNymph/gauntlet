@@ -104,7 +104,10 @@ straggler experiences.
    `Participate` directives — or, when the barrier and fleet levels'
    NCCL envs differ, runs it afterwards as a separate
    `NcclWorkload::Barrier(spec)` job under the barrier env, with the same
-   intercept and analysis. After the sweep, every host's process runs
+   intercept and analysis (`orchestrator/nccl/barrier_job.rs`). That job
+   runs only after a clean sweep: if the sweep blamed a host, every member
+   records `nccl_barrier` Skipped naming it, rather than re-forming a
+   world that includes the culprit. After the sweep, every host's process runs
    warmup + `iters` timed tiny grouped all-reduces over its local ranks
    and emits one `AgentEvent::NcclBarrierTimings { rank, elapsed_us }` per
    local rank (participants included — the one time they speak). The

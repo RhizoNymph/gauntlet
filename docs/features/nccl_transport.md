@@ -13,8 +13,11 @@ NCCL actually used:
 - the NCCL version.
 
 A multi-host communicator whose network transport is the socket fallback
-is a finding (`fleet.socket_fallbacks`, verdict Stragglers) unless the
-level's env asked for sockets on purpose. The point is diagnosis: a silent
+is a finding (`fleet.socket_fallbacks`, verdict Stragglers) when the host
+had an ACTIVE IB/RoCE port to fall back from and the level's env did not
+ask for sockets on purpose. A fleet with no IB at all (e.g. an Ethernet
+bond) runs NCCL over sockets by necessity, and that is never flagged. The
+point is diagnosis: a silent
 fallback from IB to TCP (a wrong NCCL_IB_HCA, a missing GID index, a down
 port) is about 10x slower and otherwise just looks like low bandwidth.
 
@@ -31,10 +34,12 @@ Non-scope:
 
 ## Data / control flow
 1. **Spawn env** (`orchestrator/session.rs::spawn_env_words`,
-   `nccl_transport/debug.rs::capture_additions`). Every NCCL-hosting
-   spawn (`AgentEnv::Nccl(level)`) gets, on its `env` command line, the
-   level's effective env plus the debug-log variables the config does not
-   already set:
+   `nccl_transport/debug.rs::capture_env`). Every NCCL-hosting spawn
+   (`AgentEnv::Nccl(level)`) gets, on its `env` command line, the level's
+   effective env overlaid with the debug-log variables the config does
+   not already set (an `NcclEnv`, quoted by the same `agent_env_words`
+   path as every other word; computed once per host at connect,
+   `SpawnWords`):
    - NCCL_DEBUG unset -> `NCCL_DEBUG=INFO`, and if NCCL_DEBUG_SUBSYS is
      unset too, `NCCL_DEBUG_SUBSYS=INIT,NET` (INIT carries every line the
      parser reads; NET adds plugin detail; the log stays small).
@@ -49,8 +54,9 @@ Non-scope:
    never overridden.** A user NCCL_DEBUG=INFO keeps NCCL's default
    subsystem mask (which includes INIT) and gains only the file, so their
    log moves from the agent's stderr into that file. A user NCCL_DEBUG
-   below INFO (VERSION, WARN, ...) or a subsystem mask without INIT gets
-   nothing added, and the transport is recorded as unknown with that
+   below INFO (VERSION, WARN, ...) or a user subsystem mask without INIT
+   (even with NCCL_DEBUG unset) gets nothing added at all — no logging
+   nobody asked for — and the transport is recorded as unknown with that
    reason. A user NCCL_DEBUG_FILE is parsed in place (with `%h`/`%p`
    expanded the way NCCL does). Values set by gauntlet override values the
    node's login shell exports for the same keys.
@@ -59,27 +65,39 @@ Non-scope:
    `agent::channel::isolate_stdout` already points fd 1 at stderr.
 
 2. **Agent** (`agent/transport.rs`). `CaptureWindow::open()` before the
-   first NCCL call of the process; `CaptureWindow::emit(sink, level,
-   span)` after the communicator has carried traffic (NCCL connects peers
-   lazily, at the first collective, since 2.22):
-   - `agent nccl`: after the workload (sweep, barrier or fleet overlap),
-     whether or not it succeeded, before any error propagates — a socket
-     fallback is exactly what makes a workload crawl or time out. Level
-     from `NcclWorkload::level()`, span `CommSpan::from_world(block count,
-     world size)` (one host owns one contiguous block, so the world spans
-     hosts exactly when it is larger than the block).
-   - `agent run` network phase (intra-node sweep): after the sweep loop;
-     `Intranode`, single host.
-   - `agent run` overlap phase: after the warmup rounds, before the GEMM
-     load; `OverlapIntranode`, single host.
+   first NCCL call of the process, then `window.run(sink, level, span,
+   body)` around every NCCL call of the communicator. `run` emits the
+   report exactly once on every exit of the body — success, a failed
+   `ncclGetUniqueId` / `ncclCommInitRank` / `ncclCommInitAll`, a
+   collective error — and then returns the body's result unchanged. A
+   failed init is exactly when the diagnosis matters (wrong NCCL_IB_HCA or
+   GID index), and NCCL has logged its network selection by then. NCCL
+   connects peers lazily (at the first collective, since 2.22), so the
+   bodies end after traffic:
+   - `agent nccl`: id mint, communicator init and the workload (sweep,
+     barrier or fleet overlap). Stage 1 (device checks, buffers) runs
+     before the body and makes no NCCL call, so a failure there emits
+     nothing. Level from `NcclWorkload::level()`, span
+     `CommSpan::from_world(block count, world size)` (one host owns one
+     contiguous block, so the world spans hosts exactly when it is larger
+     than the block).
+   - `agent run` network phase (intra-node sweep): `ncclCommInitAll`
+     through the sweep loop; `Intranode`, single host.
+   - `agent run` overlap phase: `ncclCommInitAll` through the warmup
+     rounds, before the GEMM load; `OverlapIntranode`, single host.
 
-   The window reads NCCL_DEBUG, NCCL_DEBUG_SUBSYS and NCCL_DEBUG_FILE from
-   the process env (reading is sound; the agent never sets env), decides
-   with the pure `debug::log_source` where NCCL wrote its log (or why it
-   wrote none), checks the file was modified after the window opened
-   (else `Stale`: NCCL could not open it and a previous run's file is
-   still there), reads it and parses it with the pure `parse::parse_log`.
-   NCCL opens its debug file unbuffered, so every line is on disk.
+   `open` reads NCCL_DEBUG, NCCL_DEBUG_SUBSYS and NCCL_DEBUG_FILE from the
+   process env (reading is sound; the agent never sets env), decides with
+   the pure `debug::log_source` where NCCL will write its log (or why it
+   will write none), and **deletes whatever is at that path**. What
+   exists there after the body ran was written by this process's NCCL by
+   construction; no timestamps are compared, so an NFS server's clock
+   cannot matter. (NCCL truncates the file at open anyway, so nothing is
+   lost.) A path that cannot be cleared is `Unknown::Uncleared`; a file
+   NCCL never wrote is `Unknown::Unreadable`. The text is parsed with the
+   pure `parse::parse_log`; NCCL opens its debug file unbuffered, so every
+   line is on disk. A process killed outright (the fleet-overlap
+   watchdog's hard exit) emits nothing.
 
 3. **Wire** (PROTO_VERSION 11). `AgentEvent::NcclTransport { report:
    Box<NcclTransportReport> }`, one per NCCL-hosting process:
@@ -92,14 +110,27 @@ Non-scope:
    across repeats.
 
 5. **Report** (`report/nccl_transport.rs`, SCHEMA_VERSION 13).
-   `socket_fallbacks(observations, nccl_level_env)`: for every host, every
-   `MultiHost` report whose captured network is `Socket`, one
-   `SocketFallback { level, ifaces }` per (host, level) however many
-   repeats saw it — unless that level's recorded effective env makes
-   sockets deliberate (`socket_is_deliberate`: NCCL_IB_DISABLE a non-zero
-   integer, or NCCL_NET=Socket, case-insensitive). Unknown captures and
-   single-host communicators never flag. `fleet.socket_fallbacks`
-   non-empty makes the verdict at least Stragglers.
+   `socket_fallbacks(observations, nccl_level_env)` is the one pure
+   decision. It yields one `SocketFallback { level, ifaces }` per (host,
+   level), however many repeats saw it, when all of these hold:
+   - the report is `MultiHost` and its captured network is `Socket`;
+   - the host's phase-0 inventory shows at least one IB/RoCE port in state
+     ACTIVE (`IbAvailability::of` == `ActivePort`). Without one, sockets
+     are the only transport the host has, not a fallback;
+   - the level's recorded effective env does not make sockets deliberate
+     (`socket_is_deliberate`: NCCL_IB_DISABLE a non-zero integer, or
+     NCCL_NET=Socket, case-insensitive).
+
+   `IbAvailability` is `ActivePort`, `NoActivePort` (no ports, or none
+   ACTIVE), `NoDeviceSeenByNccl` (no inventory, but NCCL logged `NET/IB :
+   No device found` while the level left NCCL_IB_HCA unset, i.e. no IB
+   device exists; recorded by the parser as `ib_no_device`) or `Unknown`
+   (no inventory and no such signal). Only `ActivePort` can flag. With
+   NCCL_IB_HCA set, "no device" may be the misconfiguration itself, so it
+   is not taken as proof of absence. Unknown captures and single-host
+   communicators never flag either. The transport record itself is kept
+   in every case. `fleet.socket_fallbacks` non-empty makes the verdict at
+   least Stragglers.
 
 6. **Terminal** (`report::render_table`). A "nccl transports" section, one
    row per (host, level) with the latest report: span, network
@@ -143,17 +174,19 @@ logs should be added as fixtures when hardware validation produces them.
   `socket_is_deliberate`.
 - `src/nccl_transport/parse.rs` — `parse_log`.
 - `src/nccl_transport/debug.rs` — `DebugSettings`, `capture_additions`,
-  `log_source`, `expand_debug_file`, `short_hostname`,
+  `capture_env`, `log_source`, `expand_debug_file`, `short_hostname`,
   `managed_log_path`, `level_logs_info`, `subsys_admits_init`,
   `CAPTURE_LEVEL`, `CAPTURE_SUBSYS`, `LOG_DIR`.
-- `src/agent/transport.rs` — `CaptureWindow` (`open`, `emit`).
+- `src/agent/transport.rs` — `CaptureWindow` (`open`, `open_with`,
+  `run`).
 - `src/agent/nccl/mod.rs`, `src/agent/gpu/intranode.rs`,
   `src/agent/gpu/overlap.rs` — the three capture points.
-- `src/orchestrator/session.rs` — `spawn_env_words` adds the variables;
-  `resolve_remote_dir` creates `nccl-logs`.
+- `src/orchestrator/session.rs` — `spawn_env_words` adds the variables,
+  `SpawnWords` precomputes them per host; `resolve_remote_dir` creates
+  `nccl-logs`.
 - `src/orchestrator/collect.rs` — `HostObservations.nccl_transports`.
-- `src/report/nccl_transport.rs` — `SocketFallback`, `socket_fallbacks`,
-  `net_cell`, `render`.
+- `src/report/nccl_transport.rs` — `SocketFallback`, `IbAvailability`,
+  `socket_fallbacks`, `net_cell`, `render`.
 - `src/report/mod.rs` — `FleetAnalysis.socket_fallbacks`, verdict.
 
 ## Invariants
@@ -161,10 +194,13 @@ logs should be added as fixtures when hardware validation produces them.
   only adds the ones missing, and only when the result is a parsable log.
 - The agent decides where the log is from the variables in its own
   environment, so it parses exactly the file NCCL was told to write.
-- A report is emitted only by a process whose communicator initialized;
-  its level comes from `Phase::nccl_level` / `NcclWorkload::level`, the
-  same mapping that chose its spawn env.
-- A log not modified since the process's NCCL init began is never parsed.
-- Only a captured `Socket` network on a `MultiHost` communicator, at a
-  level whose env does not disable IB, is a finding.
+- Every NCCL-hosting process that reached its first NCCL call emits
+  exactly one report, whether the body succeeded or failed (init failures
+  included); its level comes from `Phase::nccl_level` /
+  `NcclWorkload::level`, the same mapping that chose its spawn env.
+- The log path is cleared before NCCL starts, so a previous run's log is
+  never parsed; freshness never depends on clocks.
+- Only a captured `Socket` network on a `MultiHost` communicator, on a
+  host whose inventory shows an ACTIVE IB/RoCE port, at a level whose env
+  does not disable IB, is a finding.
 - Parsing is pure and total: any text yields a value or `None`.

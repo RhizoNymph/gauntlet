@@ -15,9 +15,9 @@ use tracing::{debug, warn};
 
 use super::deploy::AGENT_RELPATH;
 use crate::config::{HostConfig, SshConfig};
-use crate::nccl_env::NcclEnv;
-use crate::nccl_level::{NcclLevel, NcclLevelEnvs};
-use crate::nccl_transport::debug::{DebugSettings, LOG_DIR, capture_additions, managed_log_path};
+use crate::nccl_env::{NcclEnv, NcclEnvError};
+use crate::nccl_level::{NcclLevel, NcclLevelEnvs, PerLevel};
+use crate::nccl_transport::debug::{DebugSettings, LOG_DIR, capture_env, managed_log_path};
 use crate::proto::{AgentEvent, PROTO_VERSION, decode_event};
 
 /// Which environment an agent spawn is started with.
@@ -85,9 +85,37 @@ pub struct HostSession {
     remote_dir: String,
     /// `<remote_dir>/bin/gauntlet-agent`.
     agent_path: String,
-    /// The resolved NCCL env of every level; each spawn picks its words
-    /// from it by `AgentEnv` (`spawn_env_words`).
+    /// The resolved NCCL env of every level (`nccl_levels`).
     nccl: Arc<NcclLevelEnvs>,
+    /// Pre-quoted env words per `AgentEnv`, computed once at connect
+    /// (`SpawnWords::build`); every spawn picks its list from here.
+    words: SpawnWords,
+}
+
+/// The env words of every `AgentEnv` for one host: `Base` plus one list
+/// per NCCL level, each already quoted (`spawn_env_words`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpawnWords {
+    base: Vec<String>,
+    levels: PerLevel<Vec<String>>,
+}
+
+impl SpawnWords {
+    pub(crate) fn build(remote_dir: &str, nccl: &NcclLevelEnvs) -> Result<Self, NcclEnvError> {
+        Ok(Self {
+            base: spawn_env_words(remote_dir, nccl, AgentEnv::Base)?,
+            levels: PerLevel::try_from_fn(|level| {
+                spawn_env_words(remote_dir, nccl, AgentEnv::Nccl(level))
+            })?,
+        })
+    }
+
+    pub(crate) fn get(&self, env: AgentEnv) -> &[String] {
+        match env {
+            AgentEnv::Base => &self.base,
+            AgentEnv::Nccl(level) => self.levels.get(level),
+        }
+    }
 }
 
 impl HostSession {
@@ -140,6 +168,12 @@ impl HostSession {
         })??;
 
         let agent_path = format!("{remote_dir}/{AGENT_RELPATH}");
+        let words = SpawnWords::build(&remote_dir, &nccl).with_context(|| {
+            format!(
+                "remote_dir {remote_dir} on {} cannot hold the NCCL debug log",
+                host.addr
+            )
+        })?;
         debug!(host = %host.addr, remote_dir = %remote_dir, "ssh session established");
         Ok(HostSession {
             host,
@@ -147,7 +181,13 @@ impl HostSession {
             remote_dir,
             agent_path,
             nccl,
+            words,
         })
+    }
+
+    /// The run's resolved NCCL env, per level.
+    pub fn nccl_levels(&self) -> &NcclLevelEnvs {
+        &self.nccl
     }
 
     pub fn addr(&self) -> &str {
@@ -167,8 +207,7 @@ impl HostSession {
     /// The remote words after the `env` program for an `agent <args>` spawn
     /// (`agent_spawn_args`), shared by every spawn path.
     fn spawn_args(&self, env: AgentEnv, args: &[&str]) -> Vec<String> {
-        let words = spawn_env_words(&self.remote_dir, &self.nccl, env);
-        agent_spawn_args(&words, &self.agent_path, args)
+        agent_spawn_args(self.words.get(env), &self.agent_path, args)
     }
 
     /// Run a short remote command, capturing stdout (used by deploy for
@@ -515,47 +554,36 @@ async fn run_shell(session: &Session, addr: &str, script: &str) -> Result<Remote
 /// Keys are validated `^NCCL_[A-Z0-9_]+$` (literal shell words); values are
 /// single-quoted, so spaces, quotes, `$`, backticks and globs stay literal.
 pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<String> {
-    std::iter::once(ld_library_path_word(remote_dir))
-        .chain(nccl_env_words(nccl_env))
-        .collect()
+    std::iter::once(format!(
+        "LD_LIBRARY_PATH={}",
+        single_quote(&format!("{remote_dir}/lib"))
+    ))
+    .chain(nccl_env_words(nccl_env))
+    .collect()
 }
 
 /// Environment words for a spawn of kind `env` (see `AgentEnv`), each a
 /// quoted POSIX-sh word: `AgentEnv::Base` is `agent_env_words` with the
 /// global env; `AgentEnv::Nccl(level)` uses the level's effective env plus
-/// the NCCL debug-log additions (`capture_additions`, whose keys never
-/// collide with the env's), all in key order after LD_LIBRARY_PATH.
+/// the NCCL debug-log additions (`capture_env`, whose keys never collide
+/// with the env's) overlaid as one `NcclEnv`. Both go through
+/// `agent_env_words`, the single quoting path. Fails only when the
+/// managed log path is not a valid env value.
 pub(crate) fn spawn_env_words(
     remote_dir: &str,
     nccl: &NcclLevelEnvs,
     env: AgentEnv,
-) -> Vec<String> {
+) -> Result<Vec<String>, NcclEnvError> {
     let level = match env {
-        AgentEnv::Base => return agent_env_words(remote_dir, nccl.global()),
+        AgentEnv::Base => return Ok(agent_env_words(remote_dir, nccl.global())),
         AgentEnv::Nccl(level) => level,
     };
     let level_env = nccl.level(level);
-    let additions = capture_additions(
+    let capture = capture_env(
         DebugSettings::from_env(level_env),
         &managed_log_path(remote_dir, level),
-    );
-    let mut entries: Vec<(&str, &str)> = level_env.iter().collect();
-    entries.extend(additions.iter().map(|(key, value)| (*key, value.as_str())));
-    entries.sort_by_key(|(key, _)| *key);
-    std::iter::once(ld_library_path_word(remote_dir))
-        .chain(
-            entries
-                .into_iter()
-                .map(|(key, value)| format!("{key}={}", single_quote(value))),
-        )
-        .collect()
-}
-
-fn ld_library_path_word(remote_dir: &str) -> String {
-    format!(
-        "LD_LIBRARY_PATH={}",
-        single_quote(&format!("{remote_dir}/lib"))
-    )
+    )?;
+    Ok(agent_env_words(remote_dir, &level_env.overlay(&capture)))
 }
 
 /// Every remote word after the `env` program of an agent spawn, each already
@@ -692,15 +720,39 @@ mod tests {
         NcclLevelEnvs::resolve(global, &overrides)
     }
 
+    fn words_for(remote_dir: &str, envs: &NcclLevelEnvs, env: AgentEnv) -> Vec<String> {
+        spawn_env_words(remote_dir, envs, env).expect("valid words")
+    }
+
+    #[test]
+    fn spawn_words_are_precomputed_per_agent_env() {
+        let envs = level_envs();
+        let words = SpawnWords::build("/opt/g", &envs).expect("valid words");
+        assert_eq!(
+            words.get(AgentEnv::Base),
+            words_for("/opt/g", &envs, AgentEnv::Base)
+        );
+        for level in NcclLevel::ALL {
+            assert_eq!(
+                words.get(AgentEnv::Nccl(level)),
+                words_for("/opt/g", &envs, AgentEnv::Nccl(level)),
+                "{level}"
+            );
+        }
+        // A remote_dir that cannot be an env value fails at connect, not
+        // at some later spawn.
+        assert!(SpawnWords::build("/opt/g\nx", &envs).is_err());
+    }
+
     #[test]
     fn base_spawns_carry_the_global_env_without_capture_variables() {
         let envs = level_envs();
         assert_eq!(
-            spawn_env_words("/opt/g", &envs, AgentEnv::Base),
+            words_for("/opt/g", &envs, AgentEnv::Base),
             agent_env_words("/opt/g", envs.global())
         );
         assert_eq!(
-            spawn_env_words("/opt/g", &envs, AgentEnv::Base),
+            words_for("/opt/g", &envs, AgentEnv::Base),
             vec![
                 "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
                 "NCCL_IB_HCA='mlx5_0'".to_string(),
@@ -712,7 +764,7 @@ mod tests {
     fn nccl_spawns_carry_their_levels_env_plus_capture_variables() {
         let envs = level_envs();
         assert_eq!(
-            spawn_env_words("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Intranode)),
+            words_for("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Intranode)),
             vec![
                 "LD_LIBRARY_PATH='/opt/g/lib'".to_string(),
                 "NCCL_ALGO='Ring'".to_string(),
@@ -723,7 +775,7 @@ mod tests {
             ]
         );
         // The intra-node override stays out of the fleet process.
-        let fleet = spawn_env_words("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Fleet));
+        let fleet = words_for("/opt/g", &envs, AgentEnv::Nccl(NcclLevel::Fleet));
         assert!(
             !fleet.iter().any(|word| word.starts_with("NCCL_ALGO=")),
             "{fleet:?}"
@@ -736,7 +788,7 @@ mod tests {
 
     #[test]
     fn a_configured_nccl_debug_is_never_overridden() {
-        let words = spawn_env_words(
+        let words = words_for(
             "/opt/g",
             &level_envs(),
             AgentEnv::Nccl(NcclLevel::OverlapFleet),
@@ -751,7 +803,7 @@ mod tests {
         );
         // Every key appears once, even with capture additions.
         for level in NcclLevel::ALL {
-            let words = spawn_env_words("/opt/g", &level_envs(), AgentEnv::Nccl(level));
+            let words = words_for("/opt/g", &level_envs(), AgentEnv::Nccl(level));
             let keys: Vec<&str> = words
                 .iter()
                 .filter_map(|word| word.split_once('=').map(|(key, _)| key))
@@ -765,7 +817,7 @@ mod tests {
     #[test]
     fn the_debug_file_pattern_reaches_nccl_unexpanded() {
         // `%h` is NCCL's placeholder, not the shell's: it must arrive as is.
-        let words = spawn_env_words(
+        let words = words_for(
             "/home/u/.gauntlet dir",
             &NcclLevelEnvs::default(),
             AgentEnv::Nccl(NcclLevel::Barrier),

@@ -260,8 +260,8 @@ pub mod imp {
             }
         };
 
-        // Before the first NCCL call: NCCL's debug log is only this
-        // process's if it was written after this point.
+        // Before the first NCCL call: resolve this process's NCCL debug log
+        // and clear any previous file there.
         let capture = CaptureWindow::open();
         // Stage 1, no NCCL: device check, contexts, binds, buffers. The
         // lead finishes it before minting the id, so a lead that cannot
@@ -278,41 +278,44 @@ pub mod imp {
                 Buffers::Barrier(BarrierBuffers::alloc(&prepared, spec)?)
             }
         };
-        let id = match rendezvous {
-            Rendezvous::Join(id) => id,
-            Rendezvous::Mint => {
-                let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
-                sink.emit(&AgentEvent::NcclId {
-                    unique_id_b64: encode_id(&id),
-                });
-                id
-            }
-        };
-        // Stage 2: grouped communicator init.
-        let ranks = prepared.connect(id)?;
-        let outcome = match (workload, buffers) {
-            (
-                NcclWorkload::Sweep {
-                    sizes,
-                    iters_per_size,
-                    barrier,
-                },
-                Buffers::Sweep(buffers),
-            ) => run_sweep(sink, &ranks, buffers, sizes, *iters_per_size, *barrier),
-            (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
-                overlap_fleet(sink, &ranks, buffers, spec)
-            }
-            (NcclWorkload::Barrier(spec), Buffers::Barrier(buffers)) => {
-                run_barrier(sink, &ranks, buffers, *spec)
-            }
-            _ => bail!("workload buffers do not match the workload"),
-        };
-        // The communicator is up and has carried traffic (or failed trying):
-        // record which transports NCCL chose, before any error propagates —
-        // a socket fallback is exactly what makes a workload crawl.
+        // From the first NCCL call on, every exit path — id mint failure,
+        // communicator init failure, workload error, success — emits the
+        // transport report exactly once (`CaptureWindow::run`), then the
+        // outcome propagates. A failed init is exactly when the diagnosis
+        // matters (wrong NCCL_IB_HCA / GID index), and NCCL has logged its
+        // network selection by then.
         let span = CommSpan::from_world(assignment.block().count(), assignment.world_size());
-        capture.emit(sink, workload.level(), span);
-        outcome
+        capture.run(sink, workload.level(), span, || {
+            let id = match rendezvous {
+                Rendezvous::Join(id) => id,
+                Rendezvous::Mint => {
+                    let id = Id::new().map_err(|error| nccl_error("ncclGetUniqueId", error))?;
+                    sink.emit(&AgentEvent::NcclId {
+                        unique_id_b64: encode_id(&id),
+                    });
+                    id
+                }
+            };
+            // Stage 2: grouped communicator init.
+            let ranks = prepared.connect(id)?;
+            match (workload, buffers) {
+                (
+                    NcclWorkload::Sweep {
+                        sizes,
+                        iters_per_size,
+                        barrier,
+                    },
+                    Buffers::Sweep(buffers),
+                ) => run_sweep(sink, &ranks, buffers, sizes, *iters_per_size, *barrier),
+                (NcclWorkload::Overlap(spec), Buffers::Overlap(buffers)) => {
+                    overlap_fleet(sink, &ranks, buffers, spec)
+                }
+                (NcclWorkload::Barrier(spec), Buffers::Barrier(buffers)) => {
+                    run_barrier(sink, &ranks, buffers, *spec)
+                }
+                _ => bail!("workload buffers do not match the workload"),
+            }
+        })
     }
 
     /// The workload's buffers, allocated in stage 1.

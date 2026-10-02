@@ -303,14 +303,18 @@ invisible). Real training runs one rank per GPU; so does this.
   `barrier` and `fleet` effective envs are identical. Otherwise
   `nccl_sweep` runs the sweep without it and then a second job,
   `NcclWorkload::Barrier(spec)`, on a fresh communicator with the same
-  rank layout under the `barrier` env (`BarrierPlacement`). Its timings
-  feed the same skew analysis and `nccl_barrier` metrics.
-- Every `agent nccl` process, after its workload (successful or not),
-  emits an `NcclTransport` report for its communicator; span is
-  `MultiHost` when the world is larger than the host's rank block. A
-  multi-host communicator on NCCL's socket transport, with IB not
-  disabled by the level env, becomes `fleet.socket_fallbacks` (verdict
-  Stragglers). Details: docs/features/nccl_transport.md.
+  rank layout under the `barrier` env (`orchestrator/nccl/barrier_job.rs`).
+  Its timings feed the same skew analysis and `nccl_barrier` metrics. That
+  second job runs only after a clean sweep; when the sweep blamed a host,
+  every member records `nccl_barrier` Skipped naming it.
+- Every `agent nccl` process that reached its first NCCL call emits one
+  `NcclTransport` report for its communicator, whether the id mint, init
+  or workload succeeded or failed; span is `MultiHost` when the world is
+  larger than the host's rank block. A multi-host communicator on NCCL's
+  socket transport, on a host whose inventory shows an ACTIVE IB/RoCE
+  port and with IB not disabled by the level env, becomes
+  `fleet.socket_fallbacks` (verdict Stragglers); an Ethernet-only fleet
+  on sockets is not flagged. Details: docs/features/nccl_transport.md.
 
 ## Management vs data plane
 `HostConfig.data_addr`, when set, is the target for peer latency/bandwidth

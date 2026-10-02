@@ -77,35 +77,68 @@ impl fmt::Display for NcclLevel {
     }
 }
 
+/// One value per `NcclLevel`, complete by construction: a lookup can never
+/// miss. Holds the per-level envs and the per-level spawn words.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PerLevel<T> {
+    intranode: T,
+    fleet: T,
+    barrier: T,
+    overlap_intranode: T,
+    overlap_fleet: T,
+}
+
+impl<T> PerLevel<T> {
+    /// Build every level's value with `make`.
+    pub fn from_fn(mut make: impl FnMut(NcclLevel) -> T) -> Self {
+        Self {
+            intranode: make(NcclLevel::Intranode),
+            fleet: make(NcclLevel::Fleet),
+            barrier: make(NcclLevel::Barrier),
+            overlap_intranode: make(NcclLevel::OverlapIntranode),
+            overlap_fleet: make(NcclLevel::OverlapFleet),
+        }
+    }
+
+    /// Like `from_fn`, stopping at the first error.
+    pub fn try_from_fn<E>(mut make: impl FnMut(NcclLevel) -> Result<T, E>) -> Result<Self, E> {
+        Ok(Self {
+            intranode: make(NcclLevel::Intranode)?,
+            fleet: make(NcclLevel::Fleet)?,
+            barrier: make(NcclLevel::Barrier)?,
+            overlap_intranode: make(NcclLevel::OverlapIntranode)?,
+            overlap_fleet: make(NcclLevel::OverlapFleet)?,
+        })
+    }
+
+    pub fn get(&self, level: NcclLevel) -> &T {
+        match level {
+            NcclLevel::Intranode => &self.intranode,
+            NcclLevel::Fleet => &self.fleet,
+            NcclLevel::Barrier => &self.barrier,
+            NcclLevel::OverlapIntranode => &self.overlap_intranode,
+            NcclLevel::OverlapFleet => &self.overlap_fleet,
+        }
+    }
+}
+
 /// The resolved NCCL env of the run: the global map plus the effective
-/// (global <- override) map of every level. Complete by construction —
-/// every level has an env — so a lookup can never miss.
+/// (global <- override) map of every level.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NcclLevelEnvs {
     global: NcclEnv,
-    intranode: NcclEnv,
-    fleet: NcclEnv,
-    barrier: NcclEnv,
-    overlap_intranode: NcclEnv,
-    overlap_fleet: NcclEnv,
+    levels: PerLevel<NcclEnv>,
 }
 
 impl NcclLevelEnvs {
     /// Layer each level's validated override onto `global`. Levels without
     /// an override get the global env verbatim.
     pub fn resolve(global: NcclEnv, overrides: &BTreeMap<NcclLevel, NcclEnv>) -> Self {
-        let effective = |level: NcclLevel| match overrides.get(&level) {
+        let levels = PerLevel::from_fn(|level| match overrides.get(&level) {
             Some(over) => global.overlay(over),
             None => global.clone(),
-        };
-        Self {
-            intranode: effective(NcclLevel::Intranode),
-            fleet: effective(NcclLevel::Fleet),
-            barrier: effective(NcclLevel::Barrier),
-            overlap_intranode: effective(NcclLevel::OverlapIntranode),
-            overlap_fleet: effective(NcclLevel::OverlapFleet),
-            global,
-        }
+        });
+        Self { global, levels }
     }
 
     /// Every level runs under `global` (no overrides).
@@ -121,20 +154,14 @@ impl NcclLevelEnvs {
 
     /// The effective env of `level`.
     pub fn level(&self, level: NcclLevel) -> &NcclEnv {
-        match level {
-            NcclLevel::Intranode => &self.intranode,
-            NcclLevel::Fleet => &self.fleet,
-            NcclLevel::Barrier => &self.barrier,
-            NcclLevel::OverlapIntranode => &self.overlap_intranode,
-            NcclLevel::OverlapFleet => &self.overlap_fleet,
-        }
+        self.levels.get(level)
     }
 
     /// Whether the barrier probe can ride the fleet sweep's communicator:
     /// only when both levels' effective envs are identical. Otherwise the
     /// probe needs its own process (and world) to run under its own env.
     pub fn barrier_shares_fleet_comm(&self) -> bool {
-        self.barrier == self.fleet
+        self.level(NcclLevel::Barrier) == self.level(NcclLevel::Fleet)
     }
 
     /// Effective env per level as plain string maps, for the results

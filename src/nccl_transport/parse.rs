@@ -44,6 +44,7 @@ struct ParseState {
     plugin: Option<String>,
     network: Option<String>,
     channels: ChannelTransports,
+    ib_no_device: bool,
 }
 
 impl ParseState {
@@ -60,7 +61,9 @@ impl ParseState {
             return;
         };
         let message = line[at + INFO_MARKER.len()..].trim();
-        if let Some(devices) = using_list(message, "NET/IB") {
+        if message.starts_with("NET/IB") && message.contains("No device found") {
+            self.ib_no_device = true;
+        } else if let Some(devices) = using_list(message, "NET/IB") {
             for port in devices.filter_map(parse_ib_port) {
                 if !self.ib_ports.contains(&port) {
                     self.ib_ports.push(port);
@@ -139,6 +142,7 @@ impl ParseState {
             net,
             net_plugin: self.plugin,
             channels: self.channels,
+            ib_no_device: self.ib_no_device,
         })
     }
 }
@@ -244,6 +248,7 @@ mod tests {
     fn infiniband_2_18() {
         let info = parse_log(IB_2_18).expect("transport lines");
         assert_eq!(info.nccl_version.as_deref(), Some("2.18.5+cuda12.2"));
+        assert!(!info.ib_no_device);
         assert_eq!(
             info.net,
             Some(NetTransport::Ib {
@@ -301,6 +306,7 @@ mod tests {
         assert_eq!(info.channels.net, 4);
         assert_eq!(info.channels.net_gdr, 0);
         assert_eq!(info.channels.p2p, 2);
+        assert!(info.ib_no_device, "NET/IB : No device found");
     }
 
     #[test]

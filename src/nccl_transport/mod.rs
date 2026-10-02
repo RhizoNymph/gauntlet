@@ -173,6 +173,11 @@ pub struct NcclTransportInfo {
     /// `None` for NCCL's internal transports.
     pub net_plugin: Option<String>,
     pub channels: ChannelTransports,
+    /// NCCL's IB transport reported `NET/IB : No device found`: the host
+    /// had no usable IB/RoCE device (or NCCL_IB_HCA matched none). Used as
+    /// a "no IB here" signal when the host has no inventory.
+    #[serde(default)]
+    pub ib_no_device: bool,
 }
 
 /// Why no transport could be recorded for a communicator.
@@ -189,9 +194,9 @@ pub enum UnknownTransport {
     NoDebugFile,
     /// The expanded NCCL_DEBUG_FILE could not be read.
     Unreadable { path: String, error: String },
-    /// The file predates this process's NCCL init (NCCL could not open it,
-    /// so a previous run's log is still there).
-    Stale { path: String },
+    /// A previous log at the path could not be removed before NCCL init, so
+    /// what is there afterwards may not be this process's.
+    Uncleared { path: String, error: String },
     /// The file holds no transport line at all.
     NoTransportLines { path: String },
 }
@@ -216,9 +221,9 @@ impl fmt::Display for UnknownTransport {
             UnknownTransport::Unreadable { path, error } => {
                 write!(f, "cannot read NCCL debug file {path}: {error}")
             }
-            UnknownTransport::Stale { path } => write!(
+            UnknownTransport::Uncleared { path, error } => write!(
                 f,
-                "NCCL debug file {path} predates this communicator (NCCL could not write it)"
+                "cannot clear the previous NCCL debug file {path} before init: {error}"
             ),
             UnknownTransport::NoTransportLines { path } => {
                 write!(f, "NCCL debug file {path} names no transport")
@@ -387,6 +392,7 @@ mod tests {
                     }),
                     net_plugin: None,
                     channels: ChannelTransports::default(),
+                    ib_no_device: false,
                 },
             },
         };

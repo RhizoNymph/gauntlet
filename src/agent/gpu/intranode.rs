@@ -43,25 +43,30 @@ pub fn run(sink: &EventSink, spec: &NcclSweepSpec) -> Result<()> {
 }
 
 fn execute(sink: &EventSink, spec: &NcclSweepSpec, world: MultiGpuWorld) -> Result<()> {
-    let capture = CaptureWindow::open();
-    let node = NodeComm::init(world.get())?;
-    let plan = SweepPlan::new(&spec.sizes, world.non_zero());
-    let mut collectives = NodeCollectives {
-        sends: node.alloc_per_rank(plan.max_elements())?,
-        recvs: node.alloc_per_rank(plan.max_elements())?,
-        node: &node,
-    };
-    let mut points = Vec::with_capacity(plan.steps().len());
-    let swept = run_plan(&mut collectives, &plan, spec.iters_per_size, |point| {
-        for record in point_records(SweepLevel::IntraNode, point, world.get()) {
-            sink.metric(record);
-        }
-        points.push(*point);
-    });
-    // Peers are connected by now (or the sweep failed trying): record the
-    // transports NCCL chose before any error propagates.
-    capture.emit(sink, NcclLevel::Intranode, CommSpan::SingleHost);
-    swept?;
+    // Communicator init through the last collective: the transport report
+    // is emitted exactly once on every exit, init failure included.
+    let points = CaptureWindow::open().run(
+        sink,
+        NcclLevel::Intranode,
+        CommSpan::SingleHost,
+        || -> Result<_> {
+            let node = NodeComm::init(world.get())?;
+            let plan = SweepPlan::new(&spec.sizes, world.non_zero());
+            let mut collectives = NodeCollectives {
+                sends: node.alloc_per_rank(plan.max_elements())?,
+                recvs: node.alloc_per_rank(plan.max_elements())?,
+                node: &node,
+            };
+            let mut points = Vec::with_capacity(plan.steps().len());
+            run_plan(&mut collectives, &plan, spec.iters_per_size, |point| {
+                for record in point_records(SweepLevel::IntraNode, point, world.get()) {
+                    sink.metric(record);
+                }
+                points.push(*point);
+            })?;
+            Ok(points)
+        },
+    )?;
     intranode::emit_summary(sink, &points, world);
     Ok(())
 }

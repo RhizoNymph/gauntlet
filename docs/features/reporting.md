@@ -305,11 +305,15 @@ its env. The viewer's diff mode uses it.
   transport or why unknown). Serde-defaulted.
 - `fleet.socket_fallbacks: BTreeMap<host, Vec<SocketFallback { level,
   ifaces }>>` — `report::nccl_transport::socket_fallbacks`: a multi-host
-  communicator whose captured network transport is TCP sockets, at a
-  level whose recorded env neither sets NCCL_IB_DISABLE to a non-zero
-  integer nor NCCL_NET=Socket. One entry per (host, level) across
-  repeats; unknown captures never count. Any entry makes the verdict at
-  least `Stragglers`. Serde-defaulted.
+  communicator whose captured network transport is TCP sockets, on a host
+  whose phase-0 inventory shows at least one ACTIVE IB/RoCE port
+  (`ib_ports`), at a level whose recorded env neither sets
+  NCCL_IB_DISABLE to a non-zero integer nor NCCL_NET=Socket. A host with
+  no IB ports, only inactive ones, or no inventory is never flagged:
+  sockets are then its only transport, not a fallback (an Ethernet-only
+  fleet stays Clean). One entry per (host, level) across repeats;
+  unknown captures never count; the transport record is kept regardless.
+  Any entry makes the verdict at least `Stragglers`. Serde-defaulted.
 - Terminal: a "nccl transports" section (latest record per host and
   level: span, network summary or "unknown: <reason>", peer channel
   counts, NCCL version) and, when any, a "nccl socket fallback" section

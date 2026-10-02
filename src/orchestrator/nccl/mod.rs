@@ -23,6 +23,7 @@
 //! killed remotely, never just dropped.
 
 mod attribution;
+mod barrier_job;
 mod layout;
 mod ownership;
 mod records;
@@ -37,17 +38,16 @@ use tracing::{info, warn};
 use self::attribution::{
     AbortAction, AbortTracker, Attribution, FailureKind, HostFailure, attribute,
 };
+use self::barrier_job::{BarrierPlacement, BarrierTimings};
 use self::layout::RankLayout;
 use self::ownership::accept_owned;
 use self::records::{host_overlap_records, outcomes_with};
-use super::barrier::{RankSubject, emit_barrier_metrics};
+use super::barrier::RankSubject;
 use super::session::{AgentEnv, HostSession};
 use super::{ObservationSink, gpu_bearing_hosts, kill_remote_agent};
-use crate::analysis::skew::{self, Margin, RankSeries, SkewPolarity};
 use crate::config::FleetConfig;
-use crate::nccl_level::NcclLevelEnvs;
 use crate::proto::{
-    AGENT_EXIT_CASCADE, AgentEvent, BarrierSpec, InventorySnapshot, NcclDirective, NcclWorkload,
+    AGENT_EXIT_CASCADE, AgentEvent, InventorySnapshot, NcclDirective, NcclWorkload,
     OverlapFleetReport, RankAssignment, RankBlock, Scope, TestId, TestOutcome,
 };
 
@@ -545,136 +545,38 @@ pub(super) async fn nccl_sweep(
         "NCCL sweep"
     );
 
-    // Barrier-skew microbenchmark: rides the sweep's communicator when the
-    // barrier and fleet levels share one NCCL env; otherwise it gets its
-    // own world (same layout) under the barrier env. Skew needs at least
-    // two independent arrivals, and the ranks of one host share its
-    // launching thread's arrival, so a one-host world has none.
-    let barrier_spec =
-        (config.tests.barrier_iters > 0 && world.member_count() >= 2).then_some(BarrierSpec {
-            iters: config.tests.barrier_iters,
-            bytes: config.tests.barrier_bytes,
-        });
-    let barrier_placement = barrier_spec.map(|spec| {
-        let shares = config
-            .nccl_levels()
-            .map(NcclLevelEnvs::barrier_shares_fleet_comm)
-            .unwrap_or(true);
-        BarrierPlacement::new(spec, shares)
-    });
-    // Every rank reports its per-iteration barrier timings; the intercept
-    // collects them with their sender so ownership can be checked and the
-    // fleet-wide skew analysis run once all hosts are in.
-    let barrier_timings: Arc<Mutex<Vec<(String, RankSeries)>>> = Arc::default();
-    let intercept: EventIntercept = {
-        let barrier_timings = Arc::clone(&barrier_timings);
-        Arc::new(move |host, event| match event {
-            AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
-                barrier_timings
-                    .lock()
-                    .expect("barrier timings poisoned")
-                    .push((host.to_string(), RankSeries { rank, elapsed_us }));
-                None
-            }
-            event => Some(event),
-        })
-    };
+    // Barrier-skew microbenchmark (`barrier_job`): rides the sweep's
+    // communicator when the barrier and fleet levels share one NCCL env,
+    // otherwise runs afterwards in its own world under the barrier env.
+    let barrier = BarrierPlacement::plan(config, &world, lead);
+    let timings = BarrierTimings::default();
     let job = NcclJob {
         workload: NcclWorkload::Sweep {
             sizes: config.tests.nccl_sizes.clone(),
             iters_per_size: config.tests.nccl_iters_per_size,
-            barrier: barrier_placement.and_then(BarrierPlacement::rides_sweep),
+            barrier: barrier.and_then(BarrierPlacement::rides_sweep),
         },
     };
-    drive_fleet_nccl(
+    let sweep = drive_fleet_nccl(
         config,
         &world,
         sink,
         "nccl sweep",
         &job,
         NcclFailureMode::HostError,
-        Arc::clone(&intercept),
+        timings.intercept(),
     )
     .await;
-    if let Some(spec) = barrier_placement.and_then(BarrierPlacement::own_world) {
-        info!(
-            world_size,
-            "NCCL barrier probe in its own world (its NCCL env differs from the fleet sweep's)"
-        );
-        let job = NcclJob {
-            workload: NcclWorkload::Barrier(spec),
-        };
-        drive_fleet_nccl(
-            config,
-            &world,
-            sink,
-            "nccl barrier",
-            &job,
-            NcclFailureMode::HostError,
-            intercept,
-        )
-        .await;
-    }
-
-    if barrier_spec.is_some() {
-        let collected =
-            std::mem::take(&mut *barrier_timings.lock().expect("barrier timings poisoned"));
-        let (accepted, violations) =
-            accept_owned(&block_owners(&world), collected, |series| series.rank);
-        report_violations(sink, violations);
-        let series: Vec<RankSeries> = accepted.into_values().collect();
-        match skew::analyze_grouped(
-            &series,
-            SkewPolarity::LateIsMin,
-            Margin::default(),
-            |rank| world.arrival_group(rank),
-        ) {
-            Some(skew) => emit_barrier_metrics(
-                sink,
-                TestId::NcclBarrier,
-                &skew,
-                |rank| gpu_subject(&world, rank),
-                Some(lead.addr()),
-            ),
-            None => warn!(
-                ranks_reporting = series.len(),
-                world_size, "NCCL barrier produced no analyzable timings"
-            ),
+    let analyze = match barrier {
+        None => false,
+        Some(BarrierPlacement::RidesSweep(_)) => true,
+        Some(BarrierPlacement::OwnWorld(spec)) => {
+            barrier_job::run_own_world(config, &world, sink, spec, timings.intercept(), &sweep)
+                .await
         }
-    }
-}
-
-/// Where the NCCL barrier probe runs, decided by whether the barrier and
-/// fleet levels share one effective NCCL env.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BarrierPlacement {
-    /// Appended to the fleet sweep, on its communicator (same env).
-    RidesSweep(BarrierSpec),
-    /// Its own `agent nccl` job and communicator, under the barrier env.
-    OwnWorld(BarrierSpec),
-}
-
-impl BarrierPlacement {
-    fn new(spec: BarrierSpec, shares_fleet_comm: bool) -> Self {
-        if shares_fleet_comm {
-            BarrierPlacement::RidesSweep(spec)
-        } else {
-            BarrierPlacement::OwnWorld(spec)
-        }
-    }
-
-    fn rides_sweep(self) -> Option<BarrierSpec> {
-        match self {
-            BarrierPlacement::RidesSweep(spec) => Some(spec),
-            BarrierPlacement::OwnWorld(_) => None,
-        }
-    }
-
-    fn own_world(self) -> Option<BarrierSpec> {
-        match self {
-            BarrierPlacement::OwnWorld(spec) => Some(spec),
-            BarrierPlacement::RidesSweep(_) => None,
-        }
+    };
+    if analyze {
+        timings.analyze(sink, &world, lead.addr());
     }
 }
 
@@ -842,22 +744,9 @@ mod tests {
     }
 
     #[test]
-    fn the_barrier_rides_the_sweep_only_under_the_fleet_env() {
-        let spec = BarrierSpec {
-            iters: 2000,
-            bytes: 8,
-        };
-        let shared = BarrierPlacement::new(spec, true);
-        assert_eq!(shared.rides_sweep(), Some(spec));
-        assert_eq!(shared.own_world(), None);
-        let split = BarrierPlacement::new(spec, false);
-        assert_eq!(split.rides_sweep(), None);
-        assert_eq!(split.own_world(), Some(spec));
-    }
-
-    #[test]
     fn every_job_spawns_under_its_workloads_level() {
         use crate::nccl_level::NcclLevel;
+        use crate::proto::BarrierSpec;
         assert_eq!(job().spawn_env(), AgentEnv::Nccl(NcclLevel::OverlapFleet));
         let sweep = NcclJob {
             workload: NcclWorkload::Sweep {
