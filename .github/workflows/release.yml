@@ -27,6 +27,13 @@ env:
   # here. cudarc likewise dlopens the CUDA stack, so no CUDA toolchain is
   # required to build the GPU feature.
   BUILD_DEPS: libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+  # The CLI is what the orchestrator copies onto every node, so its glibc
+  # floor decides which nodes can run it. It is cross-linked against this
+  # glibc with zig rather than inheriting the runner's (24.04 -> 2.39).
+  CLI_TARGET: x86_64-unknown-linux-gnu
+  GLIBC_FLOOR: "2.31"
+  ZIG_VERSION: "0.16.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
 
 jobs:
   verify:
@@ -92,22 +99,73 @@ jobs:
       - name: Install cargo-deb
         run: cargo install cargo-deb --version =3.7.0 --locked
 
+      # zig supplies the linker and glibc stubs for an older glibc. It is
+      # installed into a plain directory rather than site-packages, because
+      # the runner's system Python is externally managed (PEP 668).
+      # cargo-zigbuild finds it through `python3 -m ziglang`.
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/zig" "ziglang==$ZIG_VERSION"
+          echo "PYTHONPATH=$RUNNER_TEMP/zig" >> "$GITHUB_ENV"
+          cargo install cargo-zigbuild --version "=$CARGO_ZIGBUILD_VERSION" --locked
+
+      - name: Build the CLI against glibc ${{ env.GLIBC_FLOOR }}
+        run: |
+          cargo zigbuild --release --locked -p gauntlet-bench \
+            --target "$CLI_TARGET.$GLIBC_FLOOR"
+
+      # Guard the floor rather than trusting the toolchain: if any dependency
+      # pulls in a newer glibc symbol, fail the release instead of shipping a
+      # binary that older nodes cannot load.
+      - name: Check the CLI's glibc floor
+        run: |
+          BIN="target/$CLI_TARGET/release/gauntlet"
+          newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          # An empty result sorts below any floor, so treat it as a failure
+          # rather than letting a missing or unreadable binary pass.
+          if [ -z "$newest" ]; then
+            echo "::error::no GLIBC_* symbols found in $BIN"
+            exit 1
+          fi
+          echo "newest glibc symbol: $newest (floor $GLIBC_FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::gauntlet needs glibc $newest, above the $GLIBC_FLOOR floor"
+            exit 1
+          fi
+
       # Built separately so a node installing the CLI never pulls the GUI's
       # Vulkan/Wayland runtime dependencies.
+      # - The CLI package wraps the zig-built binary as is (--no-build). Its
+      #   glibc-floor variant declares libc6 explicitly, because
+      #   dpkg-shlibdeps would report 2.34 for the libdl/libpthread links
+      #   (see Cargo.toml).
+      # - The viewer is a desktop app that never runs on nodes, so it is a
+      #   native build.
       - name: Build .deb packages
         run: |
-          cargo deb -p gauntlet-bench
-          cargo deb -p gauntlet-view
+          mkdir -p dist
+          cargo deb -p gauntlet-bench --no-build --target "$CLI_TARGET" \
+            --variant glibc-floor --output dist/
+          cargo deb -p gauntlet-view --output dist/
+
+      # The declared libc6 floor is hand-written in Cargo.toml, so check that
+      # it matches the floor the binary was actually linked against.
+      - name: Check the CLI package's libc6 dependency
+        run: |
+          depends=$(dpkg-deb -f dist/gauntlet_*.deb Depends)
+          echo "gauntlet Depends: $depends"
+          case "$depends" in
+            *"libc6 (>= $GLIBC_FLOOR)"*) ;;
+            *) echo "::error::gauntlet .deb does not declare libc6 (>= $GLIBC_FLOOR)"; exit 1 ;;
+          esac
 
       - name: Build release tarballs
         run: |
           VERSION="${{ needs.verify.outputs.version }}"
-          mkdir -p dist
-          for bin in gauntlet gauntlet-view; do
-            tar -czf "dist/${bin}-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-              -C target/release "$bin"
-          done
-          cp target/debian/*.deb dist/
+          tar -czf "dist/gauntlet-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C "target/$CLI_TARGET/release" gauntlet
+          tar -czf "dist/gauntlet-view-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C target/release gauntlet-view
           ls -l dist
 
       - uses: actions/upload-artifact@v4

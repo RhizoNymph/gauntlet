@@ -32,9 +32,13 @@ git tag vX.Y.Z && git push --tags
    [verify]  resolve tag -> version, check both manifests match the tag,
         |    cargo test --workspace --locked
         v
-   [build]   cargo deb -p gauntlet-bench
-        |    cargo deb -p gauntlet-view
-        |    tarballs from target/release
+   [build]   cargo zigbuild -p gauntlet-bench --target ...gnu.2.31
+        |    check newest GLIBC_* symbol <= 2.31
+        |    cargo deb -p gauntlet-bench --no-build --target ...gnu
+        |              --variant glibc-floor   (Depends: libc6 >= 2.31)
+        |    check the .deb declares libc6 (>= GLIBC_FLOOR)
+        |    cargo deb -p gauntlet-view   (native)
+        |    tarballs from both target dirs
         |    -> uploads the `packages` artifact
         |
         +--------------------+--------------------+
@@ -120,11 +124,42 @@ Set on the `RhizoNymph/gauntlet` repository:
   safe for resuming a partially failed release.
 - **Only `amd64` is produced.** Adding an architecture requires editing
   `Architectures:` in the APT repo's `conf/distributions` first.
-- **The runner image sets the glibc floor.** Binaries are dynamically linked
-  against the builder's glibc, so `dpkg-shlibdeps` stamps a `libc6 (>= X)`
-  dependency taken from whatever `ubuntu-latest` currently is (24.04 →
-  glibc 2.39). Nodes older than the runner cannot install the package. If
-  the fleet ever runs an older distribution than the runner, pin
-  `runs-on:` to the oldest supported image rather than relaxing the
-  dependency. The same floor applies to the orchestrator's ssh deploy,
-  which uploads the operator's own binary to each node.
+- **The CLI's glibc floor is 2.31, independent of the runner.** The
+  `gauntlet` binary is what the orchestrator copies onto every node, so its
+  glibc requirement decides which nodes can run an agent. It is therefore
+  cross-linked with `cargo zigbuild --target x86_64-unknown-linux-gnu.2.31`
+  rather than inheriting the runner's glibc (`ubuntu-latest` is 24.04 →
+  2.39). That makes Ubuntu 20.04, Debian 11 and RHEL 9 nodes supported.
+  - **Floor check.** A step reads the newest `GLIBC_*` symbol version from
+    `objdump -T` and fails the release if it exceeds `GLIBC_FLOOR`. A
+    dependency that starts calling a newer libc function then breaks the
+    build instead of silently breaking old nodes.
+  - **The .deb.** The CLI package wraps the zig-built binary as is
+    (`cargo deb --no-build --target x86_64-unknown-linux-gnu --variant
+    glibc-floor`). The `glibc-floor` variant in Cargo.toml declares
+    `libc6 (>= 2.31)` explicitly instead of `$auto`. The binary links libdl
+    and libpthread, which the runner's libc6 symbols file maps to 2.34 (the
+    release that folded them into libc), so `dpkg-shlibdeps` would demand
+    2.34 for a binary that runs on 2.31.
+  - **Depends check.** A workflow step fails the release unless the built
+    package's Depends contains `libc6 (>= $GLIBC_FLOOR)`, so the
+    hand-written version cannot drift from the floor.
+  - **Validation.** The zig-built binary and the installed .deb were run in
+    an `ubuntu:20.04` container (glibc 2.31): `apt install` of the package
+    succeeds and `gauntlet agent probe` produces a full inventory. A native
+    24.04 build fails there with `GLIBC_2.32 not found`.
+  - **The viewer.** `gauntlet-view` is still a native build at the runner's
+    glibc. It is a desktop app that links gpui's xkbcommon and never runs on
+    nodes.
+  - **Raising or lowering the floor.** Change `GLIBC_FLOOR` in the workflow
+    `env`. zig ships the glibc stubs, so no older runner image is needed.
+- **A locally built binary keeps the builder's floor.** The orchestrator's
+  ssh deploy uploads whatever binary the operator is running. A
+  `cargo build` on a newer distro produces an agent that older nodes
+  cannot load. Install the release artifact, or build with
+  `cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31`, when
+  deploying to older nodes.
+- **Pinned build tools.** `ZIG_VERSION` (installed from the `ziglang` PyPI
+  wheel into `$RUNNER_TEMP`, since the runner's system Python is externally
+  managed) and `CARGO_ZIGBUILD_VERSION` are pinned in the workflow `env`,
+  alongside the existing `cargo-deb` pin.

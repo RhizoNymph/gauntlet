@@ -86,6 +86,17 @@ assets = [
     ["README.md", "usr/share/doc/gauntlet/README.md", "644"],
 ]
 
+# Release CI packages the CLI from a zig build linked against glibc 2.31
+# (`cargo deb --variant glibc-floor`). `$auto` cannot be used for it: the
+# binary links libdl and libpthread, which the runner's libc6 symbols file
+# maps to 2.34 (the release that folded them into libc), so dpkg-shlibdeps
+# would demand libc6 >= 2.34 for a binary that runs on 2.31. Keep this
+# version in step with GLIBC_FLOOR in .github/workflows/release.yml; the
+# workflow checks that they agree.
+[package.metadata.deb.variants.glibc-floor]
+name = "gauntlet"
+depends = "libc6 (>= 2.31), openssh-client"
+
 [profile.release]
 lto = true
 codegen-units = 1

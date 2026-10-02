@@ -136,7 +136,10 @@ Features Index:
       and crates.io. The CLI publishes as `gauntlet-bench` because `gauntlet`
       is taken; `[lib]`/`[[bin]]`/deb names stay `gauntlet`, so no source or
       deployment path changes. Every publishing step is idempotent, so a
-      partially failed release can be resumed via workflow_dispatch.
+      partially failed release can be resumed via workflow_dispatch. The CLI
+      (the binary deployed to nodes) is cross-linked with cargo-zigbuild
+      against glibc 2.31, and a CI step enforces that floor. The viewer
+      stays a native build.
     entry_points: [.github/workflows/release.yml, Cargo.toml, viewer/Cargo.toml]
     depends_on: [viewer, reporting]
     doc: docs/features/release_ci.md
