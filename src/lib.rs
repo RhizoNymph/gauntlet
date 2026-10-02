@@ -7,6 +7,7 @@ pub mod nccl_env;
 pub mod net_steps;
 pub mod orchestrator;
 pub mod proto;
+pub mod remote_dir;
 pub mod report;
 
 use tracing_subscriber::EnvFilter;

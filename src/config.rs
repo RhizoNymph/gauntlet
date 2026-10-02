@@ -13,6 +13,7 @@ use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
     OverlapSpec, Phase,
 };
+use crate::remote_dir::RemoteDir;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -100,7 +101,10 @@ pub struct SshConfig {
     /// Identity file; defaults to agent/ssh-config resolution.
     pub key: Option<PathBuf>,
     /// Directory on each node for the agent binary and scratch files.
-    pub remote_dir: String,
+    /// Expanded on the node: a leading `~` and `$USER` / `${USER}` only.
+    /// Defaults to the node-local `/tmp/gauntlet-$USER` (a home directory
+    /// is often shared NFS on clusters).
+    pub remote_dir: RemoteDir,
     pub connect_timeout_secs: u64,
     /// Concurrent session-establishment limit (full sessions stay open after).
     pub max_concurrent: usize,
@@ -111,7 +115,7 @@ impl Default for SshConfig {
         Self {
             user: None,
             key: None,
-            remote_dir: "~/.gauntlet".into(),
+            remote_dir: RemoteDir::default(),
             connect_timeout_secs: 10,
             max_concurrent: 32,
         }

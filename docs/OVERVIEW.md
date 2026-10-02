@@ -16,8 +16,10 @@ Overview:
       Runs on the operator's machine (`gauntlet run`). Tokio task per host,
       persistent ssh sessions via the `openssh` crate (native-mux
       ControlMaster multiplexing, respects ~/.ssh/config). Deploys the agent
-      (sftp upload of the running binary, staged then renamed, skipped when
-      the remote sha256 matches), drives the phase schedule, aggregates
+      (sftp upload of the running binary to a per-upload random temp name,
+      then an atomic rename, skipped when the remote sha256 matches) into
+      `ssh.remote_dir` (default node-local `/tmp/gauntlet-$USER`, `~` and
+      `$USER` expanded on the node), drives the phase schedule, aggregates
       results over an mpsc channel into a single lock-free collector task.
     agent: >
       Same binary in `gauntlet agent` mode, executed on each node. At
@@ -76,8 +78,9 @@ Features Index:
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
       schema-versioned document (the GUI viewer's interface; v2 records
-      gauntlet_version).
-    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
+      gauntlet_version). remote_dir is a validated template (default
+      /tmp/gauntlet-$USER, owner-checked, created 700).
+    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs, orchestrator/session.rs, remote_dir.rs]
     depends_on: []
     doc: docs/features/bootstrap.md
   phase0_inventory:

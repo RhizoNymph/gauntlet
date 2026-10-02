@@ -69,7 +69,11 @@ writes `performance` into every `cpufreq/scaling_governor` via
 - `src/orchestrator/bootstrap/gpu_idle.rs` — `gpu_idle_check`.
 - `src/orchestrator/deploy.rs` — `ensure_agent`, `local_sha256`,
   `AGENT_RELPATH`.
-- `src/orchestrator/session.rs` — `HostSession` (connect/exec/upload).
+- `src/orchestrator/session.rs` — `HostSession` (connect/exec/upload),
+  `remote_dir_word`, `remote_dir_script`, `staging_path`,
+  `install_command`, `FileMode`.
+- `src/remote_dir.rs` — `RemoteDir`, `RemoteDirPart`, `RemoteDirError`,
+  `DEFAULT_REMOTE_DIR`.
 - `src/build_info.rs` — `BuildInfo`, `GitRevision` (bootstrap `--json`).
 - `src/agent/mod.rs` — `probe()` prints `InventorySnapshot` JSON.
 
@@ -80,11 +84,30 @@ writes `performance` into every `cpufreq/scaling_governor` via
   matrix exactly once, in config order.
 - Tuning steps run only under `--tune` and each reports ok/warn/fail
   independently.
-- `ssh.remote_dir` is expanded on the *node*: a leading `~` becomes `$HOME`
-  inside the remote shell word, never the operator's home. `HostSession`
-  resolves and `mkdir -p`s it at connect time and caches the absolute path.
-- Uploads are staged (`<path>.staging` → `chmod` → `mv -f`) so replacing a
-  running agent cannot fail with `ETXTBSY` or leave a truncated binary.
+- `ssh.remote_dir` is a validated `RemoteDir` template
+  (`src/remote_dir.rs`), default `/tmp/gauntlet-$USER`: node-local, since a
+  home directory is often shared NFS on clusters and a shared remote_dir
+  makes every node upload onto the same file at once. It is expanded on the
+  *node*, never on the operator's machine: a leading `~` becomes `$HOME`,
+  `$USER` / `${USER}` becomes `"$(id -un)"` (the remote login name, set or
+  not in the login environment); every other `$` is a config error, and
+  all other text is single-quoted literally (`session::remote_dir_word`).
+  An explicit value such as `~/.gauntlet` keeps working. `HostSession`
+  resolves it at connect time (`remote_dir_script`: `mkdir -p -m 700`,
+  refuse a directory not owned by the login user — in a world-writable
+  parent like /tmp anyone could pre-create `/tmp/gauntlet-<you>` — then
+  `pwd`) and caches the absolute path. A remote_dir on a `noexec` mount
+  cannot run the agent; point it elsewhere.
+- Uploads are staged under a per-upload random sibling name
+  (`<dest>.tmp.<16 hex>`, `session::staging_path`), `chmod`ed, then
+  renamed over the destination (`session::install_command`: `mv -f`, a
+  same-directory rename(2)). Replacing a running agent therefore cannot
+  fail with `ETXTBSY`, a killed or failed upload never leaves a torn
+  binary (a failed one removes its temp file; a killed one leaves only an
+  unreferenced `*.tmp.*`), and concurrent deploys to one shared path never
+  share a temp file: each renames a complete, identical binary and the last
+  rename wins. Before uploading, `deploy::ensure_agent` compares the local
+  sha256 with the remote `sha256sum` and skips the upload on a match.
 
 ## Machine interface (`--json`)
 

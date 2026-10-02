@@ -12,7 +12,11 @@ hosts = [
 [ssh]
 # user = "ubuntu"              # default: ~/.ssh/config resolution
 # key = "~/.ssh/id_ed25519"
-remote_dir = "~/.gauntlet"
+# Per-node scratch dir for the agent binary. Expanded on the node: a
+# leading ~ and $USER / ${USER} only. The default is node-local; avoid a
+# shared (NFS) home, where every node would upload onto the same file.
+# The directory must be owned by the login user (created mode 700).
+remote_dir = "/tmp/gauntlet-$USER"
 connect_timeout_secs = 10
 max_concurrent = 32
 
