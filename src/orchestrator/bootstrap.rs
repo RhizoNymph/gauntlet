@@ -30,7 +30,11 @@ mod gpu_idle;
 
 use self::gpu_idle::gpu_idle_check;
 use super::deploy::ensure_agent;
+#[cfg(test)]
+use super::nccl_shim::{NCCL_SHIM_SCRIPT, nccl_shim_needed};
+use super::nccl_shim::{ShimOutcome, ensure_shim, probe};
 use super::session::HostSession;
+use crate::build_info::BuildInfo;
 use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
 use crate::nccl_env::NcclEnv;
@@ -38,11 +42,17 @@ use crate::proto::InventorySnapshot;
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
 /// viewer renders the same matrix from this document.
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `gauntlet_version` (crate version plus build-time git revision of
+/// the binary that bootstrapped, which is also the agent it deployed).
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapReport {
     pub schema_version: u32,
+    /// `None` = not recorded (v1 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub finished_epoch_secs: u64,
     pub hosts: Vec<HostReadiness>,
 }
@@ -169,6 +179,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     if args.json {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: Some(BuildInfo::current()),
             finished_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
@@ -280,13 +291,8 @@ async fn prepare_host(
         }
     };
 
-    let inventory = match maybe_build_nccl_shim(&session, inventory).await {
-        (inventory, Some(shim_check)) => {
-            checks.push(shim_check);
-            inventory
-        }
-        (inventory, None) => inventory,
-    };
+    let (inventory, shim) = ensure_shim(&session, inventory).await;
+    checks.extend(shim_check(&shim));
 
     checks.extend(readiness_checks(&inventory, gpu_idle_max_used_mib));
     if tune {
@@ -300,76 +306,28 @@ async fn prepare_host(
     }
 }
 
-/// Remote script that symlinks the NCCL runtime soname under a name cudarc
-/// searches, inside the agent's own directory (no sudo, no system change).
-/// `{lib_dir}` is substituted with `<remote_dir>/lib`.
-const NCCL_SHIM_SCRIPT: &str = r#"mkdir -p {lib_dir} && target=""; for p in $(ldconfig -p 2>/dev/null | awk '/libnccl\.so\.2 /{print $NF}') /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib64/libnccl.so.2 /usr/lib/libnccl.so.2; do if [ -e "$p" ]; then target="$p"; break; fi; done; if [ -n "$target" ]; then ln -sf "$target" {lib_dir}/libnccl.so && echo "$target"; else exit 3; fi"#;
-
-/// Does this inventory describe the runtime-only NCCL install (libnccl.so.2
-/// present, but no name cudarc's loader searches)?
-fn nccl_shim_needed(inventory: &InventorySnapshot) -> bool {
-    !inventory.gpus.is_empty()
-        && inventory.gpu_libs.get("nccl") == Some(&false)
-        && inventory.gpu_libs.get("nccl_runtime") == Some(&true)
-}
-
-/// cudarc's loader does not search libnccl.so.2 (NCCL's actual runtime
-/// soname), so a node with only the runtime package installed cannot run the
-/// NCCL sweep. Build `<remote_dir>/lib/libnccl.so -> libnccl.so.2`; every
-/// agent invocation already carries LD_LIBRARY_PATH=<remote_dir>/lib, so
-/// dlopen("libnccl.so") then resolves. Re-probes afterwards so the returned
-/// inventory reflects reality.
-async fn maybe_build_nccl_shim(
-    session: &HostSession,
-    inventory: InventorySnapshot,
-) -> (InventorySnapshot, Option<ReadinessCheck>) {
-    if !nccl_shim_needed(&inventory) {
-        return (inventory, None);
+/// The readiness-matrix cell for a shim outcome; `None` when the node did
+/// not need one (no column noise on ordinary nodes).
+fn shim_check(outcome: &ShimOutcome) -> Option<ReadinessCheck> {
+    match outcome {
+        ShimOutcome::NotNeeded => None,
+        ShimOutcome::Built { target } => Some(ReadinessCheck::ok(
+            "nccl_shim",
+            format!("libnccl.so -> {target}"),
+        )),
+        ShimOutcome::StillUnloadable { target } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("shim created ({target}) but libnccl still not loadable"),
+        )),
+        ShimOutcome::CreateFailed { error } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("libnccl.so.2 present but shim creation failed: {error}"),
+        )),
+        ShimOutcome::ReprobeFailed { error, .. } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("re-probe after shim failed: {error}"),
+        )),
     }
-    let script = NCCL_SHIM_SCRIPT.replace("{lib_dir}", &format!("{}/lib", session.remote_dir()));
-    let target = match session.exec(&script).await {
-        Ok(stdout) => stdout.trim().to_string(),
-        Err(error) => {
-            return (
-                inventory,
-                Some(ReadinessCheck::warn(
-                    "nccl_shim",
-                    format!("libnccl.so.2 present but shim creation failed: {error:#}"),
-                )),
-            );
-        }
-    };
-    match probe(session).await {
-        Ok(reprobed) if reprobed.gpu_libs.get("nccl") == Some(&true) => (
-            reprobed,
-            Some(ReadinessCheck::ok(
-                "nccl_shim",
-                format!("libnccl.so -> {target}"),
-            )),
-        ),
-        Ok(reprobed) => (
-            reprobed,
-            Some(ReadinessCheck::warn(
-                "nccl_shim",
-                format!("shim created ({target}) but libnccl still not loadable"),
-            )),
-        ),
-        Err(error) => (
-            inventory,
-            Some(ReadinessCheck::warn(
-                "nccl_shim",
-                format!("re-probe after shim failed: {error:#}"),
-            )),
-        ),
-    }
-}
-
-async fn probe(session: &HostSession) -> Result<InventorySnapshot> {
-    let output = session.run_agent_capture(&["probe"], None).await?;
-    if !output.success() {
-        bail!("agent probe failed: {}", output.detail());
-    }
-    serde_json::from_str(output.stdout.trim()).context("parsing InventorySnapshot from agent probe")
 }
 
 /// Node arch as reported by `uname -m`, mapped onto `std::env::consts::ARCH`
@@ -942,6 +900,29 @@ mod tests {
     }
 
     #[test]
+    fn shim_outcomes_map_onto_the_nccl_shim_column() {
+        assert_eq!(shim_check(&ShimOutcome::NotNeeded), None);
+        let built = shim_check(&ShimOutcome::Built {
+            target: "/usr/lib/libnccl.so.2".into(),
+        })
+        .expect("cell");
+        assert_eq!(built.name, "nccl_shim");
+        assert_eq!(built.status, CheckStatus::Ok);
+        assert!(built.detail.contains("/usr/lib/libnccl.so.2"));
+        for outcome in [
+            ShimOutcome::StillUnloadable { target: "t".into() },
+            ShimOutcome::CreateFailed { error: "e".into() },
+            ShimOutcome::ReprobeFailed {
+                target: "t".into(),
+                error: "e".into(),
+            },
+        ] {
+            let cell = shim_check(&outcome).expect("cell");
+            assert_eq!(cell.status, CheckStatus::Warn, "{outcome:?}");
+        }
+    }
+
+    #[test]
     fn shim_needed_only_for_runtime_only_nccl_on_gpu_hosts() {
         let mut inv = inventory();
         inv.gpu_libs = libs(&[("nccl", false), ("nccl_runtime", true)]);
@@ -1036,6 +1017,7 @@ mod tests {
         // `--json` carries the column and the probed occupancy.
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
             finished_epoch_secs: 1,
             hosts: rows,
         };
@@ -1050,6 +1032,7 @@ mod tests {
     fn readiness_report_round_trips_through_json() {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
             finished_epoch_secs: 1_700_000_000,
             hosts: vec![HostReadiness {
                 host: "10.0.0.1".into(),

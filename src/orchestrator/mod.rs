@@ -21,6 +21,7 @@ pub mod collect;
 pub mod deploy;
 mod intranode;
 mod nccl;
+mod nccl_shim;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -44,6 +45,7 @@ use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
 use crate::nccl_env::NcclEnv;
+use crate::net_steps::{NetStep, NetSteps, disabled_outcomes};
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit, gpu_idle_outcomes,
@@ -143,10 +145,9 @@ struct PartialWriter {
 }
 
 impl PartialWriter {
-    /// Analyse and publish `observations` as they stand. Snapshots are a
-    /// convenience for onlookers: a failure here is logged and forgotten,
-    /// never propagated into the run.
-    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+    /// The in-flight document: the run id onlookers follow, and no
+    /// verdict (`RunResults::finalize` is for the final document only).
+    fn document(&self, observations: BTreeMap<String, HostObservations>) -> report::RunResults {
         let mut results = report::build(
             &self.config,
             observations,
@@ -154,6 +155,14 @@ impl PartialWriter {
             epoch_secs(),
         );
         results.run_id = self.run_id.clone();
+        results
+    }
+
+    /// Analyse and publish `observations` as they stand. Snapshots are a
+    /// convenience for onlookers: a failure here is logged and forgotten,
+    /// never propagated into the run.
+    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+        let results = self.document(observations);
         let dir = Path::new(report::history::DEFAULT_DIR);
         match report::history::save_partial(&results, dir) {
             Ok(path) => {
@@ -171,7 +180,8 @@ impl PartialWriter {
 pub async fn run(args: RunArgs) -> Result<()> {
     let config = FleetConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
-    let phases = config.resolve_phases(&args.phases)?;
+    let plan = config.run_plan(&args.phases, &args.net_steps)?;
+    let phases = plan.phases();
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
@@ -227,10 +237,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
     info!(
         hosts = sessions.len(),
         phases = ?phases,
+        net_steps = ?plan
+            .net_steps()
+            .map(|steps| steps.iter().map(NetStep::name).collect::<Vec<_>>()),
         "fleet ready"
     );
 
-    let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
+    // The libnccl shim lives under remote_dir, which (node-local by
+    // default) can lose it on reboot while the agent is re-uploaded; runs
+    // that use NCCL rebuild it here instead of relying on a past bootstrap.
+    let mut inventories: BTreeMap<String, InventorySnapshot> = if nccl_shim::phases_use_nccl(phases)
+    {
+        nccl_shim::ensure_fleet_shims(&sessions, config.ssh.max_concurrent).await
+    } else {
+        BTreeMap::new()
+    };
     // Error-counter baselines, taken once before the first load phase; the
     // matching delta pass runs after the last load phase of the last repeat.
     let mut counter_baselines: BTreeMap<String, CounterSnapshot> = BTreeMap::new();
@@ -240,7 +261,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if args.repeat > 1 {
             info!(repeat, of = args.repeat, "repeat start");
         }
-        for phase in &phases {
+        for phase in phases {
             // The inventory is a census, not a measurement.
             if *phase == Phase::Inventory && repeat > 0 {
                 continue;
@@ -272,10 +293,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Phase::Network => {
+                    // `run_plan` resolves a step set whenever the phase
+                    // list contains Network.
+                    let Some(net_steps) = plan.net_steps() else {
+                        bail!("network phase scheduled without a resolved step set");
+                    };
                     network_phase(
                         &config,
                         &sessions,
                         &mut inventories,
+                        net_steps,
                         args.sample_pairs,
                         &sink,
                     )
@@ -304,6 +331,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // document lands where onlookers were already watching.
     results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
+    results.finalize();
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -660,17 +688,45 @@ async fn network_phase(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
+    steps: &NetSteps,
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
+    // Deselected steps leave an explicit trace on every host, so a
+    // bandwidth-only run reads as "not run", never as "missing".
+    let disabled = disabled_outcomes(steps);
+    if !disabled.is_empty() {
+        info!(
+            skipped = ?disabled.iter().map(|(test, _)| *test).collect::<Vec<_>>(),
+            "network steps disabled by config"
+        );
+        for session in sessions {
+            for (test, outcome) in &disabled {
+                sink.event(
+                    session.addr(),
+                    AgentEvent::Outcome {
+                        test: *test,
+                        scope: Scope::Node,
+                        outcome: outcome.clone(),
+                    },
+                );
+            }
+        }
+    }
     // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
     // node pairs (TCP), then the full fleet (NCCL over the fabric).
-    if config.tests.nccl_intranode {
+    if steps.contains(NetStep::Intranode) {
         intranode::intranode_sweep(config, sessions, inventories, sink).await;
     }
-    pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl::nccl_sweep(config, sessions, inventories, sink).await;
-    tcp_barrier_sweep(config, sessions, sink).await;
+    if steps.contains(NetStep::Pairwise) {
+        pairwise_sweep(config, sessions, sample_pairs, sink).await;
+    }
+    if steps.contains(NetStep::Nccl) {
+        nccl::nccl_sweep(config, sessions, inventories, steps.nccl_barrier(), sink).await;
+    }
+    if steps.contains(NetStep::Barrier) {
+        tcp_barrier_sweep(config, sessions, sink).await;
+    }
 }
 
 /// Tournament rounds of disjoint pairs: within a round every pair runs
@@ -1170,6 +1226,35 @@ fn parse_json_document<T: DeserializeOwned>(text: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_snapshots_carry_no_verdict() {
+        let config: FleetConfig = toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+        let writer = PartialWriter {
+            run_id: "1-abcdef".into(),
+            config,
+            started_epoch_secs: 1,
+        };
+        let mut observations = BTreeMap::new();
+        let mut obs = HostObservations::default();
+        obs.outcomes.push((
+            TestId::CpuCorrectness,
+            Scope::Node,
+            crate::proto::TestOutcome::Failed {
+                reason: "mismatch".into(),
+            },
+        ));
+        observations.insert("n1".to_string(), obs);
+        let partial = writer.document(observations);
+        assert_eq!(partial.run_id, "1-abcdef");
+        assert_eq!(partial.verdict, None);
+        let json = serde_json::to_value(&partial).expect("serialize");
+        assert!(json["verdict"].is_null(), "{json}");
+
+        let mut fin = partial.clone();
+        fin.finalize();
+        assert_eq!(fin.verdict, Some(report::Verdict::Failures));
+    }
 
     #[test]
     fn peer_endpoints_drop_the_login_user_and_ssh_port() {

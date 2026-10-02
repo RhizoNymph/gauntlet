@@ -2,10 +2,44 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::net_steps::NetStep;
+use crate::proto::Phase;
+
+/// `--phases` help, built from the phase table so a new phase shows up
+/// without anyone remembering to edit a doc comment.
+fn phases_help() -> String {
+    format!(
+        "Restrict to a subset of phases, comma-separated: {}",
+        Phase::help_list()
+    )
+}
+
+/// `--net-steps` help, built from the step table.
+fn net_steps_help() -> String {
+    format!(
+        "Network-phase steps to run, comma-separated (overrides [tests] net_steps): {}. \
+         Deselected steps record Skipped outcomes; e.g. `--phases network --net-steps nccl` \
+         is a quick NCCL-only check",
+        NetStep::help_list()
+    )
+}
+
+/// Process exit code for a failed `Cli::try_parse`: 0 when clap is only
+/// displaying `--help` / `--version`, `report::EXIT_ERROR` for a usage
+/// error. clap's default (2) would read as the host-failures verdict.
+pub fn parse_failure_exit_code(error: &clap::Error) -> u8 {
+    if error.use_stderr() {
+        crate::report::EXIT_ERROR
+    } else {
+        0
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "gauntlet",
-    about = "Cluster pre-flight benchmark and health check"
+    about = "Cluster pre-flight benchmark and health check",
+    version = crate::build_info::VERSION_LINE
 )]
 pub struct Cli {
     /// Enable debug logging (stderr).
@@ -35,9 +69,12 @@ pub struct RunArgs {
     /// Write results JSON here (default: runs/<run-id>.json).
     #[arg(long)]
     pub out: Option<PathBuf>,
-    /// Restrict to a subset of phases (inventory, cpu_mem, gpu, network).
-    #[arg(long, value_delimiter = ',')]
+    // Help generated from `Phase::PARSE_TABLE` (`phases_help`).
+    #[arg(long, value_delimiter = ',', help = phases_help())]
     pub phases: Vec<String>,
+    // Help generated from `NetStep::PARSE_TABLE` (`net_steps_help`).
+    #[arg(long, value_delimiter = ',', help = net_steps_help())]
+    pub net_steps: Vec<String>,
     /// Sampled network mode: test only this many pairs per host instead of full mesh.
     #[arg(long)]
     pub sample_pairs: Option<usize>,

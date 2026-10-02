@@ -156,8 +156,9 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialized by canonical `name`; deserialized from any spelling in
+/// `PARSE_TABLE`, so config files accept exactly what `--phases` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Phase {
     Inventory,
     CpuMem,
@@ -178,17 +179,53 @@ impl Phase {
         Phase::Overlap,
     ];
 
-    pub fn parse(s: &str) -> Option<Phase> {
-        match s {
-            "inventory" => Some(Phase::Inventory),
-            "cpu_mem" | "cpu" => Some(Phase::CpuMem),
-            "gpu" => Some(Phase::Gpu),
-            "network" | "net" => Some(Phase::Network),
-            "overlap" => Some(Phase::Overlap),
-            _ => None,
+    /// Every accepted spelling (`--phases`, `[tests] phases`, the wire):
+    /// each phase's canonical `name` plus short aliases. Parsing, serde and
+    /// the generated CLI help all read this table (`crate::names`).
+    pub const PARSE_TABLE: &'static [(&'static str, Phase)] = &[
+        ("inventory", Phase::Inventory),
+        ("cpu_mem", Phase::CpuMem),
+        ("cpu", Phase::CpuMem),
+        ("gpu", Phase::Gpu),
+        ("network", Phase::Network),
+        ("net", Phase::Network),
+        ("overlap", Phase::Overlap),
+    ];
+
+    /// Canonical name: the serde spelling and the config/CLI spelling.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Phase::Inventory => "inventory",
+            Phase::CpuMem => "cpu_mem",
+            Phase::Gpu => "gpu",
+            Phase::Network => "network",
+            Phase::Overlap => "overlap",
         }
     }
+
+    pub fn parse(s: &str) -> Option<Phase> {
+        crate::names::parse(s)
+    }
+
+    /// Run-order list of canonical names with their aliases, e.g.
+    /// `inventory, cpu_mem (cpu), gpu, network (net), overlap`, for help
+    /// text.
+    pub fn help_list() -> String {
+        crate::names::help_list::<Phase>()
+    }
 }
+
+impl crate::names::NameTable for Phase {
+    const KIND: &'static str = "phase";
+    const VARIANTS: &'static [Phase] = &Phase::ALL;
+    const SPELLINGS: &'static [(&'static str, Phase)] = Phase::PARSE_TABLE;
+
+    fn name(self) -> &'static str {
+        Phase::name(self)
+    }
+}
+
+crate::serde_via_name_table!(Phase);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

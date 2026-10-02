@@ -128,10 +128,12 @@ mod tests {
             run_id: run_id.into(),
             started_epoch_secs: 1,
             debug_build: false,
+            gauntlet_version: None,
             aggregates: Default::default(),
             finished_epoch_secs: 2,
             hosts: BTreeMap::new(),
             nccl_env: None,
+            verdict: None,
             fleet: FleetAnalysis::default(),
             calibration: Calibration::default(),
         }

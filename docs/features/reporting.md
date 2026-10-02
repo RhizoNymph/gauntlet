@@ -24,10 +24,8 @@ started, finished)`:
    the dlopen probe results on GPU-bearing hosts.
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
-6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any test outcome is Failed (including `gpu_idle`) or any
-   outliers/violations exist; else Clean.
-   Exit codes 2/1/0.
+6. `verdict()` classifies the document (see "Verdict and exit codes");
+   `build` records it as `RunResults.verdict`.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
 over a timestamp and the host set (deterministic, no rand dep). Two seeds
@@ -194,10 +192,18 @@ tail progress:
 `src/analysis/{stats,fit,schedule}.rs`,
 `src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
-`src/orchestrator/collect.rs` (`Collector::snapshot`).
+`src/orchestrator/collect.rs` (`Collector::snapshot`),
+`src/report/verdict.rs` (`Verdict`, `EXIT_ERROR`, `EvidenceTier`,
+`failed_outcome_tier`, `verdict`),
+`src/build_info.rs` (`BuildInfo`, `GitRevision`, `VERSION_LINE`),
+`build.rs` (`GAUNTLET_GIT_REVISION`).
 
 ## Invariants
 - SCHEMA_VERSION bumps on any field rename/removal in `RunResults`.
+- `RunResults.verdict` is `Some` only on a finalized document, where it
+  equals `report::verdict` of that document and the process exit code is
+  its `exit_code()`; partial snapshots always carry `None`.
+- Verdict exit codes are monotonic in severity; precedence follows them.
 - A run's `run_id` never changes once the run has started: the partial
   snapshots and the final document are the same file stem.
 - `list` and `list_live` partition the visible documents in a run
@@ -213,15 +219,87 @@ tail progress:
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
+## Verdict and exit codes (schema v13)
+
+`report::Verdict` (`src/report/verdict.rs`) is a typed enum, serialized
+snake_case in `RunResults.verdict` and mapped one-to-one onto the
+`gauntlet run` exit code, so consumers never parse the exit status. Exit
+codes rise with severity, and precedence follows the number — a higher
+code always means a worse run:
+
+| verdict          | exit | meaning                                                  |
+|------------------|------|----------------------------------------------------------|
+| `clean`          | 0    | every host completed, nothing found                      |
+| `outliers`       | 1    | soft findings only (statistical, environmental)          |
+| `host_failures`  | 2    | a host failed to complete; no hard evidence anywhere     |
+| `failures`       | 3    | hard evidence of broken hardware/software on some host   |
+
+Hard evidence (3) outranks host failures (2): one unreachable node never
+hides SDC or counter evidence on the others. Any other exit code is not a
+verdict (`Verdict::from_exit_code` returns `None`): an invocation that
+fails with an error instead of producing a verdict — bad config, CLI
+usage error, no usable host, I/O — exits `report::EXIT_ERROR` = 4
+(`main`; clap's own exit 2 for usage errors is remapped, `--help` /
+`--version` stay 0), and a panic exits 101. So exit 1 always means
+"outliers only", never "gauntlet crashed", and exit 2 never means "typo".
+
+`RunResults.verdict` is written only by `RunResults::finalize` on the
+final document. `null` means *no final verdict*: a partial snapshot of a
+run still in flight (`*.partial.json`), or a pre-v13 document (serde
+default); `report::verdict` gives a provisional classification of either.
+
+Evidence tiers. Failed outcomes are classified per test by
+`report::failed_outcome_tier`, an exhaustive `match` on `TestId` with no
+wildcard, so a new test does not compile until its failure is classified
+deliberately. Only `gpu_idle` is soft (another tenant's process holds
+the GPU: environmental, not broken); every other test is hard. Every
+input to `verdict()`:
+
+| input                                              | tier            |
+|----------------------------------------------------|-----------------|
+| Failed outcome of a hard-tier test (correctness, SDC screens, NCCL, intra-node, overlap, inventory visibility, ...) | hard (3) |
+| `fleet.sdc_failures` (derived from Failed outcomes; checked directly too) | hard (3) |
+| `fleet.counter_findings` (error counters that went up under load) | hard (3) |
+| `fleet.failed_hosts` (Fatal, transport, timeout, deploy) | host failure (2) |
+| Failed `gpu_idle` outcome                          | soft (1)        |
+| `fleet.outliers` (MAD)                             | soft (1)        |
+| `fleet.threshold_violations` (absolute bounds)     | soft (1)        |
+| `fleet.barrier_stragglers`                         | soft (1)        |
+| `fleet.jitter_outliers`                            | informational   |
+| `fleet.consistency`                                | informational   |
+| `Skipped` outcomes                                 | informational   |
+
+Absolute thresholds count as soft: a value under a configured floor is a
+performance finding, not proof that a component is broken. Soft-tier
+findings stay fully visible — the "gpus in use" section and the outcomes
+in the JSON are unchanged; only the exit code tier differs. The terminal
+header prints `verdict: <label> (exit <code>)` (labels: clean, outliers,
+host failures, test failures); the viewer colors outliers warn and both
+failure classes bad.
+
+## Build info (schema v13)
+
+`RunResults.gauntlet_version` records the producing binary — which is
+also the deployed agent (self-deploy, sha256-matched) — as
+`{ version: <CARGO_PKG_VERSION>, git: { state: "known", sha, dirty } |
+{ state: "unknown" } }` (`build_info::BuildInfo` / `GitRevision`).
+`build.rs` captures the short sha and a dirty flag (tracked files only)
+at build time as `GAUNTLET_GIT_REVISION`; a build outside a checkout of
+this crate (source tarball, no git, or a tarball unpacked inside another
+repository) records `unknown`. `gauntlet --version` prints the same as
+`<version> (<sha>[-dirty]|unknown)`; the table header prints a
+`gauntlet <version> (<revision>)` line. Serde-defaulted: older documents
+decode with `None`.
+
 ## Error-counter findings (schema v4)
 
 `hosts.*.counter_deltas` carries the full per-node error-counter delta
 list across the load phases (zeros and resets included);
 `fleet.counter_findings` keeps only counters with `after > before`, keyed
-by host. Any finding makes the verdict at least Stragglers. `render_table`
-adds an "error-counter deltas (across load phases)" section (host, domain,
-device, counter, before, after, +increment), omitted entirely when there
-are no findings. See docs/features/counter_deltas.md for collection and
+by host. Any finding makes the verdict at least `failures` (exit 3).
+`render_table` adds an "error-counter deltas (across load phases)"
+section (host, domain, device, counter, before, after, +increment),
+omitted entirely when there are no findings. See docs/features/counter_deltas.md for collection and
 scheduling.
 
 ## Repeats and distribution moments (schema v2)
@@ -250,7 +328,9 @@ processes other than the reporting agent; stale gauntlet agents marked),
 and each host gains one `gpu_idle` outcome per GPU, derived
 orchestrator-side from the snapshot against
 `thresholds.gpu_idle_max_used_mib` (docs/features/phase0_inventory.md).
-A Failed `gpu_idle` feeds the verdict like any failed test (Stragglers).
+A Failed `gpu_idle` feeds the verdict in the soft tier (`outliers`, exit
+1; see "Verdict and exit codes"): it is environmental, not hard evidence.
+The section and the outcomes are reported in full regardless.
 Both additions are serde-defaulted: a v10 document decodes with occupancy
 unknown and simply has no `gpu_idle` outcomes.
 
@@ -296,7 +376,7 @@ ordinary MAD machinery, plus a dedicated rule:
 (group -> flagged hosts) when a host's median `slowest_frac` exceeds
 `thresholds.barrier_slowest_frac` and its median `slowest_considered` is
 at least `analysis::skew::MIN_TALLY_ITERS`. Barrier straggler flags count
-toward the `Stragglers` verdict and render as the "barrier stragglers"
+toward the `Outliers` verdict and render as the "barrier stragglers"
 table section. The field is serde-defaulted, so pre-v6 documents load
 with it empty.
 
@@ -354,7 +434,7 @@ field's shape:
   (docs/features/viewer.md).
 - `hosts.*.inventory` gains `cuda_visible_gpus`, and a mismatch with the
   nvidia-smi GPU count is a Failed `inventory` outcome on that host
-  (verdict at least Stragglers).
+  (verdict at least Outliers).
 - Fleet NCCL failures are attributed (docs/features/phase3_network.md):
   `fleet.failed_hosts` lists only the host that caused a sweep failure;
   hosts it aborted are warnings, not host failures.
