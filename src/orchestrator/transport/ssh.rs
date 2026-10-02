@@ -14,7 +14,7 @@ use tracing::debug;
 use super::{AgentCommand, Pipe, SpawnStdio};
 use crate::config::SshConfig;
 use crate::orchestrator::session::{
-    RemoteOutput, agent_kill_pattern, agent_spawn_args, env_words, single_quote,
+    RemoteOutput, agent_kill_pattern, agent_spawn_args, single_quote,
 };
 
 pub(super) fn connect_timeout(ssh: &SshConfig) -> Duration {
@@ -82,7 +82,7 @@ pub(super) async fn spawn(
     command: &AgentCommand<'_>,
     pipes: SpawnStdio,
 ) -> Result<openssh::Child<Arc<Session>>> {
-    let words = env_words(command.env);
+    let words = command.env.ssh_words();
     let mut remote = Arc::clone(session).arc_command("env");
     remote
         .raw_args(agent_spawn_args(&words, command.agent_path, command.args))

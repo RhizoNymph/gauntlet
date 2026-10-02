@@ -24,14 +24,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::info;
 
 mod gpu_idle;
 
 use self::gpu_idle::gpu_idle_check;
 use super::deploy::{self, DeployOutcome};
+use super::fanout::fan_out;
 use super::session::HostSession;
 use super::transport::{Launcher, resolve_launch};
 use crate::cli::BootstrapArgs;
@@ -267,36 +266,6 @@ impl Stage {
             done @ Stage::Done(_) => done,
         }
     }
-}
-
-/// Run `op` over `items` with at most `max_concurrent` in flight; results
-/// in input order (`None` only for a task that panicked).
-async fn fan_out<I, T, F, Fut>(items: Vec<I>, max_concurrent: usize, op: F) -> Vec<Option<T>>
-where
-    I: Send + 'static,
-    T: Send + 'static,
-    F: Fn(I) -> Fut,
-    Fut: std::future::Future<Output = T> + Send + 'static,
-{
-    let permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
-    let mut tasks = JoinSet::new();
-    let count = items.len();
-    for (index, item) in items.into_iter().enumerate() {
-        let permits = Arc::clone(&permits);
-        let future = op(item);
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            (index, future.await)
-        });
-    }
-    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, value)) => slots[index] = Some(value),
-            Err(error) => debug!(%error, "bootstrap task did not complete"),
-        }
-    }
-    slots
 }
 
 /// `connectivity` and `arch`. Never returns an error: a failure is a

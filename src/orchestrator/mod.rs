@@ -21,6 +21,7 @@ mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+mod fanout;
 mod intranode;
 mod nccl;
 pub mod session;

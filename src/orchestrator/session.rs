@@ -73,15 +73,13 @@ fn exit_code(status: &ExitStatus) -> i32 {
 
 pub struct HostSession {
     pub host: HostConfig,
-    transport: HostTransport,
+    pub(crate) transport: HostTransport,
     /// The agent directory after node-side resolution; always absolute.
     remote_dir: String,
     /// `<remote_dir>/bin/gauntlet-agent`.
     agent_path: String,
-    /// The environment every agent spawn starts under (`agent_env_vars`):
-    /// rendered as quoted `env` words over ssh, set on the local srun
-    /// process (and exported to the task) over srun.
-    agent_env: Vec<(String, String)>,
+    /// The environment every agent spawn starts under (`AgentEnv`).
+    agent_env: AgentEnv,
 }
 
 impl HostSession {
@@ -106,7 +104,7 @@ impl HostSession {
                     )
                 })??;
         let agent_path = format!("{remote_dir}/{AGENT_RELPATH}");
-        let agent_env = agent_env_vars(&remote_dir, nccl_env);
+        let agent_env = AgentEnv::new(&remote_dir, nccl_env);
         debug!(host = %host.addr, remote_dir = %remote_dir, "session established");
         Ok(HostSession {
             host,
@@ -349,6 +347,13 @@ impl HostSession {
             Err(error) => warn!(host = %self.addr(), args, %error, "remote agent cleanup failed"),
         }
     }
+
+    /// `kill_agent` for many hosts at once: over srun one squeue listing
+    /// and one scancel cover all of them (the NCCL early-abort path kills
+    /// every surviving host of a world). Best effort.
+    pub async fn kill_agents(sessions: &[std::sync::Arc<HostSession>], args: &str) {
+        super::transport::kill_agents(sessions, args).await;
+    }
 }
 
 async fn read_all(mut stream: super::transport::AgentOutput) -> std::io::Result<Vec<u8>> {
@@ -424,43 +429,60 @@ pub(crate) fn agent_kill_pattern(args: &str) -> String {
     format!("[g]auntlet-agent agent {args}")
 }
 
-/// The environment of every agent invocation, in order:
+/// The environment every agent invocation starts under:
 ///
-/// - `LD_LIBRARY_PATH=<remote_dir>/lib`: `<remote_dir>/lib` holds shim
+/// - `lib_dir` (`<remote_dir>/lib`) on LD_LIBRARY_PATH: it holds shim
 ///   symlinks bootstrap may have created for runtime-only libraries (e.g.
 ///   libnccl.so -> libnccl.so.2); dlopen consults LD_LIBRARY_PATH as
-///   captured at process start, so it must be set at spawn time.
-/// - one `NCCL_*=<value>` per resolved NCCL env entry, in key order. NCCL
-///   reads its knobs with `getenv` at communicator init; setting them here
-///   puts them in the environment before the agent starts any thread. The
-///   agent itself never calls `set_var` — it runs on a multi-threaded tokio
-///   runtime, where mutating the environment is unsound.
-pub(crate) fn agent_env_vars(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<(String, String)> {
-    std::iter::once(("LD_LIBRARY_PATH".to_string(), format!("{remote_dir}/lib")))
-        .chain(
-            nccl_env
+///   captured at process start, so it must be set at spawn time. ssh sets
+///   `LD_LIBRARY_PATH=<lib_dir>` on the remote `env` line (unchanged);
+///   srun runs `env LD_LIBRARY_PATH=<lib_dir>:<inherited>` *inside* the
+///   step, so the local srun client keeps the orchestrator's own path.
+/// - `nccl`: one `NCCL_*=<value>` per resolved NCCL env entry, in key
+///   order. NCCL reads its knobs with `getenv` at communicator init;
+///   setting them at spawn puts them in the environment before the agent
+///   starts any thread. The agent itself never calls `set_var` — it runs
+///   on a multi-threaded tokio runtime, where mutating the environment is
+///   unsound.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentEnv {
+    pub lib_dir: String,
+    pub nccl: Vec<(String, String)>,
+}
+
+impl AgentEnv {
+    pub(crate) fn new(remote_dir: &str, nccl_env: &NcclEnv) -> Self {
+        Self {
+            lib_dir: format!("{remote_dir}/lib"),
+            nccl: nccl_env
                 .iter()
-                .map(|(key, value)| (key.to_string(), value.to_string())),
-        )
-        .collect()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    /// `KEY='value'` words for the ssh `env` command line, each a single
+    /// quoted POSIX-sh word (they go through `raw_arg`, unescaped by
+    /// openssh): `LD_LIBRARY_PATH` first, then the NCCL env. Keys are
+    /// literal shell words (validated `^NCCL_[A-Z0-9_]+$`); values are
+    /// single-quoted, so spaces, quotes, `$`, backticks and globs stay
+    /// literal.
+    pub(crate) fn ssh_words(&self) -> Vec<String> {
+        std::iter::once(format!("LD_LIBRARY_PATH={}", single_quote(&self.lib_dir)))
+            .chain(
+                self.nccl
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", single_quote(value))),
+            )
+            .collect()
+    }
 }
 
-/// `KEY='value'` words for the ssh `env` command line, each a single quoted
-/// POSIX-sh word (they go through `raw_arg`, unescaped by openssh). Keys
-/// are literal shell words (`LD_LIBRARY_PATH`, validated
-/// `^NCCL_[A-Z0-9_]+$`); values are single-quoted, so spaces, quotes, `$`,
-/// backticks and globs stay literal.
-pub(crate) fn env_words(vars: &[(String, String)]) -> Vec<String> {
-    vars.iter()
-        .map(|(key, value)| format!("{key}={}", single_quote(value)))
-        .collect()
-}
-
-/// `agent_env_vars` rendered as ssh `env` words (what `transport::ssh`
-/// puts on the remote command line).
+/// `AgentEnv` rendered as ssh `env` words (what `transport::ssh` puts on
+/// the remote command line).
 #[cfg(test)]
 pub(crate) fn agent_env_words(remote_dir: &str, nccl_env: &NcclEnv) -> Vec<String> {
-    env_words(&agent_env_vars(remote_dir, nccl_env))
+    AgentEnv::new(remote_dir, nccl_env).ssh_words()
 }
 
 /// Every remote word after the `env` program of an agent spawn, each already

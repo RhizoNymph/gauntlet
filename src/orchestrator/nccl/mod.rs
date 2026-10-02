@@ -374,14 +374,13 @@ async fn abort_rest(
         "primary failure in a fleet NCCL job; aborting the remaining hosts"
     );
     tracker.mark_aborted(running.iter().cloned());
-    let mut kills = JoinSet::new();
-    for host in running {
-        if let Some(session) = sessions.get(host) {
-            let session = Arc::clone(session);
-            kills.spawn(async move { kill_remote_agent(&session, "nccl").await });
-        }
-    }
-    while kills.join_next().await.is_some() {}
+    // One fleet-level kill: over srun a single squeue listing and scancel
+    // cover every surviving host.
+    let targets: Vec<Arc<HostSession>> = running
+        .iter()
+        .filter_map(|host| sessions.get(host).map(Arc::clone))
+        .collect();
+    HostSession::kill_agents(&targets, "nccl").await;
 }
 
 /// Run one host's `agent nccl` to completion under the phase timeout,

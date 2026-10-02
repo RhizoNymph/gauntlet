@@ -11,10 +11,13 @@
 //!
 //! - ssh: per host, sftp to a staging file, then `chmod` + `mv -f`.
 //! - srun + `sbcast` (default): one `sbcast` of the binary to a staging
-//!   file next to the agent dir on every allocated node (Slurm's tree
-//!   broadcast, no per-node upload from the orchestrator), then a per-node
-//!   install step: copy to a per-process temp name, `chmod`, `mv -f` into
-//!   place, re-hash. The staging file is removed afterwards.
+//!   file next to the agent dir, scoped by a carrier step to exactly the
+//!   stale, connected nodes (Slurm's tree broadcast, no per-node upload
+//!   from the orchestrator); if that fails, one sbcast per node so a bad
+//!   node fails only its own deploy. Then a per-node install step: copy to
+//!   a per-process temp name, `chmod`, `mv -f` into place, re-hash. The
+//!   staging file is removed from every targeted node afterwards, whatever
+//!   the outcome.
 //! - srun + `shared`: the agent dir is one shared filesystem path; the
 //!   orchestrator installs the binary there once, locally (temp name +
 //!   rename), and every node only verifies the hash.
@@ -27,12 +30,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use super::fanout::fan_out;
 use super::session::{HostSession, single_quote};
-use super::transport::{Launcher, SrunLauncher};
+use super::transport::{Launcher, SrunLauncher, SrunTransportError};
 use crate::launch::srun::{SrunDeploy, sbcast_staging_path};
 
 /// Remote path of the agent binary relative to `remote_dir`.
@@ -65,10 +67,9 @@ impl fmt::Display for DeployOutcome {
 }
 
 /// Make every session's agent match the local binary. Results are in
-/// `sessions` order; one host's failure never fails another's deploy
-/// (except an srun broadcast failure, which no stale host can recover
-/// from). `max_concurrent` bounds per-host operations; `timeout` bounds
-/// each host's whole deploy, and the one broadcast.
+/// `sessions` order; one host's failure never fails another's deploy.
+/// `max_concurrent` bounds per-host operations; `timeout` bounds each
+/// host's operations and each broadcast.
 pub async fn ensure_fleet(
     launcher: &Launcher,
     sessions: &[Arc<HostSession>],
@@ -113,31 +114,19 @@ where
     F: Fn(Arc<HostSession>) -> Fut,
     Fut: std::future::Future<Output = Result<T>> + Send + 'static,
 {
-    let permits = Arc::new(Semaphore::new(max_concurrent.max(1)));
-    let mut tasks = JoinSet::new();
-    for (index, session) in sessions.iter().enumerate() {
-        let permits = Arc::clone(&permits);
-        let future = op(Arc::clone(session));
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            let result = match tokio::time::timeout(timeout, future).await {
+    fan_out(sessions.to_vec(), max_concurrent, |session| {
+        let future = op(session);
+        async move {
+            match tokio::time::timeout(timeout, future).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow!("timed out after {}s", timeout.as_secs())),
-            };
-            (index, result)
-        });
-    }
-    let mut slots: Vec<Option<Result<T>>> = sessions.iter().map(|_| None).collect();
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, result)) => slots[index] = Some(result),
-            Err(error) => warn!(%error, "deploy task did not complete"),
+            }
         }
-    }
-    slots
-        .into_iter()
-        .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("deploy task aborted"))))
-        .collect()
+    })
+    .await
+    .into_iter()
+    .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("deploy task aborted"))))
+    .collect()
 }
 
 /// ssh: make `session`'s agent match the local binary, sftp-uploading on
@@ -265,34 +254,50 @@ async fn sbcast_and_install(
 ) -> Vec<Result<DeployOutcome>> {
     let staging = sbcast_staging_path(srun.dir(), srun.job_id(), local);
     info!(hosts = stale.len(), staging = %staging, "broadcasting agent with sbcast");
-    let broadcast = match tokio::time::timeout(timeout, srun.broadcast(local_exe, &staging)).await {
-        Ok(result) => result,
-        Err(_) => Err(anyhow!("sbcast timed out after {}s", timeout.as_secs())),
-    };
-    if let Err(error) = broadcast {
-        let message = format!("{error:#}");
-        return stale.iter().map(|_| Err(anyhow!("{message}"))).collect();
-    }
+    let reached = scoped_broadcast(srun, stale, local_exe, &staging, max_concurrent, timeout).await;
+
     let staging = Arc::new(staging);
     let local = Arc::new(local.to_string());
-    let outcomes = per_host(stale, max_concurrent, timeout, {
+    let installs: Vec<(Arc<HostSession>, Option<SrunTransportError>)> = stale
+        .iter()
+        .cloned()
+        .zip(reached.into_iter().map(Result::err))
+        .collect();
+    let outcomes = fan_out(installs, max_concurrent, {
         let staging = Arc::clone(&staging);
         let local = Arc::clone(&local);
-        move |session| {
+        move |(session, broadcast_error)| {
             let staging = Arc::clone(&staging);
             let local = Arc::clone(&local);
             async move {
-                let digest = session
-                    .exec(&sbcast_install_script(&staging, session.agent_path()))
-                    .await
-                    .with_context(|| format!("installing agent on {}", session.addr()))?;
+                if let Some(error) = broadcast_error {
+                    return Err(anyhow::Error::new(error)
+                        .context(format!("broadcasting the agent to {}", session.addr())));
+                }
+                let script = sbcast_install_script(&staging, session.agent_path());
+                let install = session.exec(&script);
+                let digest = match tokio::time::timeout(timeout, install).await {
+                    Ok(result) => {
+                        result.with_context(|| format!("installing agent on {}", session.addr()))?
+                    }
+                    Err(_) => bail!(
+                        "install on {} timed out after {}s",
+                        session.addr(),
+                        timeout.as_secs()
+                    ),
+                };
                 verify(&session, &local, digest.trim(), DeployMethod::Sbcast)
             }
         }
     })
-    .await;
+    .await
+    .into_iter()
+    .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("deploy task aborted"))))
+    .collect();
     // The staging copies are only a vehicle; leaving them would pile one
-    // binary per job and version into the node's scratch space.
+    // binary per job and version into the node's scratch space. Every node
+    // the broadcast targeted is cleaned, whatever the broadcast or install
+    // outcome (`rm -f` of a file that never arrived is harmless).
     let cleanup = per_host(stale, max_concurrent, timeout, {
         let staging = Arc::clone(&staging);
         move |session| {
@@ -312,6 +317,83 @@ async fn sbcast_and_install(
         }
     }
     outcomes
+}
+
+/// Broadcast to exactly the stale, connected hosts. First one sbcast over a
+/// carrier step spanning all of them (Slurm's tree broadcast); if that
+/// fails, retry per node so one bad node fails only its own deploy.
+/// Returns one result per host, in order.
+async fn scoped_broadcast(
+    srun: &Arc<SrunLauncher>,
+    stale: &[Arc<HostSession>],
+    local_exe: &Path,
+    staging: &str,
+    max_concurrent: usize,
+    timeout: Duration,
+) -> Vec<Result<(), SrunTransportError>> {
+    let hosts: Vec<&str> = stale.iter().map(|session| session.addr()).collect();
+    let group = srun.broadcast(&hosts, local_exe, staging, timeout).await;
+    let error = match group {
+        Ok(()) => return stale.iter().map(|_| Ok(())).collect(),
+        Err(error) => error,
+    };
+    if stale.len() == 1 || !isolates_per_node(&error) {
+        let error = Arc::new(error);
+        return stale
+            .iter()
+            .map(|_| {
+                Err(SrunTransportError::Batched {
+                    source: Arc::clone(&error),
+                })
+            })
+            .collect();
+    }
+    warn!(
+        hosts = stale.len(),
+        %error,
+        "fleet sbcast failed; retrying per node to isolate the failure"
+    );
+    let jobs: Vec<String> = hosts.iter().map(|host| host.to_string()).collect();
+    let local_exe = Arc::new(local_exe.to_path_buf());
+    let staging = Arc::new(staging.to_string());
+    fan_out(jobs, max_concurrent, {
+        let srun = Arc::clone(srun);
+        move |host| {
+            let srun = Arc::clone(&srun);
+            let local_exe = Arc::clone(&local_exe);
+            let staging = Arc::clone(&staging);
+            async move {
+                srun.broadcast(&[&host], &local_exe, &staging, timeout)
+                    .await
+            }
+        }
+    })
+    .await
+    .into_iter()
+    .map(|slot| {
+        slot.unwrap_or_else(|| {
+            Err(SrunTransportError::Carrier {
+                nodes: "?".into(),
+                detail: "broadcast task aborted".into(),
+            })
+        })
+    })
+    .collect()
+}
+
+/// Whether a failed fleet broadcast can be narrowed down per node: a node
+/// that rejected the transfer or its carrier step, or a slow one. A
+/// missing Slurm client or an unusable source path would fail every node
+/// the same way.
+fn isolates_per_node(error: &SrunTransportError) -> bool {
+    matches!(
+        error,
+        SrunTransportError::Sbcast { .. }
+            | SrunTransportError::Carrier { .. }
+            | SrunTransportError::Timeout { .. }
+            | SrunTransportError::Squeue { .. }
+            | SrunTransportError::Scancel { .. }
+    )
 }
 
 async fn shared_install(

@@ -6,7 +6,7 @@
 //! syntax (`node[01-04,07]`) is never parsed here — `scontrol` expands it
 //! and this module only reads the one-hostname-per-line result.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -51,6 +51,8 @@ pub enum SlurmError {
         hosts: Vec<String>,
         allocation: Vec<String>,
     },
+    #[error("`scontrol show node` printed an unusable record {line:?}")]
+    InvalidNodeRecord { line: String },
 }
 
 /// A Slurm job id. Numeric by construction: array/het-job suffixes are not
@@ -194,10 +196,75 @@ pub fn select_hosts(
     Ok(configured)
 }
 
+/// NodeName -> NodeAddr, from `scontrol -o show node`.
+pub type NodeAddrs = BTreeMap<String, String>;
+
+/// `scontrol --oneliner show node <nodelist>`: one record per node, the
+/// whole (compressed) node list resolved in a single call.
+pub fn scontrol_show_nodes_args(nodelist: &str) -> Vec<String> {
+    vec![
+        "--oneliner".into(),
+        "show".into(),
+        "node".into(),
+        nodelist.to_string(),
+    ]
+}
+
+/// Parse `scontrol --oneliner show node` output into NodeName -> NodeAddr.
+/// Each record is one line of space-separated `Key=Value` fields starting
+/// with `NodeName=` (`slurm_sprint_node_table`); NodeAddr comes before
+/// any free-text field (OS, Reason, Comment), and neither names nor
+/// addresses contain spaces, so the first ` NodeAddr=` token is the
+/// node's. A record without NodeAddr is omitted (the node is then reached
+/// by its name); blank lines are ignored; any other line is an error.
+pub fn parse_node_addrs(stdout: &str) -> Result<NodeAddrs, SlurmError> {
+    let mut addrs = NodeAddrs::new();
+    for line in stdout.lines() {
+        let record = line.trim();
+        if record.is_empty() {
+            continue;
+        }
+        let invalid = || SlurmError::InvalidNodeRecord {
+            line: line.to_string(),
+        };
+        let name = record
+            .strip_prefix("NodeName=")
+            .and_then(|rest| rest.split_whitespace().next())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(invalid)?;
+        let addr = record
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("NodeAddr="))
+            .filter(|addr| !addr.is_empty() && *addr != "(null)");
+        if let Some(addr) = addr {
+            addrs.insert(name.to_string(), addr.to_string());
+        }
+    }
+    Ok(addrs)
+}
+
+/// Point peer traffic at each node's NodeAddr. The host's `addr` stays the
+/// Slurm NodeName (what `srun --nodelist` targets); `data_addr` — which
+/// the pairwise, TCP-barrier and NCCL bootstrap traffic uses — becomes the
+/// NodeAddr when the node has one that differs from its name. A configured
+/// `data_addr` always wins.
+pub fn apply_node_addrs(hosts: Vec<HostConfig>, addrs: &NodeAddrs) -> Vec<HostConfig> {
+    hosts
+        .into_iter()
+        .map(|mut host| {
+            if host.data_addr.is_none()
+                && let Some(addr) = addrs.get(&host.addr)
+                && *addr != host.addr
+            {
+                host.data_addr = Some(addr.clone());
+            }
+            host
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
@@ -338,5 +405,54 @@ mod tests {
                 allocation,
             }
         );
+    }
+
+    /// Shaped like `slurm_sprint_node_table` with `--oneliner`: free-text
+    /// fields (OS, Reason) contain spaces and come after NodeAddr.
+    const SHOW_NODES: &str = "\
+NodeName=gpu-a01 Arch=x86_64 CoresPerSocket=32 CPUAlloc=64 CPUEfctv=128 CPUTot=128 CPULoad=3.10 AvailableFeatures=h100,ib ActiveFeatures=h100,ib Gres=gpu:h100:8 NodeAddr=10.1.1.11 NodeHostName=gpu-a01 Version=24.05.1 OS=Linux 5.15.0-91-generic #101-Ubuntu SMP RealMemory=2000000 State=MIXED Reason=fake NodeAddr=9.9.9.9 [root@2026-01-01]
+NodeName=gpu-a02 Arch=x86_64 CoresPerSocket=32 Gres=gpu:h100:8 NodeAddr=gpu-a02 NodeHostName=gpu-a02 OS=Linux 5.15.0 #1 SMP State=IDLE
+
+NodeName=cpu-07 Arch=aarch64 CoresPerSocket=64 Gres=(null) NodeHostName=cpu-07 State=IDLE
+";
+
+    #[test]
+    fn node_addrs_parse_from_oneliner_records() {
+        let addrs = parse_node_addrs(SHOW_NODES).expect("parse");
+        assert_eq!(addrs.get("gpu-a01").map(String::as_str), Some("10.1.1.11"));
+        // NodeAddr == NodeName is kept as reported.
+        assert_eq!(addrs.get("gpu-a02").map(String::as_str), Some("gpu-a02"));
+        // No NodeAddr field: not resolved.
+        assert!(!addrs.contains_key("cpu-07"));
+        assert_eq!(addrs.len(), 2);
+        assert_eq!(parse_node_addrs(""), Ok(NodeAddrs::new()));
+        assert!(matches!(
+            parse_node_addrs("Node gpu-a01 not found\n"),
+            Err(SlurmError::InvalidNodeRecord { .. })
+        ));
+        assert_eq!(
+            scontrol_show_nodes_args("gpu-a[01-02],cpu-07"),
+            ["--oneliner", "show", "node", "gpu-a[01-02],cpu-07"]
+        );
+    }
+
+    #[test]
+    fn node_addrs_become_data_addrs_unless_configured_or_identical() {
+        let addrs = parse_node_addrs(SHOW_NODES).expect("parse");
+        let mut configured = host("gpu-a01");
+        configured.data_addr = Some("10.9.9.9".into());
+        let hosts = apply_node_addrs(
+            vec![
+                host("gpu-a01"),
+                host("gpu-a02"),
+                host("cpu-07"),
+                configured.clone(),
+            ],
+            &addrs,
+        );
+        let data: Vec<Option<&str>> = hosts.iter().map(|h| h.data_addr.as_deref()).collect();
+        assert_eq!(data, [Some("10.1.1.11"), None, None, Some("10.9.9.9")]);
+        // The step target is untouched.
+        assert_eq!(hosts[0].addr, "gpu-a01");
     }
 }
