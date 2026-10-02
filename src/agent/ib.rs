@@ -5,13 +5,19 @@
 //! (`ports/<p>/`): `state`, `phys_state`, `rate`, `link_layer`,
 //! `counters/link_downed`, the bound netdevs, and on Ethernet the RoCE
 //! versions of the populated GIDs. Every read is best effort: a missing
-//! file degrades that field to unknown, never fails the probe.
+//! file degrades that field to unknown, never fails the probe. A rate that
+//! is present but does not parse is kept with its typed error (and logged).
 
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use tracing::warn;
+
 use crate::agent::pci;
-use crate::proto::{IbDeviceInventory, IbPortInventory, IbRate, LinkLayer, PhysState, RoceVersion};
+use crate::agent::sysfs::read_trimmed;
+use crate::proto::{
+    IbDeviceInventory, IbPortInventory, LinkLayer, PhysState, PortRate, RoceVersion,
+};
 
 /// Real sysfs root.
 pub const INFINIBAND_ROOT: &str = "/sys/class/infiniband";
@@ -56,15 +62,18 @@ pub fn probe(ib_root: &Path) -> IbInventory {
 
 fn probe_port(device_dir: &Path, device: &str, port: u32, port_dir: &Path) -> IbPortInventory {
     // `state` reads as "4: ACTIVE"; the wire keeps the symbolic half.
-    let state = read_trimmed(&port_dir.join("state"))
+    let state = read_trimmed(port_dir.join("state"))
         .map(|raw| {
             raw.split_once(':')
                 .map(|(_, name)| name.trim().to_string())
                 .unwrap_or(raw)
         })
         .unwrap_or_else(|| "unknown".to_string());
-    let rate = read_trimmed(&port_dir.join("rate")).and_then(|raw| IbRate::parse(&raw).ok());
-    let link_layer = match read_trimmed(&port_dir.join("link_layer")) {
+    let rate = PortRate::from_sysfs(read_trimmed(port_dir.join("rate")).as_deref());
+    if let PortRate::Unparseable { error } = &rate {
+        warn!(device, port, %error, "unparseable ib port rate");
+    }
+    let link_layer = match read_trimmed(port_dir.join("link_layer")) {
         Some(raw) => {
             let roce = if raw == "Ethernet" {
                 roce_versions(port_dir)
@@ -75,19 +84,18 @@ fn probe_port(device_dir: &Path, device: &str, port: u32, port_dir: &Path) -> Ib
         }
         None => LinkLayer::Unknown,
     };
+    let netdevs = netdevs(device_dir, port, port_dir, &link_layer);
     IbPortInventory {
         device: device.to_string(),
         port,
         state,
-        rate_gbps: rate.map(|rate| rate.gbps),
-        link_downed_count: read_trimmed(&port_dir.join("counters/link_downed"))
+        rate,
+        link_downed_count: read_trimmed(port_dir.join("counters/link_downed"))
             .and_then(|raw| raw.parse::<u64>().ok()),
-        lanes: rate.and_then(|rate| rate.lanes),
-        speed: rate.and_then(|rate| rate.speed),
         link_layer,
-        phys_state: read_trimmed(&port_dir.join("phys_state"))
+        phys_state: read_trimmed(port_dir.join("phys_state"))
             .map_or(PhysState::Unknown, |raw| PhysState::parse(&raw)),
-        netdevs: netdevs(device_dir, port, port_dir),
+        netdevs,
     }
 }
 
@@ -99,47 +107,64 @@ fn roce_versions(port_dir: &Path) -> Vec<RoceVersion> {
     };
     let versions: BTreeSet<RoceVersion> = entries
         .flatten()
-        .filter_map(|entry| read_trimmed(&entry.path()))
+        .filter_map(|entry| read_trimmed(entry.path()))
         .filter_map(|raw| RoceVersion::parse_gid_type(&raw))
         .collect();
     versions.into_iter().collect()
 }
 
-/// Netdevs bound to `port`: the PCI function's `net/*` entries whose
-/// `dev_port` (0-based) is `port - 1` (an entry without `dev_port` counts
-/// for every port); failing that, the names in the port's GID table
-/// (`gid_attrs/ndevs/<i>`). Sorted, deduplicated.
-fn netdevs(device_dir: &Path, port: u32, port_dir: &Path) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(device_dir.join("device/net")) {
-        for entry in entries.flatten() {
-            let bound = match read_trimmed(&entry.path().join("dev_port")) {
-                Some(raw) => raw
-                    .parse::<u32>()
-                    .is_ok_and(|dev_port| dev_port.checked_add(1) == Some(port)),
-                None => true,
-            };
-            if bound {
-                names.insert(entry.file_name().to_string_lossy().into_owned());
-            }
+/// Netdevs bound to `port`, sorted and deduplicated.
+///
+/// RoCE (Ethernet link layer): the names in the port's GID table
+/// (`gid_attrs/ndevs/<i>`, non-empty). That is the interface RoCE traffic
+/// actually uses: for a LAG device (`mlx5_bond_0`) it is the bond, not a
+/// member PF, and in switchdev mode it is the uplink, never a VF
+/// representor.
+///
+/// Otherwise (IPoIB on InfiniBand, or a RoCE port with an empty GID
+/// table): the PCI function's `net/*` entries whose `dev_port` (0-based)
+/// equals `port - 1`, skipping VF/SF representors (`phys_port_name` like
+/// `pf0vf3` / `pf0sf1`). An entry without `dev_port` is not attributed.
+fn netdevs(device_dir: &Path, port: u32, port_dir: &Path, link_layer: &LinkLayer) -> Vec<String> {
+    if matches!(link_layer, LinkLayer::Ethernet { .. }) {
+        let from_gids = gid_ndevs(port_dir);
+        if !from_gids.is_empty() {
+            return from_gids;
         }
     }
-    if names.is_empty()
-        && let Ok(entries) = std::fs::read_dir(port_dir.join("gid_attrs/ndevs"))
-    {
-        names.extend(
-            entries
-                .flatten()
-                .filter_map(|entry| read_trimmed(&entry.path())),
-        );
-    }
+    let Ok(entries) = std::fs::read_dir(device_dir.join("device/net")) else {
+        return Vec::new();
+    };
+    let names: BTreeSet<String> = entries
+        .flatten()
+        .filter(|entry| {
+            let dir = entry.path();
+            let bound = read_trimmed(dir.join("dev_port"))
+                .and_then(|raw| raw.parse::<u32>().ok())
+                .is_some_and(|dev_port| dev_port.checked_add(1) == Some(port));
+            bound && !is_representor(&dir)
+        })
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
     names.into_iter().collect()
 }
 
-fn read_trimmed(path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+fn gid_ndevs(port_dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(port_dir.join("gid_attrs/ndevs")) else {
+        return Vec::new();
+    };
+    let names: BTreeSet<String> = entries
+        .flatten()
+        .filter_map(|entry| read_trimmed(entry.path()))
+        .collect();
+    names.into_iter().collect()
+}
+
+/// A switchdev VF/SF representor: `phys_port_name` names a function
+/// (`pf0vf3`, `c1pf0vf3`, `pf0sf1`), where an uplink reads `p0`.
+fn is_representor(netdev_dir: &Path) -> bool {
+    read_trimmed(netdev_dir.join("phys_port_name"))
+        .is_some_and(|name| name.contains("vf") || name.contains("sf"))
 }
 
 #[cfg(test)]

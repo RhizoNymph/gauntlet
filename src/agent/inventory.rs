@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 
 use crate::agent::EventSink;
 use crate::agent::gpu_occupancy::{self, AgentIdentity, PciBusId};
+use crate::agent::sysfs::read_trimmed;
 use crate::agent::{ib, pci};
 use crate::proto::{
     AgentEvent, GpuInventory, GpuOccupancy, InventorySnapshot, NicInventory, PciLocation, Scope,
@@ -554,12 +555,6 @@ pub(crate) fn parse_xid_line(line: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 // Small IO helpers
 // ---------------------------------------------------------------------------
-
-fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
 
 /// Run a probe command and capture its stdout, giving up after `timeout`.
 ///

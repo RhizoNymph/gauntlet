@@ -223,7 +223,8 @@ impl IbSpeed {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum IbRateError {
     #[error("ib rate {raw:?} does not start with a number")]
     Number { raw: String },
@@ -274,6 +275,77 @@ impl IbRate {
             None => (None, None),
         };
         Ok(Self { gbps, lanes, speed })
+    }
+}
+
+/// What a port's `rate` file said: a parsed rate, a string that did not
+/// parse (kept with its typed error, so a missing ceiling explains itself),
+/// or nothing readable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PortRate {
+    Known {
+        /// The number as printed (decimal Gb/s); see [`payload_gbps`].
+        gbps: f64,
+        /// Lanes ("4X" -> 4), when printed.
+        #[serde(default)]
+        lanes: Option<u32>,
+        /// Speed name, when printed and recognised.
+        #[serde(default)]
+        speed: Option<IbSpeed>,
+    },
+    Unparseable {
+        error: IbRateError,
+    },
+    /// The file was missing, unreadable or empty (and what a pre-v11
+    /// inventory without a rate decodes to).
+    #[default]
+    Unreadable,
+}
+
+impl PortRate {
+    /// Classify the raw sysfs text (`None` = unreadable/empty).
+    pub fn from_sysfs(raw: Option<&str>) -> Self {
+        match raw.map(IbRate::parse) {
+            None => Self::Unreadable,
+            Some(Ok(rate)) => rate.into(),
+            Some(Err(error)) => Self::Unparseable { error },
+        }
+    }
+
+    /// The printed rate in Gb/s, when known.
+    pub fn gbps(&self) -> Option<f64> {
+        match self {
+            Self::Known { gbps, .. } => Some(*gbps),
+            _ => None,
+        }
+    }
+
+    /// Encoding-corrected payload rate in Gb/s, when known.
+    pub fn payload_gbps(&self, link_layer: &LinkLayer) -> Option<f64> {
+        match self {
+            Self::Known { gbps, speed, .. } => Some(payload_gbps(*gbps, *speed, link_layer)),
+            _ => None,
+        }
+    }
+
+    /// "200G", "unparseable rate: ...", "unreadable rate".
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Known { gbps, .. } => format!("{gbps}G"),
+            Self::Unparseable { error } => format!("unparseable rate: {error}"),
+            Self::Unreadable => "unreadable rate".to_string(),
+        }
+    }
+}
+
+impl From<IbRate> for PortRate {
+    fn from(rate: IbRate) -> Self {
+        Self::Known {
+            gbps: rate.gbps,
+            lanes: rate.lanes,
+            speed: rate.speed,
+        }
     }
 }
 
@@ -374,6 +446,89 @@ pub fn pci_locality(a: &PciLocation, b: &PciLocation) -> PciLocality {
         (Some(x), Some(y)) if x == y => PciLocality::SameNuma,
         (Some(_), Some(_)) => PciLocality::CrossNuma,
         _ => PciLocality::Unknown,
+    }
+}
+
+/// One RDMA port (`/sys/class/infiniband/<device>/ports/<port>`).
+///
+/// Decoded through [`IbPortWire`] so pre-v11 inventories (a bare
+/// `rate_gbps` number, no link layer) still load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "IbPortWire")]
+pub struct IbPortInventory {
+    pub device: String,
+    pub port: u32,
+    /// Symbolic logical state ("ACTIVE", "DOWN", ...), unchanged on the
+    /// wire since v1; typed reading via [`IbPortInventory::logical_state`].
+    pub state: String,
+    /// `rate` (proto v11; replaces the bare `rate_gbps`).
+    pub rate: PortRate,
+    pub link_downed_count: Option<u64>,
+    /// `link_layer` (proto v11); `Unknown` for older inventories.
+    pub link_layer: LinkLayer,
+    /// `phys_state` (proto v11).
+    pub phys_state: PhysState,
+    /// Network interfaces bound to this port, sorted (proto v11). RoCE:
+    /// the GID table's `ndevs` (a LAG reports its bond); otherwise the PCI
+    /// function's `net/*` with a matching `dev_port`, VF/SF representors
+    /// excluded.
+    pub netdevs: Vec<String>,
+}
+
+impl IbPortInventory {
+    pub fn logical_state(&self) -> PortState {
+        PortState::parse(&self.state)
+    }
+
+    /// Encoding-corrected line rate in Gb/s, when the rate is known.
+    pub fn payload_gbps(&self) -> Option<f64> {
+        self.rate.payload_gbps(&self.link_layer)
+    }
+}
+
+/// Every shape `IbPortInventory` has had on the wire: v11 (`rate`) and
+/// v1-v10 (`rate_gbps` only).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IbPortWire {
+    device: String,
+    port: u32,
+    state: String,
+    #[serde(default)]
+    rate: Option<PortRate>,
+    /// Pre-v11: the first number of the rate string.
+    #[serde(default)]
+    rate_gbps: Option<f64>,
+    #[serde(default)]
+    link_downed_count: Option<u64>,
+    #[serde(default)]
+    link_layer: LinkLayer,
+    #[serde(default)]
+    phys_state: PhysState,
+    #[serde(default)]
+    netdevs: Vec<String>,
+}
+
+impl From<IbPortWire> for IbPortInventory {
+    fn from(wire: IbPortWire) -> Self {
+        let rate = wire.rate.unwrap_or(match wire.rate_gbps {
+            Some(gbps) => PortRate::Known {
+                gbps,
+                lanes: None,
+                speed: None,
+            },
+            None => PortRate::Unreadable,
+        });
+        Self {
+            device: wire.device,
+            port: wire.port,
+            state: wire.state,
+            rate,
+            link_downed_count: wire.link_downed_count,
+            link_layer: wire.link_layer,
+            phys_state: wire.phys_state,
+            netdevs: wire.netdevs,
+        }
     }
 }
 

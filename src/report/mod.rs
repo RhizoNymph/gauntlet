@@ -5,6 +5,7 @@
 //! bump SCHEMA_VERSION. The terminal table is a projection of it, never a
 //! second source of truth.
 
+mod consistency;
 pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
@@ -24,12 +25,14 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::nccl_env::NcclEnv;
-use crate::nccl_ib::{NcclIbConfig, NcclNicSummary};
+// The majority vote's unit tests live with the rest of this module's tests.
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
-    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
-    consistency_fields, nccl_metric, overlap_metric,
+    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit, nccl_metric,
+    overlap_metric,
 };
+#[cfg(test)]
+use consistency::majority;
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
@@ -215,13 +218,6 @@ pub struct Calibration {
     /// "nccl_allreduce_rank_per_gpu", "nccl_allreduce_intranode_8gpu",
     /// "tcp_pairwise", ...).
     pub links: BTreeMap<String, AlphaBetaFit>,
-    /// Per host: the IB/RoCE ports NCCL would use under the run's
-    /// NCCL_IB_HCA, the excluded ones with the reason, and the summed
-    /// payload line rate (`ceiling_gib_per_sec`) — the NIC bandwidth
-    /// ceiling a simulator should use. Hosts without an inventory are
-    /// absent.
-    #[serde(default)]
-    pub nccl_nics: BTreeMap<String, NcclNicSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -414,18 +410,10 @@ pub fn build(
         .map(|(host, obs)| (host.clone(), obs.errors.clone()))
         .collect();
 
-    // `None` only for a config whose `[nccl]` never validated (see
-    // `nccl_env` below): no NIC summaries rather than guessed ones.
-    let nccl_ib = config.nccl_env().ok().map(NcclIbConfig::from_env);
-    let nccl_nics = nccl_ib
-        .as_ref()
-        .map(|nccl_ib| nccl_nics::summaries(&observations, nccl_ib))
-        .unwrap_or_default();
-
     let fleet = FleetAnalysis {
         outliers,
         threshold_violations,
-        consistency: consistency_findings(&observations, &nccl_nics),
+        consistency: consistency::findings(&observations),
         failed_hosts,
         jitter_outliers,
         sdc_failures: sdc_failures(&observations),
@@ -435,7 +423,6 @@ pub fn build(
     let calibration = Calibration {
         rooflines: rooflines(&observations),
         links: link_fits(&observations),
-        nccl_nics,
     };
     let run_id = format!(
         "{started_epoch_secs}-{}",
@@ -804,67 +791,6 @@ fn violates(bound: &Bound, value: f64) -> bool {
         return false;
     }
     bound.min.is_some_and(|min| value < min) || bound.max.is_some_and(|max| value > max)
-}
-
-/// Majority vote over `proto::consistency_fields` plus each host's NCCL NIC
-/// fields (`NcclNicSummary::consistency_fields`); only fields with at least
-/// one dissenter are reported.
-fn consistency_findings(
-    observations: &BTreeMap<String, HostObservations>,
-    nccl_nics: &BTreeMap<String, NcclNicSummary>,
-) -> BTreeMap<String, ConsistencyFinding> {
-    let mut by_field: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (host, obs) in observations {
-        let Some(inventory) = &obs.inventory else {
-            continue;
-        };
-        let nic_fields = nccl_nics
-            .get(host)
-            .map(NcclNicSummary::consistency_fields)
-            .unwrap_or_default();
-        for (field, value) in consistency_fields(inventory).into_iter().chain(nic_fields) {
-            by_field
-                .entry(field)
-                .or_default()
-                .insert(host.clone(), value);
-        }
-    }
-
-    let mut findings = BTreeMap::new();
-    for (field, values) in by_field {
-        let Some(majority_value) = majority(&values) else {
-            continue;
-        };
-        let dissenters: BTreeMap<String, String> = values
-            .into_iter()
-            .filter(|(_, value)| *value != majority_value)
-            .collect();
-        if !dissenters.is_empty() {
-            findings.insert(
-                field,
-                ConsistencyFinding {
-                    majority_value,
-                    dissenters,
-                },
-            );
-        }
-    }
-    findings
-}
-
-/// Most common value; ties broken by the lexicographically smallest value so
-/// the result never depends on map iteration luck.
-fn majority(values: &BTreeMap<String, String>) -> Option<String> {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for value in values.values() {
-        *counts.entry(value.as_str()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .min_by(|(a_value, a_count), (b_value, b_count)| {
-            b_count.cmp(a_count).then_with(|| a_value.cmp(b_value))
-        })
-        .map(|(value, _)| value.to_string())
 }
 
 // ---------------------------------------------------------------------------

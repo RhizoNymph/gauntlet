@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use crate::agent::gpu_occupancy::PciBusId;
+use crate::agent::sysfs::read_trimmed;
 use crate::proto::PciLocation;
 
 /// Real sysfs root of PCI functions by address.
@@ -20,7 +21,11 @@ pub fn locate(device_link: &Path) -> Option<PciLocation> {
         .iter()
         .map(|component| component.to_string_lossy().into_owned())
         .collect();
-    let host_bridge = components.iter().position(|name| is_host_bridge(name))?;
+    // The *innermost* host bridge: behind Intel VMD the path nests a second
+    // domain (`pci0000:00/0000:00:0e.0/pci10000:e0/...`). Anchoring at the
+    // outer bridge would make every device under one VMD controller share
+    // two components and read as sharing a PCIe switch.
+    let host_bridge = components.iter().rposition(|name| is_host_bridge(name))?;
     let (address, upstream) = components[host_bridge..].split_last()?;
     if upstream.is_empty() || address.parse::<PciBusId>().is_err() {
         return None;
@@ -54,8 +59,7 @@ fn is_host_bridge(name: &str) -> bool {
 
 /// `numa_node` holds -1 when the platform reports no affinity.
 fn read_numa_node(device_dir: &Path) -> Option<u32> {
-    let raw = std::fs::read_to_string(device_dir.join("numa_node")).ok()?;
-    let node: i64 = raw.trim().parse().ok()?;
+    let node: i64 = read_trimmed(device_dir.join("numa_node"))?.parse().ok()?;
     u32::try_from(node).ok()
 }
 

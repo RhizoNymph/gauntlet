@@ -1,59 +1,28 @@
-//! The NCCL NIC picture per host: `calibration.nccl_nics` (one
-//! `NcclNicSummary` per host with an inventory) and its "nccl nics" table
-//! section.
+//! The "nccl nics" table section: per host, the IB/RoCE ports NCCL would
+//! use (`hosts.*.nccl_nics`, recorded by the orchestrator's inventory
+//! derivation), their link layer, the ceiling, the excluded ports and the
+//! `nccl_nics` outcome note.
 //!
-//! Derived from each host's inventory under the run's resolved
-//! `NCCL_IB_HCA` (`crate::nccl_ib`), the same function the orchestrator
-//! uses for the `nccl_nics` outcome and ceiling metric, so the section, the
-//! outcome and the metric cannot disagree.
+//! A projection only: every string comes from the recorded summary's own
+//! describers (`describe_hca`, `ExcludedPort::describe`,
+//! `ceiling_unknown_reason`), the same ones the outcome reason uses.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 
 use anyhow::Result;
 
 use super::{RunResults, new_table, section};
-use crate::nccl_ib::{NcclIbConfig, NcclNicSummary, SelectedPort, summarize};
-use crate::orchestrator::collect::HostObservations;
-use crate::proto::{PciLocality, TestId, TestOutcome};
+use crate::proto::nccl_nics::{ExcludedPort, IB_HCA, SelectedPort, describe_hca};
+use crate::proto::{NcclNicSummary, TestId, TestOutcome};
 
-/// One summary per host that reported an inventory.
-pub fn summaries(
-    observations: &BTreeMap<String, HostObservations>,
-    config: &NcclIbConfig,
-) -> BTreeMap<String, NcclNicSummary> {
-    observations
-        .iter()
-        .filter_map(|(host, obs)| {
-            obs.inventory
-                .as_ref()
-                .map(|inventory| (host.clone(), summarize(inventory, config)))
-        })
-        .collect()
-}
-
-/// "mlx5_0:1 ib 200G (ibp12s0, gpu0-3 pcie_switch)".
+/// "mlx5_0:1 infiniband 200G (ibp12s0, gpu0,gpu1 pcie_switch)".
 fn port_cell(port: &SelectedPort) -> String {
-    let rate = port
-        .rate_gbps
-        .map_or_else(|| "?G".to_string(), |gbps| format!("{gbps}G"));
     let mut detail: Vec<String> = Vec::new();
     if !port.netdevs.is_empty() {
         detail.push(port.netdevs.join("/"));
     }
-    let nearest = port
-        .gpu_locality
-        .values()
-        .copied()
-        .min()
-        .filter(|locality| *locality != PciLocality::Unknown);
-    if let Some(nearest) = nearest {
-        let gpus: Vec<String> = port
-            .gpu_locality
-            .iter()
-            .filter(|(_, locality)| **locality == nearest)
-            .map(|(gpu, _)| format!("gpu{gpu}"))
-            .collect();
+    if let Some((nearest, gpus)) = port.nearest_gpus() {
+        let gpus: Vec<String> = gpus.iter().map(|gpu| format!("gpu{gpu}")).collect();
         detail.push(format!("{} {}", gpus.join(","), nearest.label()));
     }
     let detail = if detail.is_empty() {
@@ -62,46 +31,63 @@ fn port_cell(port: &SelectedPort) -> String {
         format!(" ({})", detail.join(", "))
     };
     format!(
-        "{}:{} {} {rate}{detail}",
+        "{}:{} {} {}{detail}",
         port.device,
         port.port,
-        port.link_layer.label()
+        port.link_layer.label(),
+        port.rate.describe()
     )
 }
 
-/// The host's `nccl_nics` outcome reason, when it failed or was skipped.
-fn outcome_note(results: &RunResults, host: &str) -> String {
-    results
-        .hosts
-        .get(host)
-        .and_then(|obs| {
-            obs.outcomes
-                .iter()
-                .find(|(test, _, _)| *test == TestId::NcclNics)
-        })
-        .map(|(_, _, outcome)| match outcome {
-            TestOutcome::Passed => String::new(),
-            TestOutcome::Failed { reason } => format!("FAIL: {reason}"),
-            TestOutcome::Skipped { reason } => reason.clone(),
-        })
-        .unwrap_or_default()
+/// The outcome reason (FAIL / skip), the plugin caveat and the reason a
+/// ceiling is unknown, one per line.
+fn note(summary: &NcclNicSummary, outcome: Option<&TestOutcome>) -> String {
+    let mut lines = Vec::new();
+    match outcome {
+        Some(TestOutcome::Failed { reason }) => lines.push(format!("FAIL: {reason}")),
+        Some(TestOutcome::Skipped { reason }) => lines.push(reason.clone()),
+        Some(TestOutcome::Passed) | None => {}
+    }
+    lines.extend(summary.net_caveat());
+    lines.extend(summary.ceiling_unknown_reason());
+    lines.join("\n")
 }
 
-/// Rendered when any host has an IB/RoCE port; a fleet without RDMA has
-/// nothing to say here.
+fn or_dash(lines: Vec<String>) -> String {
+    if lines.is_empty() {
+        "-".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
+/// Rendered when any host recorded an IB/RoCE port; a fleet without RDMA
+/// has nothing to say here.
 pub fn render(results: &RunResults, out: &mut dyn Write) -> Result<()> {
-    let summaries = &results.calibration.nccl_nics;
-    if summaries.values().all(NcclNicSummary::has_no_ports) {
+    let summaries: Vec<(&String, &NcclNicSummary, Option<&TestOutcome>)> = results
+        .hosts
+        .iter()
+        .filter_map(|(host, obs)| {
+            let summary = obs.nccl_nics.as_ref()?;
+            let outcome = obs
+                .outcomes
+                .iter()
+                .find(|(test, _, _)| *test == TestId::NcclNics)
+                .map(|(_, _, outcome)| outcome);
+            Some((host, summary, outcome))
+        })
+        .collect();
+    if summaries
+        .iter()
+        .all(|(_, summary, _)| summary.has_no_ports())
+    {
         return Ok(());
     }
     let hca = results
         .nccl_env
         .as_ref()
-        .and_then(|env| env.get(crate::nccl_ib::IB_HCA))
-        .map_or_else(
-            || "NCCL_IB_HCA unset".to_string(),
-            |value| format!("NCCL_IB_HCA={value}"),
-        );
+        .and_then(|env| env.get(IB_HCA))
+        .map(String::as_str);
     let mut table = new_table(&[
         "host",
         "ports nccl would use",
@@ -110,31 +96,23 @@ pub fn render(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         "excluded",
         "note",
     ]);
-    for (host, summary) in summaries {
-        let selected: Vec<String> = summary.selected.iter().map(port_cell).collect();
-        let excluded: Vec<String> = summary
-            .excluded
-            .iter()
-            .map(|port| format!("{}:{} {}", port.device, port.port, port.reason.describe()))
-            .collect();
+    for (host, summary, outcome) in summaries {
         table.add_row(vec![
             host.clone(),
-            if selected.is_empty() {
-                "-".to_string()
-            } else {
-                selected.join("\n")
-            },
+            or_dash(summary.selected.iter().map(port_cell).collect()),
             summary.link_layer().label().to_string(),
             summary
-                .ceiling_gib_per_sec
+                .ceiling_gib_per_sec()
                 .map_or_else(|| "-".to_string(), |gib| format!("{gib:.2}")),
-            if excluded.is_empty() {
-                "-".to_string()
-            } else {
-                excluded.join("\n")
-            },
-            outcome_note(results, host),
+            or_dash(
+                summary
+                    .excluded
+                    .iter()
+                    .map(ExcludedPort::describe)
+                    .collect(),
+            ),
+            note(summary, outcome),
         ]);
     }
-    section(out, &format!("nccl nics ({hca})"), &table)
+    section(out, &format!("nccl nics ({})", describe_hca(hca)), &table)
 }

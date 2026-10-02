@@ -13,13 +13,16 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod ib;
+pub mod nccl_nics;
 mod occupancy;
 mod ranks;
 
 pub use ib::{
-    IbDeviceInventory, IbRate, IbRateError, IbSpeed, LinkLayer, PciLocality, PciLocation,
-    PhysState, PortState, RoceVersion, gbps_to_gib_per_sec, payload_gbps, pci_locality,
+    IbDeviceInventory, IbPortInventory, IbRate, IbRateError, IbSpeed, LinkLayer, PciLocality,
+    PciLocation, PhysState, PortRate, PortState, RoceVersion, gbps_to_gib_per_sec, payload_gbps,
+    pci_locality,
 };
+pub use nccl_nics::NcclNicSummary;
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
@@ -64,9 +67,10 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // rate `lanes` / `speed` and the bound `netdevs`; the snapshot lists
 // `ib_devices` (PCI address, NUMA node, upstream bridges) and every
 // `GpuInventory` its `pci` placement, so NIC<->GPU locality can be derived.
-// The orchestrator-derived `nccl_nics` test id rides the wire. All
-// serde-defaulted: older inventories decode with link layer and placement
-// unknown.
+// A port's bare `rate_gbps` became a typed `rate` (known / unparseable with
+// its error / unreadable). The orchestrator-derived `nccl_nics` test id and
+// `nccl_nics` event ride the wire. Older inventories decode with link layer
+// and placement unknown and `rate_gbps` lifted into `rate`.
 pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
@@ -163,6 +167,12 @@ pub enum AgentEvent {
     /// from the baseline the orchestrator handed back in the task spec.
     CounterDeltas {
         deltas: Box<CounterDeltas>,
+    },
+    /// Orchestrator-derived from a host's inventory under the run's NCCL
+    /// env (`orchestrator::derive`): which IB/RoCE ports NCCL would use.
+    /// Agents never emit it; the collector records it per host.
+    NcclNics {
+        summary: Box<NcclNicSummary>,
     },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
@@ -435,49 +445,6 @@ pub struct NicInventory {
     pub name: String,
     pub mtu: u32,
     pub speed_mbps: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IbPortInventory {
-    pub device: String,
-    pub port: u32,
-    /// Symbolic logical state ("ACTIVE", "DOWN", ...); typed reading via
-    /// [`IbPortInventory::logical_state`].
-    pub state: String,
-    /// The number of the sysfs rate string ("200 Gb/sec (4X HDR)" -> 200),
-    /// as printed; [`IbPortInventory::payload_gbps`] corrects it for the
-    /// link encoding.
-    pub rate_gbps: Option<f64>,
-    pub link_downed_count: Option<u64>,
-    /// Lanes from the rate string ("4X" -> 4) (proto v11).
-    #[serde(default)]
-    pub lanes: Option<u32>,
-    /// Speed name from the rate string (proto v11).
-    #[serde(default)]
-    pub speed: Option<IbSpeed>,
-    /// `link_layer` (proto v11); `Unknown` for older inventories.
-    #[serde(default)]
-    pub link_layer: LinkLayer,
-    /// `phys_state` (proto v11).
-    #[serde(default)]
-    pub phys_state: PhysState,
-    /// Network interfaces bound to this port (`device/net/*` filtered by
-    /// `dev_port`, else the GID table's `ndevs`), sorted (proto v11).
-    #[serde(default)]
-    pub netdevs: Vec<String>,
-}
-
-impl IbPortInventory {
-    pub fn logical_state(&self) -> PortState {
-        PortState::parse(&self.state)
-    }
-
-    /// Encoding-corrected line rate in Gb/s, when the rate was readable.
-    pub fn payload_gbps(&self) -> Option<f64> {
-        self.rate_gbps
-            .map(|rate| payload_gbps(rate, self.speed, &self.link_layer))
-    }
 }
 
 // ---------------------------------------------------------------------------

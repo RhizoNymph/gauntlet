@@ -230,8 +230,9 @@ baseline diff compares it.
 
 ## Consumers of the resolved map
 Besides the spawn command line and `RunResults.nccl_env`, the resolved map
-is read orchestrator-side for `NCCL_IB_HCA` and `NCCL_IB_DISABLE`, to
-decide which inventoried IB/RoCE ports NCCL would use
+is read orchestrator-side for `NCCL_NET`, `NCCL_IB_DISABLE` and
+`NCCL_IB_HCA`, to decide which inventoried IB/RoCE ports NCCL would use
 (docs/features/nccl_nics.md). That is the only place gauntlet interprets an
-NCCL value's grammar, and it follows NCCL's own parser rather than
-validating: every string has NCCL's meaning.
+NCCL value's grammar. It follows NCCL's own parsers (`strcasecmp` for the
+net name, `strtoll(.., 0)` for the integer, `parseStringList` for the HCA
+list) rather than validating: every string has NCCL's meaning.

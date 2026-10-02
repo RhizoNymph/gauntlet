@@ -57,10 +57,13 @@ Overview:
     `env ... gauntlet agent ...` command line of every agent spawn — never
     on the wire, never via set_var in the agent — and recorded run-level
     in RunResults.nccl_env. The same env decides, orchestrator-side,
-    which inventoried IB/RoCE ports NCCL would use (nccl_ib::summarize
-    over each arriving inventory -> nccl_nics outcome + ceiling metric;
-    report::build -> calibration.nccl_nics + consistency fields); agents
-    report sysfs facts only.
+    which inventoried IB/RoCE ports NCCL would use: every arriving
+    inventory goes through orchestrator::derive::derive_inventory_events
+    (gpu_idle outcomes; nccl_nics outcome + ceiling metric + NcclNics
+    summary), which the collector records like agent events
+    (hosts.*.nccl_nics). report::build only reads those results
+    (consistency fields, the "nccl nics" section) and never re-derives.
+    Agents report sysfs facts only.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -86,11 +89,12 @@ Features Index:
       inventory; fleet consistency check (flag nodes differing from majority);
       GPU health counters (ECC, row remaps, dmesg Xid, PCIe link gen/width,
       NVLink status/errors); IB devices and ports (state, phys state,
-      rate/lanes/speed, link layer + RoCE versions, bound netdevs, PCI
-      address/NUMA node/upstream bridges; proto v11) and GPU PCI
-      placement; clock sync offset; per-GPU occupancy (memory used/total,
-      compute processes by bus id).
-    entry_points: [agent/inventory.rs, agent/ib.rs, agent/pci.rs, agent/gpu_occupancy.rs]
+      typed rate (known / unparseable with its error / unreadable), link
+      layer + RoCE versions, bound netdevs (GID-table ndevs for RoCE),
+      PCI address/NUMA node/upstream bridges from the innermost host
+      bridge; proto v11) and GPU PCI placement; clock sync offset;
+      per-GPU occupancy (memory used/total, compute processes by bus id).
+    entry_points: [agent/inventory.rs, agent/ib.rs, agent/pci.rs, agent/sysfs.rs, agent/gpu_occupancy.rs]
     depends_on: []
     doc: docs/features/phase0_inventory.md
   gpu_idle:
@@ -206,20 +210,29 @@ Features Index:
     doc: docs/features/nccl_env.md
   nccl_nics:
     description: >
-      Which IB/RoCE ports NCCL would use (proto v11 / schema v13). Pure
-      replay of NCCL's IB device scan over a host's inventory under the
-      run's resolved env: NCCL_IB_DISABLE, ACTIVE state, IB/Ethernet link
-      layer, then NCCL_IB_HCA (`^` exclude, `=` exact, comma list,
-      dev:port, prefix match by default; HcaFilter). The orchestrator
-      derives a Node-scope `nccl_nics` outcome as each inventory arrives
-      (Failed when ports exist but none is selected: NCCL would fall back
-      to sockets) and the fleet-comparable `nccl_nics.ceiling_gib_per_sec`
-      metric (summed encoding-corrected line rate of the selected ports);
-      the report stores per-host summaries in `calibration.nccl_nics`
-      (selected/excluded ports, GPU<->NIC PCI locality), adds
-      nccl_ib_ports / nccl_ib_link_layer / nccl_ib_ceiling_gbps
-      consistency fields, and renders a "nccl nics" section.
-    entry_points: [nccl_ib/mod.rs, nccl_ib/hca.rs, proto/ib.rs, orchestrator/mod.rs, report/nccl_nics.rs]
+      Which IB/RoCE ports NCCL would use (proto v11 / schema v13). It is
+      a pure replay of NCCL's IB device scan over a host's inventory
+      under the run's resolved env, applied in order:
+      - NCCL_NET (Socket forces sockets; a plugin is recorded but not
+        modelled);
+      - NCCL_IB_DISABLE (C strtoll base 0, as ncclLoadParam reads it);
+      - ACTIVE state and an IB/Ethernet link layer;
+      - NCCL_IB_HCA (`^` exclude, `=` exact, comma list, dev:port,
+        prefix match by default; HcaFilter).
+      The single inventory-derivation hook
+      (orchestrator::derive::derive_inventory_events, shared with
+      gpu_idle) records three things per host:
+      - a Node-scope `nccl_nics` outcome, Failed when ports exist but
+        none is selected (NCCL would fall back to sockets);
+      - the fleet-comparable `nccl_nics.ceiling_gib_per_sec` metric, the
+        summed encoding-corrected line rate of the selected ports;
+      - the NcclNicSummary in `hosts.*.nccl_nics`: env inputs,
+        selected/excluded ports, typed rates (unparseable ones carry
+        their error), and GPU<->NIC PCI locality.
+      The report reads these and adds the nccl_ib_ports,
+      nccl_ib_link_layer and nccl_ib_ceiling_gbps consistency fields
+      (report/consistency.rs) and a "nccl nics" section.
+    entry_points: [nccl_ib/mod.rs, nccl_ib/hca.rs, proto/nccl_nics.rs, proto/ib.rs, orchestrator/derive.rs, report/consistency.rs, report/nccl_nics.rs]
     depends_on: [phase0_inventory, nccl_env]
     doc: docs/features/nccl_nics.md
   overlap_phase:

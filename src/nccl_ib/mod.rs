@@ -1,73 +1,60 @@
-//! Which IB/RoCE ports NCCL would use, and what they add up to.
+//! Which IB/RoCE ports NCCL would use: a pure replay of NCCL's IB device
+//! scan over one host's inventory under the run's resolved NCCL env.
 //!
 //! The agent inventories ports as facts (`proto::IbPortInventory`); the
-//! orchestrator knows the run's resolved NCCL environment. This module joins
-//! the two, purely: [`NcclIbConfig`] is the slice of the env that decides
-//! the IB transport's port list, [`summarize`] replays NCCL's device scan
-//! over one host's inventory, and [`NcclNicSummary`] is the per-host result
-//! (selected ports, excluded ports with the reason, and the summed line
-//! rate: the "NCCL NIC ceiling").
+//! orchestrator knows the env. [`NcclIbConfig`] is the slice of the env
+//! that decides the IB transport's port list; [`summarize`] produces the
+//! per-host [`NcclNicSummary`] (types in `proto::nccl_nics`).
 //!
-//! What is modelled, in NCCL's order (IB transport init, `net_ib.cc`):
-//! 1. `NCCL_IB_DISABLE` set to a non-zero integer turns the IB transport
-//!    off: no port is used.
-//! 2. Only ports whose logical state is ACTIVE are considered.
-//! 3. Only InfiniBand and Ethernet (RoCE) link layers are considered.
-//! 4. The port must pass the `NCCL_IB_HCA` filter (see [`hca`]); unset
-//!    means every port passes.
+//! Modelled, in NCCL's order:
+//! 1. `NCCL_NET` (case-insensitive): "Socket" selects the socket
+//!    transport, so no IB port is used. "IB" or unset keep the IB
+//!    transport. Any other value names an external net plugin, which is
+//!    not modelled: the IB selection is reported as if IB ran, and the
+//!    summary carries a caveat.
+//! 2. `NCCL_IB_DISABLE`, read like NCCL's `ncclLoadParam`: C
+//!    `strtoll(s, &end, 0)` (hex `0x`, octal `0` prefixes, trailing text
+//!    ignored); no digits or overflow keeps the default 0. Non-zero
+//!    disables the IB transport.
+//! 3. Only ports whose logical state is ACTIVE.
+//! 4. Only InfiniBand and Ethernet (RoCE) link layers.
+//! 5. The `NCCL_IB_HCA` filter (see [`hca`]); unset passes everything.
 //!
-//! Not modelled: `NCCL_NET` / external net plugins (a plugin replaces the
-//! IB transport entirely), `NCCL_IB_HCA` values coming from the node's own
-//! environment or `/etc/nccl.conf` (only the `[nccl] env` map is known
-//! here), NIC fusion (`NCCL_IB_MERGE_NICS`), and per-GPU NIC assignment
-//! (NCCL picks NICs per rank by topology; the ceiling is the node total).
+//! Not modelled: external plugin behaviour, `NCCL_IB_HCA` values from the
+//! node's own environment or `/etc/nccl.conf` (only `[nccl] env` is known
+//! here), NIC fusion (`NCCL_IB_MERGE_NICS`), and per-rank NIC assignment.
 
 pub mod hca;
 
-use std::collections::BTreeMap;
-
-use serde::{Deserialize, Serialize};
-
 use crate::nccl_env::NcclEnv;
-use crate::proto::{
-    AgentEvent, InventorySnapshot, LinkLayer, MetricRecord, PciLocality, PortState, Scope, TestId,
-    TestOutcome, Unit, gbps_to_gib_per_sec, pci_locality,
+use crate::proto::nccl_nics::{
+    ExcludedPort, GpuLocality, IB_DISABLE, IB_HCA, NET, NetChoice, PortExclusion, SelectedPort,
 };
+use crate::proto::{IbPortInventory, InventorySnapshot, NcclNicSummary, PortState, pci_locality};
 use hca::HcaFilter;
-
-pub const IB_HCA: &str = "NCCL_IB_HCA";
-pub const IB_DISABLE: &str = "NCCL_IB_DISABLE";
-
-/// Metric name of the per-node ceiling (`nccl_nics.ceiling_gib_per_sec`).
-pub const CEILING_METRIC: &str = "ceiling_gib_per_sec";
-
-/// Consistency-field names contributed per host.
-pub mod consistency {
-    pub const PORTS: &str = "nccl_ib_ports";
-    pub const LINK_LAYER: &str = "nccl_ib_link_layer";
-    pub const CEILING_GBPS: &str = "nccl_ib_ceiling_gbps";
-}
 
 /// The NCCL knobs that decide the IB transport's port list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct NcclIbConfig {
-    /// The raw `NCCL_IB_HCA` value, for messages; `None` = unset.
+    /// The raw `NCCL_IB_HCA` value, recorded on summaries; `None` = unset.
     hca_value: Option<String>,
     hca: HcaFilter,
     ib_disabled: bool,
+    net: NetChoice,
 }
 
 impl NcclIbConfig {
-    pub fn new(hca: Option<&str>, ib_disable: Option<&str>) -> Self {
+    pub fn new(hca: Option<&str>, ib_disable: Option<&str>, net: Option<&str>) -> Self {
         Self {
             hca_value: hca.map(str::to_string),
             hca: hca.map_or_else(HcaFilter::unset, HcaFilter::parse),
             ib_disabled: ib_disable.is_some_and(ib_disable_is_set),
+            net: NetChoice::parse(net),
         }
     }
 
     pub fn from_env(env: &NcclEnv) -> Self {
-        Self::new(env.get(IB_HCA), env.get(IB_DISABLE))
+        Self::new(env.get(IB_HCA), env.get(IB_DISABLE), env.get(NET))
     }
 
     pub fn hca_value(&self) -> Option<&str> {
@@ -82,216 +69,78 @@ impl NcclIbConfig {
         self.ib_disabled
     }
 
-    /// "NCCL_IB_HCA=<value>" or "NCCL_IB_HCA unset".
-    pub fn describe_hca(&self) -> String {
-        match &self.hca_value {
-            Some(value) => format!("{IB_HCA}={value}"),
-            None => format!("{IB_HCA} unset"),
-        }
+    pub fn net(&self) -> &NetChoice {
+        &self.net
     }
 }
 
-/// NCCL reads integer params with `strtoll` and keeps the default (0) when
-/// the text is not a whole integer; any non-zero value disables.
+/// `NCCL_IB_DISABLE` as `ncclLoadParam` reads it: non-zero after C
+/// `strtoll(s, &end, 0)`; unparseable (no digits) or out of range keeps the
+/// default 0.
 fn ib_disable_is_set(raw: &str) -> bool {
-    raw.trim().parse::<i64>().is_ok_and(|value| value != 0)
+    strtoll_base0(raw).is_some_and(|value| value != 0)
 }
 
-/// Why NCCL would not use a port. Checked in this order; the first that
-/// applies is recorded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
-pub enum PortExclusion {
-    /// `NCCL_IB_DISABLE` turned the IB transport off.
-    IbDisabled,
-    /// Logical state is not ACTIVE; carries the state as inventoried.
-    NotActive { state: String },
-    /// Link layer is neither InfiniBand nor Ethernet.
-    UnsupportedLinkLayer,
-    /// `NCCL_IB_HCA` filters it out.
-    FilteredByHca,
-}
-
-impl PortExclusion {
-    pub fn describe(&self) -> String {
-        match self {
-            Self::IbDisabled => "IB transport disabled".to_string(),
-            Self::NotActive { state } => format!("not active ({state})"),
-            Self::UnsupportedLinkLayer => "unsupported link layer".to_string(),
-            Self::FilteredByHca => format!("filtered by {IB_HCA}"),
+/// C `strtoll(s, &end, 0)` as NCCL checks it: `None` when no digits were
+/// consumed (`end == s`) or the value is out of range (`errno == ERANGE`).
+/// Leading C whitespace, an optional sign, then `0x`/`0X` + hex digit for
+/// base 16, a leading `0` for base 8, else base 10; parsing stops at the
+/// first character not valid in the base.
+fn strtoll_base0(text: &str) -> Option<i64> {
+    let bytes = text.as_bytes();
+    let mut index = bytes
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'))
+        .count();
+    let negative = match bytes.get(index) {
+        Some(b'-') => {
+            index += 1;
+            true
         }
+        Some(b'+') => {
+            index += 1;
+            false
+        }
+        _ => false,
+    };
+    let hex_prefix = bytes.get(index) == Some(&b'0')
+        && matches!(bytes.get(index + 1), Some(b'x' | b'X'))
+        && bytes.get(index + 2).is_some_and(u8::is_ascii_hexdigit);
+    let (radix, start) = if hex_prefix {
+        (16, index + 2)
+    } else if bytes.get(index) == Some(&b'0') {
+        (8, index)
+    } else {
+        (10, index)
+    };
+    let digits: Vec<u32> = bytes[start..]
+        .iter()
+        .map_while(|byte| char::from(*byte).to_digit(radix))
+        .collect();
+    if digits.is_empty() {
+        return None;
     }
-}
-
-/// A port NCCL would use. Selected ports are ACTIVE by construction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SelectedPort {
-    pub device: String,
-    pub port: u32,
-    pub link_layer: LinkLayer,
-    /// The rate as printed by sysfs, Gb/s.
-    pub rate_gbps: Option<f64>,
-    /// Encoding-corrected payload rate, Gb/s (`proto::payload_gbps`).
-    pub payload_gbps: Option<f64>,
-    pub netdevs: Vec<String>,
-    /// The device's NUMA node, when known.
-    pub numa_node: Option<u32>,
-    /// PCI distance from this NIC to every GPU with a known placement,
-    /// keyed by GPU index.
-    pub gpu_locality: BTreeMap<u32, PciLocality>,
-}
-
-/// A port NCCL would not use, and why.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExcludedPort {
-    pub device: String,
-    pub port: u32,
-    #[serde(flatten)]
-    pub reason: PortExclusion,
-}
-
-/// Link layer(s) of the selected ports, as one fleet-comparable value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SelectionLinkLayer {
-    None,
-    Infiniband,
-    Ethernet,
-    Mixed,
-}
-
-impl SelectionLinkLayer {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Infiniband => "infiniband",
-            Self::Ethernet => "ethernet",
-            Self::Mixed => "mixed",
-        }
-    }
-}
-
-/// One host's NCCL NIC picture under the run's env.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NcclNicSummary {
-    pub selected: Vec<SelectedPort>,
-    pub excluded: Vec<ExcludedPort>,
-    /// Sum of the selected ports' payload rates in GiB/s. `Some(0.0)` when
-    /// nothing is selected; `None` when a selected port's rate is unknown
-    /// (a partial sum would understate the ceiling).
-    pub ceiling_gib_per_sec: Option<f64>,
-}
-
-impl NcclNicSummary {
-    /// The host has no IB/RoCE ports at all.
-    pub fn has_no_ports(&self) -> bool {
-        self.selected.is_empty() && self.excluded.is_empty()
-    }
-
-    pub fn link_layer(&self) -> SelectionLinkLayer {
-        let infiniband = self
-            .selected
-            .iter()
-            .any(|port| port.link_layer == LinkLayer::Infiniband);
-        let ethernet = self
-            .selected
-            .iter()
-            .any(|port| matches!(port.link_layer, LinkLayer::Ethernet { .. }));
-        match (infiniband, ethernet) {
-            (false, false) => SelectionLinkLayer::None,
-            (true, false) => SelectionLinkLayer::Infiniband,
-            (false, true) => SelectionLinkLayer::Ethernet,
-            (true, true) => SelectionLinkLayer::Mixed,
-        }
-    }
-
-    /// Sum of the selected ports' payload rates in Gb/s (`None` when any is
-    /// unknown).
-    pub fn ceiling_gbps(&self) -> Option<f64> {
-        self.selected
-            .iter()
-            .map(|port| port.payload_gbps)
-            .sum::<Option<f64>>()
-    }
-
-    /// The `nccl_nics` outcome for this host:
-    /// - no IB/RoCE ports at all: Skipped (NCCL uses sockets by design);
-    /// - IB transport disabled: Skipped;
-    /// - ports present but none selected: Failed — NCCL would silently fall
-    ///   back to sockets;
-    /// - otherwise Passed.
-    pub fn outcome(&self, config: &NcclIbConfig) -> TestOutcome {
-        if self.has_no_ports() {
-            return TestOutcome::Skipped {
-                reason: "no InfiniBand/RoCE ports; NCCL uses sockets".to_string(),
-            };
-        }
-        if config.ib_disabled() {
-            return TestOutcome::Skipped {
-                reason: format!("{IB_DISABLE} set; NCCL uses sockets"),
-            };
-        }
-        if !self.selected.is_empty() {
-            return TestOutcome::Passed;
-        }
-        let why: Vec<String> = self
-            .excluded
-            .iter()
-            .map(|port| format!("{}:{} {}", port.device, port.port, port.reason.describe()))
-            .collect();
-        TestOutcome::Failed {
-            reason: format!(
-                "{} selects no active IB/RoCE port ({}); NCCL would fall back to sockets",
-                config.describe_hca(),
-                why.join(", ")
-            ),
-        }
-    }
-
-    /// The fleet-comparable node-scope metric, when it means something: the
-    /// host has IB/RoCE ports, the transport is enabled, and every selected
-    /// rate is known.
-    pub fn ceiling_metric(&self, config: &NcclIbConfig) -> Option<MetricRecord> {
-        if self.has_no_ports() || config.ib_disabled() {
+    let limit = if negative {
+        u128::from(i64::MAX.unsigned_abs()) + 1
+    } else {
+        u128::from(i64::MAX.unsigned_abs())
+    };
+    let mut magnitude: u128 = 0;
+    for digit in digits {
+        magnitude = magnitude * u128::from(radix) + u128::from(digit);
+        if magnitude > limit {
             return None;
         }
-        Some(MetricRecord {
-            test: TestId::NcclNics,
-            scope: Scope::Node,
-            name: CEILING_METRIC.to_string(),
-            value: self.ceiling_gib_per_sec?,
-            unit: Unit::GibPerSec,
-            repeat: 0,
-        })
     }
-
-    /// Consistency fields: selected-port count, selected link layer(s),
-    /// and the ceiling in Gb/s (exact-match, so one slower host dissents
-    /// even when the MAD of an otherwise uniform fleet is zero).
-    pub fn consistency_fields(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (
-                consistency::PORTS.to_string(),
-                self.selected.len().to_string(),
-            ),
-            (
-                consistency::LINK_LAYER.to_string(),
-                self.link_layer().label().to_string(),
-            ),
-            (
-                consistency::CEILING_GBPS.to_string(),
-                self.ceiling_gbps()
-                    .map_or_else(|| "unknown".to_string(), |gbps| format!("{gbps}")),
-            ),
-        ])
-    }
+    let magnitude = i128::try_from(magnitude).ok()?;
+    i64::try_from(if negative { -magnitude } else { magnitude }).ok()
 }
 
 /// Classify one port the way NCCL's device scan would.
-pub fn classify_port(
-    config: &NcclIbConfig,
-    port: &crate::proto::IbPortInventory,
-) -> Result<(), PortExclusion> {
+pub fn classify_port(config: &NcclIbConfig, port: &IbPortInventory) -> Result<(), PortExclusion> {
+    if config.net() == &NetChoice::Socket {
+        return Err(PortExclusion::NetSocket);
+    }
     if config.ib_disabled() {
         return Err(PortExclusion::IbDisabled);
     }
@@ -309,22 +158,6 @@ pub fn classify_port(
     Ok(())
 }
 
-/// The events the orchestrator derives from a host's inventory as it
-/// arrives: one Node-scope `nccl_nics` outcome, then the ceiling metric
-/// when it applies (see [`NcclNicSummary::ceiling_metric`]).
-pub fn nccl_nic_events(inventory: &InventorySnapshot, config: &NcclIbConfig) -> Vec<AgentEvent> {
-    let summary = summarize(inventory, config);
-    let mut events = vec![AgentEvent::Outcome {
-        test: TestId::NcclNics,
-        scope: Scope::Node,
-        outcome: summary.outcome(config),
-    }];
-    if let Some(record) = summary.ceiling_metric(config) {
-        events.push(AgentEvent::Metric { record });
-    }
-    events
-}
-
 /// Replay NCCL's IB device scan over one host's inventory.
 pub fn summarize(inventory: &InventorySnapshot, config: &NcclIbConfig) -> NcclNicSummary {
     let mut selected = Vec::new();
@@ -337,25 +170,26 @@ pub fn summarize(inventory: &InventorySnapshot, config: &NcclIbConfig) -> NcclNi
                     .iter()
                     .find(|device| device.name == port.device)
                     .and_then(|device| device.pci.as_ref());
-                let gpu_locality = pci
+                let mut gpu_locality: Vec<GpuLocality> = pci
                     .map(|nic| {
                         inventory
                             .gpus
                             .iter()
                             .filter_map(|gpu| {
-                                gpu.pci
-                                    .as_ref()
-                                    .map(|placement| (gpu.index, pci_locality(nic, placement)))
+                                gpu.pci.as_ref().map(|placement| GpuLocality {
+                                    gpu: gpu.index,
+                                    locality: pci_locality(nic, placement),
+                                })
                             })
                             .collect()
                     })
                     .unwrap_or_default();
+                gpu_locality.sort_by_key(|entry| entry.gpu);
                 selected.push(SelectedPort {
                     device: port.device.clone(),
                     port: port.port,
                     link_layer: port.link_layer.clone(),
-                    rate_gbps: port.rate_gbps,
-                    payload_gbps: port.payload_gbps(),
+                    rate: port.rate.clone(),
                     netdevs: port.netdevs.clone(),
                     numa_node: pci.and_then(|nic| nic.numa_node),
                     gpu_locality,
@@ -368,15 +202,12 @@ pub fn summarize(inventory: &InventorySnapshot, config: &NcclIbConfig) -> NcclNi
             }),
         }
     }
-    let ceiling_gib_per_sec = selected
-        .iter()
-        .map(|port| port.payload_gbps)
-        .sum::<Option<f64>>()
-        .map(gbps_to_gib_per_sec);
     NcclNicSummary {
+        hca: config.hca_value().map(str::to_string),
+        net: config.net().clone(),
+        ib_disabled: config.ib_disabled(),
         selected,
         excluded,
-        ceiling_gib_per_sec,
     }
 }
 
@@ -385,26 +216,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ib_disable_follows_ncclparam_integer_rules() {
-        assert!(ib_disable_is_set("1"));
-        assert!(ib_disable_is_set("2"));
-        assert!(ib_disable_is_set("-1"));
-        assert!(!ib_disable_is_set("0"));
-        assert!(!ib_disable_is_set("yes"));
-        assert!(!ib_disable_is_set("1x"));
-        assert!(NcclIbConfig::new(None, Some("1")).ib_disabled());
-        assert!(!NcclIbConfig::new(None, None).ib_disabled());
+    fn strtoll_mirrors_c_base_zero() {
+        assert_eq!(strtoll_base0("1"), Some(1));
+        assert_eq!(strtoll_base0("0"), Some(0));
+        assert_eq!(strtoll_base0("0x1"), Some(1));
+        assert_eq!(strtoll_base0("0X1f"), Some(31));
+        assert_eq!(strtoll_base0("010"), Some(8));
+        assert_eq!(strtoll_base0("08"), Some(0), "octal stops at 8");
+        assert_eq!(strtoll_base0("0x"), Some(0), "the 0 is consumed");
+        assert_eq!(strtoll_base0("1x"), Some(1), "trailing text ignored");
+        assert_eq!(strtoll_base0("  -1"), Some(-1));
+        assert_eq!(strtoll_base0("+5"), Some(5));
+        assert_eq!(strtoll_base0("x1"), None);
+        assert_eq!(strtoll_base0("yes"), None);
+        assert_eq!(strtoll_base0(""), None);
+        assert_eq!(strtoll_base0("-"), None);
+        assert_eq!(strtoll_base0("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(strtoll_base0("-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(strtoll_base0("9223372036854775808"), None, "ERANGE");
+        assert_eq!(strtoll_base0("99999999999999999999999"), None, "ERANGE");
     }
 
     #[test]
-    fn hca_is_described_for_messages() {
-        assert_eq!(
-            NcclIbConfig::new(Some("^mlx5_2"), None).describe_hca(),
-            "NCCL_IB_HCA=^mlx5_2"
-        );
-        assert_eq!(
-            NcclIbConfig::new(None, None).describe_hca(),
-            "NCCL_IB_HCA unset"
-        );
+    fn ib_disable_follows_ncclloadparam() {
+        for disabled in ["1", "2", "-1", "1x", "0x1", "010", " 1"] {
+            assert!(ib_disable_is_set(disabled), "{disabled:?}");
+        }
+        for enabled in [
+            "0",
+            "0x0",
+            "00",
+            "08",
+            "yes",
+            "x1",
+            "",
+            "99999999999999999999",
+        ] {
+            assert!(!ib_disable_is_set(enabled), "{enabled:?}");
+        }
+        assert!(NcclIbConfig::new(None, Some("1"), None).ib_disabled());
+        assert!(!NcclIbConfig::new(None, None, None).ib_disabled());
     }
 }

@@ -23,6 +23,7 @@ pub mod nccl;
 pub mod net;
 pub mod pci;
 pub mod sweep;
+pub mod sysfs;
 pub mod window;
 
 #[cfg(feature = "gpu")]
