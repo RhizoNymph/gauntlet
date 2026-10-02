@@ -8,16 +8,17 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-
+use crate::names::NameTable;
 use crate::proto::{TestId, TestOutcome};
 
 /// Reason recorded on every test a deselected step would have produced.
 pub const DISABLED_REASON: &str = "disabled by config";
 
 /// One step of the network phase, in run order (innermost level first).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialized by canonical `name`; deserialized from any spelling in
+/// `PARSE_TABLE`, so `[tests] net_steps` accepts exactly what
+/// `--net-steps` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NetStep {
     /// Intra-node NCCL sweep (all local GPUs, NVLink/PCIe).
     Intranode,
@@ -58,30 +59,12 @@ impl NetStep {
     }
 
     pub fn parse(s: &str) -> Option<NetStep> {
-        Self::PARSE_TABLE
-            .iter()
-            .find(|(alias, _)| *alias == s)
-            .map(|(_, step)| *step)
+        crate::names::parse(s)
     }
 
     /// Run-order names with aliases, for help text.
     pub fn help_list() -> String {
-        Self::ALL
-            .iter()
-            .map(|step| {
-                let aliases: Vec<&str> = Self::PARSE_TABLE
-                    .iter()
-                    .filter(|(alias, target)| target == step && *alias != step.name())
-                    .map(|(alias, _)| *alias)
-                    .collect();
-                if aliases.is_empty() {
-                    step.name().to_string()
-                } else {
-                    format!("{} ({})", step.name(), aliases.join(", "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        crate::names::help_list::<NetStep>()
     }
 
     /// The tests this step produces, i.e. the ones that record a Skipped
@@ -95,6 +78,18 @@ impl NetStep {
         }
     }
 }
+
+impl NameTable for NetStep {
+    const KIND: &'static str = "network step";
+    const VARIANTS: &'static [NetStep] = &NetStep::ALL;
+    const SPELLINGS: &'static [(&'static str, NetStep)] = NetStep::PARSE_TABLE;
+
+    fn name(self) -> &'static str {
+        NetStep::name(self)
+    }
+}
+
+crate::serde_via_name_table!(NetStep);
 
 /// A resolved, non-empty selection of network steps. Construct through
 /// `FleetConfig::resolve_net_steps`.

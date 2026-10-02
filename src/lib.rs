@@ -3,6 +3,7 @@ pub mod analysis;
 pub mod build_info;
 pub mod cli;
 pub mod config;
+pub mod names;
 pub mod nccl_env;
 pub mod net_steps;
 pub mod orchestrator;

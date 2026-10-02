@@ -156,8 +156,9 @@ pub enum AgentEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Serialized by canonical `name`; deserialized from any spelling in
+/// `PARSE_TABLE`, so config files accept exactly what `--phases` accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Phase {
     Inventory,
     CpuMem,
@@ -178,9 +179,9 @@ impl Phase {
         Phase::Overlap,
     ];
 
-    /// Every accepted `--phases` spelling: each phase's canonical `name`
-    /// plus short aliases. `parse` and the generated CLI help both read
-    /// this table, so neither can drift from the other.
+    /// Every accepted spelling (`--phases`, `[tests] phases`, the wire):
+    /// each phase's canonical `name` plus short aliases. Parsing, serde and
+    /// the generated CLI help all read this table (`crate::names`).
     pub const PARSE_TABLE: &'static [(&'static str, Phase)] = &[
         ("inventory", Phase::Inventory),
         ("cpu_mem", Phase::CpuMem),
@@ -203,34 +204,28 @@ impl Phase {
     }
 
     pub fn parse(s: &str) -> Option<Phase> {
-        Self::PARSE_TABLE
-            .iter()
-            .find(|(alias, _)| *alias == s)
-            .map(|(_, phase)| *phase)
+        crate::names::parse(s)
     }
 
     /// Run-order list of canonical names with their aliases, e.g.
     /// `inventory, cpu_mem (cpu), gpu, network (net), overlap`, for help
     /// text.
     pub fn help_list() -> String {
-        Self::ALL
-            .iter()
-            .map(|phase| {
-                let aliases: Vec<&str> = Self::PARSE_TABLE
-                    .iter()
-                    .filter(|(alias, target)| target == phase && *alias != phase.name())
-                    .map(|(alias, _)| *alias)
-                    .collect();
-                if aliases.is_empty() {
-                    phase.name().to_string()
-                } else {
-                    format!("{} ({})", phase.name(), aliases.join(", "))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        crate::names::help_list::<Phase>()
     }
 }
+
+impl crate::names::NameTable for Phase {
+    const KIND: &'static str = "phase";
+    const VARIANTS: &'static [Phase] = &Phase::ALL;
+    const SPELLINGS: &'static [(&'static str, Phase)] = Phase::PARSE_TABLE;
+
+    fn name(self) -> &'static str {
+        Phase::name(self)
+    }
+}
+
+crate::serde_via_name_table!(Phase);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

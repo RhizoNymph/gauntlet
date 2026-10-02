@@ -74,3 +74,21 @@ fn phases_help_lists_aliases() {
     assert!(help.contains("cpu"), "{help}");
     assert!(help.contains("net"), "{help}");
 }
+
+#[test]
+fn config_phases_accept_every_cli_spelling() {
+    for (spelling, phase) in Phase::PARSE_TABLE {
+        let config = gauntlet::config::FleetConfig::from_toml_str(
+            &format!("hosts = [\"a\"]\n[tests]\nphases = [\"{spelling}\"]\n"),
+            std::path::Path::new("test.toml"),
+        )
+        .unwrap_or_else(|error| panic!("{spelling}: {error}"));
+        assert_eq!(config.tests.phases, vec![*phase], "{spelling}");
+    }
+    // The wire spelling stays the canonical name.
+    let phase: Phase = serde_json::from_str("\"net\"").expect("alias decodes");
+    assert_eq!(
+        serde_json::to_string(&phase).expect("encode"),
+        "\"network\""
+    );
+}
