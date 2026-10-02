@@ -36,6 +36,15 @@ nccl_iters_per_size = 20
 # local GPU (single process, NVLink/PCIe), run before the pairwise and fleet
 # levels. Same sizes/iterations as the fleet sweep. Nodes with < 2 GPUs skip.
 nccl_intranode = true
+# World shape of the fleet sweep (needs >= 2 NCCL-capable hosts):
+#   "rank_per_gpu"  one rank per GPU everywhere (what training runs; the
+#                   ring mixes NVLink/PCIe with the fabric)
+#   "rank_per_node" one rank per host on GPU 0: every peer is on another
+#                   node, so all traffic crosses the NIC (pure inter-node)
+#   "per_rail"      rail r = GPU r of every host that has one, one rail at
+#                   a time, so each NIC/PCIe path gets its own number
+# The barrier probe and the fleet overlap step always run rank_per_gpu.
+nccl_world = "rank_per_gpu"
 # Barrier-skew microbenchmark: iterations of a tiny collective, timed
 # per rank to find hosts that consistently arrive late. 0 disables.
 barrier_iters = 2000

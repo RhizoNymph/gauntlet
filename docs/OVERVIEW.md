@@ -161,14 +161,33 @@ Features Index:
       rest of the world (remote kill), only the culprit is Failed, hosts
       it aborted are Skipped/warned; abandoned agents are always killed
       remotely; per-rank reports are accepted only from the owning host.
-    entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs]
+      World shapes (proto v11 / schema v13, tests.nccl_world): the fleet
+      sweep alone can run rank_per_node (one rank per host on GPU 0, every
+      peer on another node: pure inter-node) or per_rail (rail r = GPU r of
+      every host that has one, rails run sequentially), laid out by the
+      pure orchestrator/nccl/shape.rs into RankLayouts whose RankBlocks
+      carry the first local GPU; series land under nccl_inter_all_* and fit
+      nccl_{allreduce,allgather}_inter_node_<n>rank (keyed by world size).
+      Per-rail: a host to blame for one rail is excluded from later rails
+      and the barrier (orchestrator/nccl/rails.rs), and every host records
+      one outcome per test for the whole sweep. The sweep runs only on
+      worlds with >= 2 ranks, and >= 2 hosts while the intra-node sweep
+      runs (Skipped naming the failed condition). Every fleet sweep's lead
+      emits a fleet-level headline: bus_gib_per_sec_peak (rank-per-GPU,
+      rank-per-node), per rail _rail<r> plus the worst-rail
+      bus_gib_per_sec_peak_min_rail — aggregated across repeats and
+      threshold-checked but never MAD-compared (one value per run, no
+      fleet peers; the barrier fleet_span_* follow the same rule).
+      Barrier probe and fleet overlap always stay rank-per-GPU.
+    entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
     depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
   barrier_skew:
     description: >
       Straggler microbenchmark: ~2000 iterations of a tiny collective with
       per-rank timing. NCCL path (tiny all-reduce on the sweep's fleet
-      communicator, one rank per GPU; straggler = min local elapsed, the
+      communicator, one rank per GPU — its own rank-per-GPU job when the
+      sweep runs a NIC-forcing world shape; straggler = min local elapsed, the
       wait-time inversion; a host's ranks share one arrival and are
       tallied as one arrival group, results keyed host:gpuN) plus a
       pure-TCP star-barrier fallback for CPU-only fleets (straggler = max
@@ -243,7 +262,7 @@ Features Index:
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    entry_points: [report/mod.rs, report/history.rs, report/fleet_nccl.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
     doc: docs/features/reporting.md
   viewer:

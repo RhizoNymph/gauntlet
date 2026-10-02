@@ -7,9 +7,12 @@
 //! (grouped, once per local rank) and its timer (global rank 0's stream).
 //! Sweep timing comes from global rank 0 only: the host holding it times
 //! each size until *its* stream (local rank 0 = global rank 0) completes
-//! and emits the measurements; every other host runs silently. The
+//! and emits the measurements (per size as measured, then the fleet-level
+//! headline, `super::headline`); every other host runs silently. The
+//! workload's `SweepSeries` decides the test ids and headline name. The
 //! barrier probe times every local rank separately and reports one
-//! `NcclBarrierTimings` per rank.
+//! `NcclBarrierTimings` per rank; it rides the sweep, or runs alone
+//! (`run_barrier`) when the sweep ran in another world shape.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -20,12 +23,21 @@ use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::nccl::ReduceOp;
 
 use super::F32_BYTES;
+use super::headline::{fleet_headline, series_opener};
 use super::local::{LocalRanks, PreparedRanks};
 use crate::agent::EventSink;
 use crate::agent::sweep::{
     self, Collective, SweepCollectives, SweepLevel, SweepPlan, SweepStep, point_records, run_plan,
 };
-use crate::proto::{AgentEvent, BarrierSpec};
+use crate::proto::{AgentEvent, BarrierSpec, SweepSeries};
+
+/// One sweep workload's parameters, as the directive carried them.
+pub(super) struct SweepRun<'a> {
+    pub sizes: &'a [u64],
+    pub iters_per_size: u32,
+    pub barrier: Option<BarrierSpec>,
+    pub series: SweepSeries,
+}
 
 /// Untimed iterations before the barrier probe and the fleet overlap
 /// windows, so channel setup and algorithm selection stay out of the
@@ -89,6 +101,24 @@ impl SweepBuffers {
             max_elements,
         })
     }
+
+    /// Buffers for the barrier probe alone: exactly its payload, so the
+    /// probe never clamps below the configured barrier size.
+    pub(super) fn alloc_for_barrier(prepared: &PreparedRanks, spec: BarrierSpec) -> Result<Self> {
+        let max_elements = barrier_elements(spec, usize::MAX);
+        Ok(Self {
+            buffers: Buffers::alloc(&prepared.streams(), max_elements)?,
+            max_elements,
+        })
+    }
+}
+
+/// f32 elements of the barrier all-reduce: the payload rounded up to whole
+/// elements, at least one, at most what the buffers hold.
+fn barrier_elements(spec: BarrierSpec, max_elements: usize) -> usize {
+    (spec.bytes as usize)
+        .div_ceil(F32_BYTES)
+        .clamp(1, max_elements.max(1))
 }
 
 /// The message-size sweep (plus the optional barrier-skew probe).
@@ -96,13 +126,18 @@ pub(super) fn run_sweep(
     sink: &EventSink,
     ranks: &LocalRanks,
     buffers: SweepBuffers,
-    sizes: &[u64],
-    iters_per_size: u32,
-    barrier: Option<BarrierSpec>,
+    run: SweepRun<'_>,
 ) -> Result<()> {
+    let SweepRun {
+        sizes,
+        iters_per_size,
+        barrier,
+        series,
+    } = run;
     let emit_sweep = ranks.assignment().block().holds_lead();
     let world_size = ranks.world_size();
     let world = NonZeroU32::new(world_size).context("fleet world size must be at least 1")?;
+    let level = SweepLevel::fleet(series);
     let plan = SweepPlan::new(sizes, world);
     let SweepBuffers {
         mut buffers,
@@ -116,6 +151,12 @@ pub(super) fn run_sweep(
 
     // Only the host holding global rank 0 emits; every other host runs the
     // same collectives silently.
+    if emit_sweep {
+        for record in series_opener(series, world_size) {
+            sink.metric(record);
+        }
+    }
+    let mut points = Vec::with_capacity(plan.steps().len());
     run_plan(
         &mut RankBlockCollectives {
             ranks,
@@ -125,17 +166,36 @@ pub(super) fn run_sweep(
         iters_per_size,
         |point| {
             if emit_sweep {
-                for record in point_records(SweepLevel::Fleet, point, world_size) {
+                for record in point_records(level, point, world_size) {
                     sink.metric(record);
                 }
+                points.push(*point);
             }
         },
     )?;
+    for record in fleet_headline(&points, series, world_size) {
+        sink.metric(record);
+    }
 
     if let Some(spec) = barrier {
         barrier_probe(sink, ranks, &mut buffers, max_elements, spec)?;
     }
     Ok(())
+}
+
+/// The barrier-skew probe alone, on its own communicator
+/// (`NcclWorkload::BarrierOnly`).
+pub(super) fn run_barrier(
+    sink: &EventSink,
+    ranks: &LocalRanks,
+    buffers: SweepBuffers,
+    spec: BarrierSpec,
+) -> Result<()> {
+    let SweepBuffers {
+        mut buffers,
+        max_elements,
+    } = buffers;
+    barrier_probe(sink, ranks, &mut buffers, max_elements, spec)
 }
 
 /// Barrier-skew microbenchmark: many iterations of a tiny all-reduce, each
@@ -154,9 +214,7 @@ fn barrier_probe(
     max_elements: usize,
     spec: BarrierSpec,
 ) -> Result<()> {
-    let elements = (spec.bytes as usize)
-        .div_ceil(F32_BYTES)
-        .clamp(1, max_elements);
+    let elements = barrier_elements(spec, max_elements);
     // Algorithm/channel selection is per message size; keep setup for the
     // barrier size out of the first measured iterations.
     for _ in 0..WARMUP_ITERS {

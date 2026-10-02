@@ -135,7 +135,10 @@ straggler experiences.
    a rank → `RankSubject { host, scope }` locator. Fleet-level,
    attributed to the lead / coordinator host under `Scope::Node` like
    the sweep metrics: `fleet_span_p50_us`, `fleet_span_p90_us`,
-   `fleet_span_p99_us`, `fleet_span_max_us`.
+   `fleet_span_p99_us`, `fleet_span_max_us` (`proto::barrier_metric`).
+   One series per run, so (schema v13) they are aggregated across
+   repeats and threshold-checked but kept out of MAD and jitter
+   (`report::fleet_nccl::is_fleet_level`, the fleet-headline rule).
 5. **Analysis**: the per-rank metrics are one-value-per-host groups, so
    they flow through the ordinary MAD outlier machinery (under
    `nccl_barrier` a straggler is a *low*-side `p50_us` outlier, compared
@@ -172,6 +175,27 @@ straggler experiences.
 - `fleet_span_*` stays one node-scope series on the lead host.
 - The TCP barrier is unchanged (one rank per host, `analyze`).
 
+## World shapes (proto v11)
+
+The NCCL barrier always runs on the rank-per-GPU world, whatever
+`tests.nccl_world` says (docs/features/phase3_network.md "World
+shapes"). With `rank_per_gpu` it rides the sweep's communicator as
+before. With `rank_per_node` / `per_rail` the sweep's worlds hold one
+rank per host on one GPU, so the probe runs afterwards as its own
+rank-per-GPU job: `NcclWorkload::BarrierOnly(BarrierSpec)` (buffers sized to
+the barrier payload alone, `agent::nccl::sweep::run_barrier`), driven by
+the same `drive_fleet_nccl` and analyzed by the same
+`orchestrator::nccl::sweep::analyze_barrier`. Choice: keeping one barrier
+world means `nccl_barrier` subjects (`host:gpuN`) and straggler flags are
+comparable across runs with different sweep shapes, at the cost of one
+extra communicator init in the NIC-forcing shapes. The job is gated on
+`orchestrator::nccl::shape::MIN_HOSTS` (2) NCCL-capable hosts, the same
+constant the riding probe and the sweep gate use. Hosts the sweep
+excluded for failing a world (`rails::Exclusions`: to blame for a rail,
+or for the rank-per-node world) do not join it; each records Skipped for
+`nccl_barrier` with the exclusion reason. A sweep world that could not be
+laid out never skips the barrier: it runs on its own world regardless.
+
 ## Files
 - `src/analysis/skew.rs` — polarity-aware skew statistics: `analyze`
   (independent ranks), `analyze_grouped` (arrival groups),
@@ -183,16 +207,17 @@ straggler experiences.
   loop via per-rank tasks + watch channel, analysis), `join`,
   `TcpBarrierReport`. Localhost-tested.
 - `src/agent/nccl/sweep.rs` — barrier loop after the sweep over all
-  local ranks (gpu feature only); every host emits Hello + one
-  `NcclBarrierTimings` per local rank.
+  local ranks, or alone (`run_barrier`) (gpu feature only); every host
+  emits Hello + one `NcclBarrierTimings` per local rank.
 - `src/agent/nccl/completion.rs` — unbiased per-rank completion stamps.
 - `src/proto/mod.rs` — `BarrierSpec`, `NcclBarrierTimings`, new `TestId`s,
   `PROTO_VERSION` 5.
 - `src/orchestrator/mod.rs` — `tcp_barrier_sweep`.
-- `src/orchestrator/nccl/mod.rs` — barrier spec on the sweep workload,
-  timing interception in the fleet NCCL driver (with the sending host),
-  ownership check, grouped analysis + per-GPU attribution via the rank
-  layout.
+- `src/orchestrator/nccl/sweep.rs` — barrier spec on the sweep workload
+  (or `barrier_only` for the NIC-forcing shapes), timing interception in
+  the fleet NCCL driver (`Collected`, with the sending host), ownership
+  check, grouped analysis + per-GPU attribution via the rank layout
+  (`analyze_barrier`).
 - `src/orchestrator/nccl/ownership.rs` — `accept_owned` (rank
   ownership of per-rank reports).
 - `src/orchestrator/collect.rs` — stray `NcclBarrierTimings` ignored.
@@ -211,6 +236,8 @@ straggler experiences.
   once per host, so each group counts once in the fleet comparison.
 - Per-rank reports are only accepted from the host owning the rank;
   nothing is ever attributed to a GPU by a host that does not drive it.
+- The NCCL barrier world is always rank-per-GPU, independent of
+  `tests.nccl_world`.
 - Percentiles are nearest-rank over sorted samples, so p50 ≤ p90 ≤ p99 ≤
   max holds by construction (same convention as the peer latency probe).
 - Skew analysis needs ≥ 2 distinct ranks, ≥ 2 arrival groups, a group

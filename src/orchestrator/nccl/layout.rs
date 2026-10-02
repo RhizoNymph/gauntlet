@@ -1,5 +1,8 @@
-//! Rank layout of the fleet NCCL world: one rank per GPU, each host a
-//! contiguous block ordered by local GPU index, hosts in fleet order.
+//! Rank layout of a fleet NCCL world: each host a contiguous rank block on
+//! a contiguous run of its local GPUs (`GpuSpan`), hosts in fleet order.
+//! The rank-per-GPU world (`RankLayout::new`) spans every GPU from 0; the
+//! NIC-forcing world shapes (`super::shape`) give each host a one-GPU
+//! span.
 //!
 //! Pure: generic over the member type (the orchestrator lays out
 //! `Arc<HostSession>`s, tests lay out host names), so the member and its
@@ -8,6 +11,30 @@
 use thiserror::Error;
 
 use crate::proto::{RankAssignment, RankBlock, RankError};
+
+/// The local GPUs one member contributes to a world: `count` ranks on
+/// GPUs `first..first + count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GpuSpan {
+    pub first: u32,
+    pub count: u32,
+}
+
+impl GpuSpan {
+    /// Every GPU from 0: the rank-per-GPU span of a host with `count`
+    /// GPUs.
+    pub(crate) fn all(count: u32) -> Self {
+        Self { first: 0, count }
+    }
+
+    /// The single GPU `gpu`.
+    pub(crate) fn one(gpu: u32) -> Self {
+        Self {
+            first: gpu,
+            count: 1,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum LayoutError {
@@ -29,10 +56,11 @@ pub(crate) struct RankLocation<'a, M> {
     pub gpu: u32,
 }
 
-/// The fleet world: members with at least one GPU, each owning the rank
-/// block `base..base + gpus`, blocks contiguous and ascending in member
-/// order, `world_size` = total GPUs. Global rank 0 is local GPU 0 of the
-/// first member.
+/// A fleet world: members with a non-empty GPU span, each owning the rank
+/// block `base..base + span.count` on GPUs `span.first..`, blocks
+/// contiguous and ascending in member order, `world_size` = total ranks.
+/// Global rank 0 is the first member's first spanned GPU (local GPU 0 in
+/// the rank-per-GPU world).
 #[derive(Debug, Clone)]
 pub(crate) struct RankLayout<M> {
     members: Vec<(M, RankAssignment)>,
@@ -52,16 +80,30 @@ impl<M> RankLayout<M> {
     /// with zero GPUs are excluded (they have no rank to contribute); an
     /// all-zero or empty input yields an empty layout.
     pub(crate) fn new(members: impl IntoIterator<Item = (M, u32)>) -> Result<Self, LayoutError> {
+        Self::with_spans(
+            members
+                .into_iter()
+                .map(|(member, gpus)| (member, GpuSpan::all(gpus))),
+        )
+    }
+
+    /// Lay out `(member, span)` pairs in the given order: each member a
+    /// contiguous block of `span.count` ranks on GPUs `span.first..`.
+    /// Members with an empty span are excluded.
+    pub(crate) fn with_spans(
+        members: impl IntoIterator<Item = (M, GpuSpan)>,
+    ) -> Result<Self, LayoutError> {
         let mut blocks: Vec<(M, RankBlock)> = Vec::new();
         let mut next: u32 = 0;
-        for (member, gpus) in members {
-            if gpus == 0 {
+        for (member, span) in members {
+            if span.count == 0 {
                 continue;
             }
-            let block = RankBlock::new(next, gpus).map_err(|error| match error {
-                RankError::BlockOverflow { .. } => LayoutError::WorldTooLarge,
-                other => LayoutError::Rank(other),
-            })?;
+            let block =
+                RankBlock::on_gpus(next, span.count, span.first).map_err(|error| match error {
+                    RankError::BlockOverflow { .. } => LayoutError::WorldTooLarge,
+                    other => LayoutError::Rank(other),
+                })?;
             next = block.end();
             blocks.push((member, block));
         }
@@ -100,7 +142,7 @@ impl<M> RankLayout<M> {
             .partition_point(|(_, assignment)| assignment.block().base() <= rank)
             .checked_sub(1)?;
         let (member, assignment) = &self.members[index];
-        let gpu = assignment.block().local_index(rank)?;
+        let gpu = assignment.block().gpu(rank)?;
         Some(RankLocation {
             member,
             member_index: index,
@@ -132,6 +174,48 @@ mod tests {
                 (*host, assignment.block().base(), assignment.block().count())
             })
             .collect()
+    }
+
+    #[test]
+    fn spans_put_one_rank_per_host_on_the_chosen_gpu() {
+        let layout = RankLayout::with_spans([
+            ("n1", GpuSpan::one(3)),
+            ("n2", GpuSpan { first: 0, count: 0 }),
+            ("n3", GpuSpan::one(3)),
+        ])
+        .expect("layout");
+        assert_eq!(layout.world_size(), 2);
+        assert_eq!(blocks(&layout), [("n1", 0, 1), ("n3", 1, 1)]);
+        let n3 = layout.locate(1).expect("rank 1");
+        assert_eq!((*n3.member, n3.member_index, n3.gpu), ("n3", 1, 3));
+        assert_eq!(layout.locate(0).expect("rank 0").gpu, 3);
+        assert_eq!(layout.locate(2), None);
+        // The directive carries the GPU, so the agent opens the right one.
+        assert_eq!(layout.members()[1].1.block().first_gpu(), 3);
+    }
+
+    #[test]
+    fn rank_per_gpu_spans_match_the_plain_layout() {
+        let plain = layout(&[("n1", 2), ("n2", 3)]);
+        let spanned = RankLayout::with_spans([("n1", GpuSpan::all(2)), ("n2", GpuSpan::all(3))])
+            .expect("layout");
+        assert_eq!(blocks(&plain), blocks(&spanned));
+        assert_eq!(plain.world_size(), spanned.world_size());
+    }
+
+    #[test]
+    fn a_span_past_the_device_ordinal_space_is_rejected() {
+        let result = RankLayout::with_spans([(
+            "n1",
+            GpuSpan {
+                first: u32::MAX,
+                count: 2,
+            },
+        )]);
+        assert!(matches!(
+            result,
+            Err(LayoutError::Rank(RankError::GpuRangeOverflow { .. }))
+        ));
     }
 
     #[test]

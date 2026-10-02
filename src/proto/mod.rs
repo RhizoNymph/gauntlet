@@ -14,12 +14,14 @@ use thiserror::Error;
 
 mod occupancy;
 mod ranks;
+mod series;
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
     gpu_idle_outcomes,
 };
 pub use ranks::{RankAssignment, RankBlock, RankError};
+pub use series::SweepSeries;
 
 // v2: hot silent-data-corruption screens — `TestId::{CpuSdcHot,GpuGemmSdc}`
 // on the wire plus `CpuTaskSpec::sdc_hot_secs` / `GpuTaskSpec::sdc_check_secs`
@@ -53,7 +55,15 @@ pub use ranks::{RankAssignment, RankBlock, RankError};
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-pub const PROTO_VERSION: u32 = 10;
+// v11: NCCL world shapes — `RankBlock` carries the local GPU its ranks
+// start on (`first_gpu`, serde-defaulted to 0 and omitted when 0), the
+// sweep workload carries its `SweepSeries` (serde-defaulted to
+// rank-per-GPU), `NcclWorkload::BarrierOnly` runs the barrier probe alone,
+// and the `nccl_inter_all_reduce` / `nccl_inter_all_gather` test ids ride
+// the wire. The lead of every fleet sweep also emits a fleet-level
+// `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline,
+// and an inter-node lead opens its per-size series with a `ranks` record.
+pub const PROTO_VERSION: u32 = 11;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -232,6 +242,12 @@ pub enum TestId {
     NcclIntraAllReduce,
     /// Intra-node all-gather sweep, same communicator as the all-reduce.
     NcclIntraAllGather,
+    /// Pure inter-node all-reduce sweep (`tests.nccl_world` =
+    /// `rank_per_node` or `per_rail`): one rank per host, so every peer is
+    /// on another node and all collective traffic crosses the NIC.
+    NcclInterAllReduce,
+    /// Pure inter-node all-gather sweep, same world as the all-reduce.
+    NcclInterAllGather,
     /// Barrier-skew microbenchmark over the NCCL group (tiny all-reduce).
     NcclBarrier,
     /// Barrier-skew microbenchmark over a TCP star (CPU-only fallback).
@@ -590,6 +606,19 @@ pub struct NcclSweepSpec {
     pub iters_per_size: u32,
 }
 
+/// Barrier-skew metric names shared by the emitter
+/// (`orchestrator::barrier`) and the report's fleet-level rule.
+pub mod barrier_metric {
+    /// Prefix of the fleet-level barrier-span distribution
+    /// (`fleet_span_{p50,p90,p99,max}_us`): one series per run, attributed
+    /// to the lead host, never MAD-compared (`report::fleet_nccl`).
+    pub const FLEET_SPAN_PREFIX: &str = "fleet_span";
+    pub const FLEET_SPAN_P50_US: &str = "fleet_span_p50_us";
+    pub const FLEET_SPAN_P90_US: &str = "fleet_span_p90_us";
+    pub const FLEET_SPAN_P99_US: &str = "fleet_span_p99_us";
+    pub const FLEET_SPAN_MAX_US: &str = "fleet_span_max_us";
+}
+
 /// Metric names shared by the NCCL sweep emitters (fleet and intra-node)
 /// and the report's link-fit extraction, so a renamed string cannot
 /// silently break the join.
@@ -600,13 +629,45 @@ pub mod nccl_metric {
     pub const MSG_BYTES: &str = "msg_bytes";
     /// Bus bandwidth at one message size.
     pub const BUS: &str = "bus_gib_per_sec";
-    /// Intra-node only: prefix of the per-node headline, the best bus
-    /// bandwidth across the sweep's sizes. Always emitted keyed by
-    /// communicator size (`bus_peak`), never bare.
+    /// Prefix of every sweep headline: the best bus bandwidth across the
+    /// sweep's sizes. The intra-node headline is always keyed by
+    /// communicator size (`bus_peak`); the fleet-level headlines are
+    /// `BUS_PEAK` (bare), `bus_peak_rail` and `BUS_PEAK_MIN_RAIL`.
     pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
-    /// Intra-node only: ranks (local GPUs) in the communicator; keys the
-    /// intra-node calibration link class.
+    /// Fleet-level headline of the rank-per-GPU and rank-per-node sweeps
+    /// (proto v11): one value per run, attributed to the world's lead
+    /// host at node scope. Not fleet-comparable within a run (it has no
+    /// peers); the report aggregates it across repeats but keeps it out
+    /// of MAD.
+    pub const BUS_PEAK: &str = BUS_PEAK_PREFIX;
+    /// The per-rail world's overall headline: peak per rail, **worst rail
+    /// overall** (min across rails of `bus_peak_rail`). Its own name, so
+    /// it never shares a metric group with rank-per-node's `BUS_PEAK`
+    /// (GPU 0's NIC only): the two are different quantities.
+    pub const BUS_PEAK_MIN_RAIL: &str = "bus_gib_per_sec_peak_min_rail";
+    /// Ranks in the communicator. Intra-node: local GPUs, keys the
+    /// intra-node link class (emitted after the series). Inter-node: the
+    /// world's rank count (= hosts), emitted by the lead *before* its
+    /// per-size series so the report can key every series — several rails
+    /// per lead, per repeat — by its own world size.
     pub const RANKS: &str = "ranks";
+
+    /// Rail suffix of the per-rail headlines: `rail<r>`.
+    pub fn rail_suffix(rail: u32) -> String {
+        format!("rail{rail}")
+    }
+
+    /// World-size suffix of the inter-node link classes: `<n>rank`.
+    pub fn rank_class_suffix(ranks: u32) -> String {
+        format!("{ranks}rank")
+    }
+
+    /// Per-rail inter-node headline: `bus_gib_per_sec_peak_rail<r>`, the
+    /// best bus bandwidth of rail `r`'s world (GPU `r` of every host that
+    /// has one), attributed to that rail's lead host.
+    pub fn bus_peak_rail(rail: u32) -> String {
+        format!("{BUS_PEAK_PREFIX}_{}", rail_suffix(rail))
+    }
 
     /// Topology suffix shared by the intra-node headline and the intra-node
     /// calibration link classes: `<n>gpu`.
@@ -741,11 +802,20 @@ pub enum NcclWorkload {
         iters_per_size: u32,
         #[serde(default)]
         barrier: Option<BarrierSpec>,
+        /// Which world shape this sweep's world was laid out in, and so
+        /// which test ids and headline name the lead emits under (proto
+        /// v11; absent = rank-per-GPU).
+        #[serde(default)]
+        series: SweepSeries,
     },
     /// Fleet overlap protocol: isolated all-reduce baseline, then the same
     /// all-reduce under GEMM load on every local GPU; every rank reports
     /// an `OverlapFleetReport`.
     Overlap(OverlapSpec),
+    /// The barrier-skew microbenchmark alone (proto v11): run on the
+    /// rank-per-GPU world when the sweep itself ran in a different world
+    /// shape, so barrier subjects stay `host:gpuN` whatever the shape.
+    BarrierOnly(BarrierSpec),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -885,6 +955,33 @@ mod tests {
     }
 
     #[test]
+    fn sweep_workloads_default_to_the_rank_per_gpu_series() {
+        // A pre-v11 sweep workload has no series: it is the rank-per-GPU
+        // sweep.
+        let json = r#"{"kind":"sweep","sizes":[1024],"iters_per_size":20}"#;
+        let workload: NcclWorkload = serde_json::from_str(json).expect("decode");
+        let NcclWorkload::Sweep { series, .. } = workload else {
+            panic!("expected a sweep");
+        };
+        assert_eq!(series, SweepSeries::RankPerGpu);
+    }
+
+    #[test]
+    fn barrier_only_workloads_round_trip() {
+        let directive = NcclDirective::Lead {
+            assignment: assignment(0, 4, 8),
+            workload: NcclWorkload::BarrierOnly(BarrierSpec {
+                iters: 2000,
+                bytes: 8,
+            }),
+        };
+        let json = serde_json::to_string(&directive).expect("serialize");
+        assert!(json.contains(r#""kind":"barrier_only""#), "{json}");
+        let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, directive);
+    }
+
+    #[test]
     fn barrier_specs_ride_the_sweep_workload() {
         let directive = NcclDirective::Participate {
             unique_id_b64: "abc".into(),
@@ -896,6 +993,7 @@ mod tests {
                     iters: 2000,
                     bytes: 8,
                 }),
+                series: SweepSeries::RankPerGpu,
             },
         };
         let json = serde_json::to_string(&directive).expect("serialize");
