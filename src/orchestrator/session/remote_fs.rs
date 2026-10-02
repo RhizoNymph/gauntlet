@@ -102,6 +102,42 @@ pub(super) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
     )
 }
 
+/// Temp files older than this are leftovers of killed uploads; younger ones
+/// may belong to an upload in flight (on a shared directory, from another
+/// node) and are never touched.
+pub(super) const STALE_STAGING_MINUTES: u32 = 15;
+
+/// Remove `<dest>.tmp.*` siblings not modified for `STALE_STAGING_MINUTES`
+/// (regular files only). Each killed upload leaves a full-size binary, often
+/// on tmpfs, so they are swept before every new staging. `-mmin` is not
+/// POSIX but GNU, BSD and busybox find all support it.
+pub(super) fn sweep_stale_staging_command(dest: &str) -> String {
+    let (dir, base) = match dest.rsplit_once('/') {
+        Some(("", base)) => ("/", base),
+        Some((dir, base)) => (dir, base),
+        None => (".", dest),
+    };
+    let pattern = format!("{}.tmp.*", glob_escape(base));
+    format!(
+        "find {dir} -maxdepth 1 -type f -name {pattern} -mmin +{STALE_STAGING_MINUTES} \
+         -exec rm -f {{}} +",
+        dir = single_quote(dir),
+        pattern = single_quote(&pattern),
+    )
+}
+
+/// Escape glob metacharacters so `find -name` matches `text` literally.
+fn glob_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +271,113 @@ mod tests {
         assert!(output.stdout.is_empty(), "no path may be reported");
         let stderr = String::from_utf8(output.stderr).expect("utf8");
         assert!(stderr.contains("is a symlink not owned by"), "{stderr}");
+    }
+
+    /// Set a file's mtime `minutes` into the past with the system `touch`.
+    fn age(path: &std::path::Path, minutes: u64) {
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+            - minutes * 60;
+        let status = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{epoch}"))
+            .arg(path)
+            .status()
+            .expect("touch");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn stale_staging_files_are_swept_and_fresh_ones_kept() {
+        let dir = scratch("sweep");
+        let dest = dir.join("gauntlet-agent");
+        std::fs::write(&dest, b"installed").expect("dest");
+        let dest = dest.to_str().expect("utf8").to_string();
+
+        let stale = staging_path(&dest, 1);
+        let fresh = staging_path(&dest, 2);
+        let barely = staging_path(&dest, 3);
+        let other = dir.join("other.tmp.0000000000000001");
+        for path in [&stale, &fresh, &barely] {
+            std::fs::write(path, b"partial").expect("stage");
+        }
+        std::fs::write(&other, b"unrelated").expect("other");
+        age(std::path::Path::new(&stale), 60);
+        age(
+            std::path::Path::new(&barely),
+            u64::from(STALE_STAGING_MINUTES) - 5,
+        );
+        age(&other, 60);
+        age(std::path::Path::new(&dest), 60);
+
+        let output = sh(&sweep_stale_staging_command(&dest), &dir);
+        assert!(output.status.success(), "{output:?}");
+        assert!(!std::path::Path::new(&stale).exists(), "stale leftover");
+        assert!(std::path::Path::new(&fresh).exists(), "upload in flight");
+        assert!(std::path::Path::new(&barely).exists(), "under the age");
+        assert!(other.exists(), "another file's staging");
+        assert!(std::path::Path::new(&dest).exists(), "the installed file");
+        // Idempotent and quiet on a clean directory.
+        assert!(
+            sh(&sweep_stale_staging_command(&dest), &dir)
+                .status
+                .success()
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn sweep_patterns_match_the_destination_name_literally() {
+        let dir = scratch("glob");
+        let dest = dir.join("a*b").to_str().expect("utf8").to_string();
+        let lookalike = dir.join("aXb.tmp.0000000000000001");
+        let own = staging_path(&dest, 1);
+        std::fs::write(&lookalike, b"x").expect("lookalike");
+        std::fs::write(&own, b"x").expect("own");
+        age(&lookalike, 60);
+        age(std::path::Path::new(&own), 60);
+        let output = sh(&sweep_stale_staging_command(&dest), &dir);
+        assert!(output.status.success(), "{output:?}");
+        assert!(lookalike.exists(), "glob must not match other names");
+        assert!(!std::path::Path::new(&own).exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn sweep_never_follows_or_removes_directories() {
+        let dir = scratch("sweepdir");
+        let dest = dir
+            .join("gauntlet-agent")
+            .to_str()
+            .expect("utf8")
+            .to_string();
+        let subdir = staging_path(&dest, 9);
+        std::fs::create_dir_all(&subdir).expect("dir named like staging");
+        age(std::path::Path::new(&subdir), 60);
+        assert!(
+            sh(&sweep_stale_staging_command(&dest), &dir)
+                .status
+                .success()
+        );
+        assert!(std::path::Path::new(&subdir).is_dir());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_scratch_dir_owned_by_someone_else_is_refused() {
+        // `/` is owned by root; unless the tests run as root, `[ -O ]`
+        // fails and the script must refuse instead of printing a path.
+        if login_name() == "root" {
+            return;
+        }
+        let dir = RemoteDir::parse("/").expect("valid");
+        let output = sh(&remote_dir_script(&dir), &std::env::temp_dir());
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("utf8");
+        assert!(stderr.contains("not owned by"), "{stderr}");
     }
 
     #[test]

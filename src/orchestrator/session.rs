@@ -21,7 +21,10 @@ use crate::remote_dir::RemoteDir;
 
 mod remote_fs;
 
-use self::remote_fs::{FileMode, install_command, remote_dir_script, staging_path, upload_nonce};
+use self::remote_fs::{
+    FileMode, install_command, remote_dir_script, staging_path, sweep_stale_staging_command,
+    upload_nonce,
+};
 
 /// Captured result of a remote command that was allowed to fail.
 #[derive(Debug, Clone)]
@@ -190,7 +193,10 @@ impl HostSession {
     /// `remote_dir`) never write into the same temp file: each renames a
     /// complete file, the last rename wins. A failed upload removes its temp
     /// file (best effort); a killed one leaves only an unreferenced
-    /// `*.tmp.*` sibling, never a torn destination.
+    /// `*.tmp.*` sibling, never a torn destination, and the next upload
+    /// sweeps such siblings once they are older than
+    /// `remote_fs::STALE_STAGING_MINUTES` (younger ones may be another
+    /// node's upload in flight).
     pub async fn upload(&self, local: &Path, remote_path: &str, executable: bool) -> Result<()> {
         let bytes = tokio::fs::read(local)
             .await
@@ -203,6 +209,18 @@ impl HostSession {
         self.exec(&format!("mkdir -p {}", single_quote(parent)))
             .await
             .with_context(|| format!("creating remote directory {parent}"))?;
+
+        // Leftovers of killed uploads; best effort, never fails the upload.
+        match self
+            .exec_capture(&sweep_stale_staging_command(remote_path))
+            .await
+        {
+            Ok(output) if output.success() => {}
+            Ok(output) => {
+                debug!(host = %self.host.addr, detail = %output.detail(), "stale staging sweep failed")
+            }
+            Err(error) => debug!(host = %self.host.addr, %error, "stale staging sweep failed"),
+        }
 
         let staging = staging_path(remote_path, upload_nonce());
         let mode = if executable {
