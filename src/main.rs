@@ -1,8 +1,24 @@
+use std::process::ExitCode;
+
 use anyhow::Result;
 use clap::Parser;
 use gauntlet::cli::{AgentCommand, Cli, Command};
+use gauntlet::report::EXIT_ERROR;
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // Not a verdict: gauntlet itself could not do its job (bad
+            // config, no usable host, I/O). A distinct code keeps this from
+            // reading as exit 1 ("outliers only").
+            eprintln!("Error: {error:?}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     gauntlet::init_tracing(cli.verbose);
     if matches!(cli.command, Command::Agent(_)) {

@@ -73,7 +73,12 @@ use crate::proto::{
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
 // is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
-pub const SCHEMA_VERSION: u32 = 12;
+// v13: run-level `verdict` — "clean" / "outliers" / "host_failures" /
+// "failures", the classification behind the exit code (0 / 1 / 2 / 3;
+// failed tests and counter findings no longer share exit 1 with
+// statistical outliers). Serde-defaulted: pre-v13 documents decode with it
+// null, and `report::verdict` classifies them.
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -118,6 +123,12 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// `verdict(self)` as `build` computed it: the same classification the
+    /// exit code reports, so consumers never parse the exit status.
+    /// `None` = not recorded (pre-v13 documents, via the serde default);
+    /// call `verdict` to classify those.
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -146,7 +157,7 @@ pub struct FleetAnalysis {
     /// correctness screens (isolated and hot), grouped by test display
     /// name; entries are "host[:scope]: reason". Hard failures — these are
     /// absolute findings on a node, never fleet-relative outliers, and any
-    /// entry makes the verdict at least `Stragglers`.
+    /// entry makes the verdict at least `Failures`.
     #[serde(default)]
     pub sdc_failures: BTreeMap<String, Vec<String>>,
     /// Error counters that incremented across the load phases, per host.
@@ -218,24 +229,77 @@ pub struct NodeRoofline {
     pub disk_write_gib_per_sec: Option<f64>,
 }
 
-/// Exit code contract for `gauntlet run`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Overall outcome of a run: recorded in `RunResults.verdict` and mapped
+/// one-to-one onto the `gauntlet run` exit code.
+///
+/// Precedence when several apply: `HostFailures` > `Failures` >
+/// `Outliers` > `Clean` (see `verdict` for how each input is classified).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
-    /// 0: all hosts completed, no outliers, no violations.
+    /// Exit 0: every host completed; no failed test, no hard finding, no
+    /// statistical finding.
     Clean,
-    /// 1: completed with failed tests, outliers, or threshold violations.
-    Stragglers,
-    /// 2: at least one host failed to complete.
+    /// Exit 1: only statistical / soft findings — MAD outliers, absolute
+    /// threshold violations, barrier stragglers. The fleet worked; some of
+    /// it is slower than the rest (or than the configured floor).
+    Outliers,
+    /// Exit 2: at least one host failed to complete (unreachable, deploy
+    /// failure, agent Fatal, transport error, phase timeout). Its results
+    /// are incomplete, so nothing else about the run can be trusted as a
+    /// full picture.
     HostFailures,
+    /// Exit 3: hard evidence of a broken node — any Failed test outcome
+    /// (correctness and SDC screens, gpu_idle, NCCL failures, ...) or an
+    /// error counter that incremented under load.
+    Failures,
 }
 
+/// Exit code of any `gauntlet` invocation that failed with an error rather
+/// than producing a verdict (bad config, no usable host, I/O). Kept apart
+/// from the verdict codes 0-3 so "outliers only" (1) never means "crashed".
+pub const EXIT_ERROR: u8 = 4;
+
 impl Verdict {
-    pub fn exit_code(self) -> i32 {
+    pub const ALL: [Verdict; 4] = [
+        Verdict::Clean,
+        Verdict::Outliers,
+        Verdict::HostFailures,
+        Verdict::Failures,
+    ];
+
+    pub const fn exit_code(self) -> i32 {
         match self {
             Verdict::Clean => 0,
-            Verdict::Stragglers => 1,
+            Verdict::Outliers => 1,
             Verdict::HostFailures => 2,
+            Verdict::Failures => 3,
         }
+    }
+
+    /// Inverse of `exit_code`, for callers that only see the process
+    /// status (the viewer's launched run). Any other code is not a verdict
+    /// (a crash, a config error).
+    pub fn from_exit_code(code: i32) -> Option<Verdict> {
+        Self::ALL
+            .into_iter()
+            .find(|verdict| verdict.exit_code() == code)
+    }
+
+    /// Human label for the terminal header and the viewer.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Verdict::Clean => "clean",
+            Verdict::Outliers => "outliers",
+            Verdict::HostFailures => "host failures",
+            Verdict::Failures => "test failures",
+        }
+    }
+}
+
+impl std::fmt::Display for Verdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -413,7 +477,7 @@ pub fn build(
         run_suffix(finished_epoch_secs, &observations)
     );
 
-    RunResults {
+    let mut results = RunResults {
         schema_version: SCHEMA_VERSION,
         run_id,
         started_epoch_secs,
@@ -424,10 +488,13 @@ pub fn build(
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
         // than guessed.
         nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
+        verdict: None,
         fleet,
         aggregates,
         calibration,
-    }
+    };
+    results.verdict = Some(verdict(&results));
+    results
 }
 
 /// Reduce raw (possibly repeated) metric records into per-subject
@@ -646,45 +713,67 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
     derived
 }
 
+/// Classify a results document. Every input and its class:
+///
+/// | input                          | class         |
+/// |--------------------------------|---------------|
+/// | `fleet.failed_hosts`           | HostFailures  |
+/// | any `Failed` test outcome      | Failures      |
+/// | `fleet.sdc_failures`           | Failures      |
+/// | `fleet.counter_findings`       | Failures      |
+/// | `fleet.outliers` (MAD)         | Outliers      |
+/// | `fleet.threshold_violations`   | Outliers      |
+/// | `fleet.barrier_stragglers`     | Outliers      |
+/// | `fleet.jitter_outliers`        | informational |
+/// | `fleet.consistency`            | informational |
+/// | `Skipped` outcomes             | informational |
+///
+/// Failed outcomes cover every hard per-test verdict an agent or the
+/// orchestrator records: correctness and SDC screens, `gpu_idle`, NCCL
+/// sweep / overlap failures attributed to a host. `sdc_failures` is derived
+/// from those outcomes and checked too, so a document is classified the
+/// same way from either view. Absolute thresholds count as soft: a value
+/// under a floor is a performance finding, not proof of a fault.
 pub fn verdict(results: &RunResults) -> Verdict {
     if !results.fleet.failed_hosts.is_empty() {
         return Verdict::HostFailures;
     }
-    let has_failed_tests = results.hosts.values().any(|obs| {
+    if has_hard_evidence(results) {
+        return Verdict::Failures;
+    }
+    if has_statistical_findings(&results.fleet) {
+        return Verdict::Outliers;
+    }
+    Verdict::Clean
+}
+
+/// Failed outcomes, SDC findings, counter increments.
+fn has_hard_evidence(results: &RunResults) -> bool {
+    let failed_outcome = results.hosts.values().any(|obs| {
         obs.outcomes
             .iter()
-            .any(|(_, _, outcome)| matches!(outcome, crate::proto::TestOutcome::Failed { .. }))
+            .any(|(_, _, outcome)| matches!(outcome, TestOutcome::Failed { .. }))
     });
-    let has_outliers = results
-        .fleet
-        .outliers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_violations = results
-        .fleet
-        .threshold_violations
-        .values()
-        .any(|violators| !violators.is_empty());
-    let has_barrier_stragglers = results
-        .fleet
-        .barrier_stragglers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_counter_findings = results
-        .fleet
-        .counter_findings
-        .values()
-        .any(|findings| !findings.is_empty());
-    if has_failed_tests
-        || has_outliers
-        || has_violations
-        || has_barrier_stragglers
-        || has_counter_findings
-    {
-        Verdict::Stragglers
-    } else {
-        Verdict::Clean
-    }
+    let fleet = &results.fleet;
+    failed_outcome
+        || fleet.sdc_failures.values().any(|found| !found.is_empty())
+        || fleet
+            .counter_findings
+            .values()
+            .any(|found| !found.is_empty())
+}
+
+/// MAD outliers, threshold violations, barrier stragglers.
+fn has_statistical_findings(fleet: &FleetAnalysis) -> bool {
+    fleet.outliers.values().any(|flagged| !flagged.is_empty())
+        || fleet
+            .threshold_violations
+            .values()
+            .any(|violators| !violators.is_empty())
+        || fleet
+            .barrier_stragglers
+            .values()
+            .any(|flagged| !flagged.is_empty())
 }
 
 /// Error counters that went up under load, per host. Zero deltas stay in
@@ -1049,15 +1138,17 @@ fn id_suffix<'a>(seed_epoch_secs: u64, hosts: impl ExactSizeIterator<Item = &'a 
 /// Render the human table (per-host summary, outliers section, consistency
 /// section, calibration digest) to the given writer.
 pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    let run_verdict = verdict(results);
     writeln!(
         out,
-        "gauntlet run {} ({} hosts, {}s wall, verdict: {:?})",
+        "gauntlet run {} ({} hosts, {}s wall, verdict: {} (exit {}))",
         results.run_id,
         results.hosts.len(),
         results
             .finished_epoch_secs
             .saturating_sub(results.started_epoch_secs),
-        verdict(results),
+        run_verdict,
+        run_verdict.exit_code(),
     )?;
     writeln!(
         out,
@@ -1683,7 +1774,7 @@ mod tests {
         assert_eq!(flagged[0].key, "n2");
         assert!((flagged[0].slowest_frac - 0.92).abs() < 1e-12);
         assert_eq!(flagged[0].considered_iters, 1800.0);
-        assert_eq!(verdict(&results), Verdict::Stragglers);
+        assert_eq!(verdict(&results), Verdict::Outliers);
     }
 
     #[test]

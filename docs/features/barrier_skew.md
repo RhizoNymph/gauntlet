@@ -146,7 +146,7 @@ straggler experiences.
    `fleet.barrier_stragglers` when its median `slowest_frac` exceeds
    `thresholds.barrier_slowest_frac` (default 0.5) *and* at least
    `skew::MIN_TALLY_ITERS` (100) iterations cleared the margin. Flags
-   count toward the `Stragglers` verdict and render as their own table
+   count toward the `Outliers` verdict and render as their own table
    section.
 
 ## Wire / protocol changes (proto v5, schema v6)

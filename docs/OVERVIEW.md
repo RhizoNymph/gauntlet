@@ -42,8 +42,10 @@ Overview:
       for quick runs.
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
-      MADs, applies optional absolute thresholds, renders table + JSON, sets
-      exit code. Runs persisted for diffing against last known-good. With
+      MADs, applies optional absolute thresholds, renders table + JSON,
+      classifies a typed Verdict (clean / outliers / host_failures /
+      failures -> exit 0 / 1 / 2 / 3) recorded in the JSON. Runs persisted for
+      diffing against last known-good. With
       --repeat N, metrics aggregate into per-subject distribution moments
       (median/MAD/min/max/mean/stddev); outliers flag on medians and
       high run-to-run spread flags as jitter. A run in
@@ -96,7 +98,7 @@ Features Index:
       orchestrator derives one TestId::GpuIdle outcome per GPU as the
       inventory arrives (proto::assess_gpu_idle against
       thresholds.gpu_idle_max_used_mib, default 1024): Failed names each
-      process, pid and MiB and makes the verdict Stragglers; unknown is
+      process, pid and MiB and makes the verdict Failures; unknown is
       Skipped. Bootstrap shows the same policy as its gpu_idle column
       (warn); the report adds a "gpus in use" section. Detection only: no
       phase is auto-skipped.
@@ -233,7 +235,7 @@ Features Index:
       port and NVMe error counters before the first load phase (baseline
       held by the orchestrator) and again after the last repeat, diffs on
       the agent, and emits per-node CounterDeltas. Any positive increment
-      is a per-host finding (verdict Stragglers) rendered in its own table
+      is a per-host finding (verdict Failures) rendered in its own table
       section; full deltas (zeros included) land in the JSON. Collection
       is best effort — nodes without a subsystem contribute nothing.
     entry_points: [agent/counters.rs, orchestrator/mod.rs]
@@ -242,7 +244,9 @@ Features Index:
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
-      overlay, run history, terminal table, exit codes. Live runs publish
+      overlay, run history, terminal table, typed verdict + exit codes
+      (schema v13: hard failures exit 3, outliers only exit 1, host
+      failures exit 2). Live runs publish
       periodic partial snapshots (runs/<run_id>.partial.json, written via
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.

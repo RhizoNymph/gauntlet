@@ -24,10 +24,8 @@ started, finished)`:
    the dlopen probe results on GPU-bearing hosts.
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
-6. `verdict()`: HostFailures if any host has errors; else Stragglers if
-   any test outcome is Failed (including `gpu_idle`) or any
-   outliers/violations exist; else Clean.
-   Exit codes 2/1/0.
+6. `verdict()` classifies the document (see "Verdict and exit codes");
+   `build` records it as `RunResults.verdict`.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
 over a timestamp and the host set (deterministic, no rand dep). Two seeds
@@ -198,6 +196,8 @@ tail progress:
 
 ## Invariants
 - SCHEMA_VERSION bumps on any field rename/removal in `RunResults`.
+- `RunResults.verdict` (when present) equals `report::verdict` of the same
+  document, and the process exit code is its `exit_code()`.
 - A run's `run_id` never changes once the run has started: the partial
   snapshots and the final document are the same file stem.
 - `list` and `list_live` partition the visible documents in a run
@@ -213,15 +213,60 @@ tail progress:
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
 
+## Verdict and exit codes (schema v13)
+
+`report::Verdict` is a typed enum, serialized snake_case in
+`RunResults.verdict` (serde-defaulted `Option`: pre-v13 documents decode
+with `None`, and `report::verdict` classifies them) and mapped one-to-one
+onto the `gauntlet run` exit code, so consumers never parse the exit
+status:
+
+| verdict          | exit | meaning                                              |
+|------------------|------|------------------------------------------------------|
+| `clean`          | 0    | every host completed, no findings                    |
+| `outliers`       | 1    | statistical / soft findings only                     |
+| `host_failures`  | 2    | at least one host failed to complete                 |
+| `failures`       | 3    | hard evidence: failed tests or counter increments    |
+
+Precedence when several apply: `host_failures` > `failures` >
+`outliers` > `clean` (an incomplete host makes the rest of the run
+untrustworthy as a full picture, so it dominates; 2 keeps its pre-v13
+meaning). Any other exit code (4 below, 101 for a panic) is not a
+verdict; `Verdict::from_exit_code` returns `None` for it. An
+invocation that fails with an error instead of producing a verdict (bad
+config, no usable host, I/O) exits `report::EXIT_ERROR` = 4 (`main`), so
+exit 1 always means "outliers only", never "gauntlet crashed".
+
+Classification of every input to `verdict()`:
+
+| input                                   | class          |
+|-----------------------------------------|----------------|
+| `fleet.failed_hosts` (Fatal, transport, timeout, deploy) | host_failures |
+| any `Failed` outcome (correctness, SDC screens, `gpu_idle`, NCCL failures attributed to a host, intra-node failures, ...) | failures |
+| `fleet.sdc_failures` (derived from Failed outcomes; checked directly too) | failures |
+| `fleet.counter_findings` (error counters that went up under load) | failures |
+| `fleet.outliers` (MAD)                  | outliers       |
+| `fleet.threshold_violations` (absolute bounds) | outliers |
+| `fleet.barrier_stragglers`              | outliers       |
+| `fleet.jitter_outliers`                 | informational  |
+| `fleet.consistency`                     | informational  |
+| `Skipped` outcomes                      | informational  |
+
+Absolute thresholds count as soft: a value under a configured floor is a
+performance finding, not proof that a component is broken. The terminal
+header prints `verdict: <label> (exit <code>)` (labels: clean, outliers,
+host failures, test failures); the viewer colors outliers warn and both
+failure classes bad.
+
 ## Error-counter findings (schema v4)
 
 `hosts.*.counter_deltas` carries the full per-node error-counter delta
 list across the load phases (zeros and resets included);
 `fleet.counter_findings` keeps only counters with `after > before`, keyed
-by host. Any finding makes the verdict at least Stragglers. `render_table`
-adds an "error-counter deltas (across load phases)" section (host, domain,
-device, counter, before, after, +increment), omitted entirely when there
-are no findings. See docs/features/counter_deltas.md for collection and
+by host. Any finding makes the verdict at least `failures` (exit 3).
+`render_table` adds an "error-counter deltas (across load phases)"
+section (host, domain, device, counter, before, after, +increment),
+omitted entirely when there are no findings. See docs/features/counter_deltas.md for collection and
 scheduling.
 
 ## Repeats and distribution moments (schema v2)
@@ -250,7 +295,8 @@ processes other than the reporting agent; stale gauntlet agents marked),
 and each host gains one `gpu_idle` outcome per GPU, derived
 orchestrator-side from the snapshot against
 `thresholds.gpu_idle_max_used_mib` (docs/features/phase0_inventory.md).
-A Failed `gpu_idle` feeds the verdict like any failed test (Stragglers).
+A Failed `gpu_idle` feeds the verdict like any failed test (`failures`
+since v13; `Stragglers` before).
 Both additions are serde-defaulted: a v10 document decodes with occupancy
 unknown and simply has no `gpu_idle` outcomes.
 
@@ -296,7 +342,7 @@ ordinary MAD machinery, plus a dedicated rule:
 (group -> flagged hosts) when a host's median `slowest_frac` exceeds
 `thresholds.barrier_slowest_frac` and its median `slowest_considered` is
 at least `analysis::skew::MIN_TALLY_ITERS`. Barrier straggler flags count
-toward the `Stragglers` verdict and render as the "barrier stragglers"
+toward the `Outliers` verdict and render as the "barrier stragglers"
 table section. The field is serde-defaulted, so pre-v6 documents load
 with it empty.
 
@@ -354,7 +400,7 @@ field's shape:
   (docs/features/viewer.md).
 - `hosts.*.inventory` gains `cuda_visible_gpus`, and a mismatch with the
   nvidia-smi GPU count is a Failed `inventory` outcome on that host
-  (verdict at least Stragglers).
+  (verdict at least Outliers).
 - Fleet NCCL failures are attributed (docs/features/phase3_network.md):
   `fleet.failed_hosts` lists only the host that caused a sweep failure;
   hosts it aborted are warnings, not host failures.
