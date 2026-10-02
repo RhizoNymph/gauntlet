@@ -16,7 +16,9 @@ fn clean() -> RunResults {
         .into_iter()
         .map(|host| (host.to_string(), HostObservations::default()))
         .collect();
-    report::build(&config, observations, 1, 2)
+    let mut results = report::build(&config, observations, 1, 2);
+    results.finalize();
+    results
 }
 
 fn outlier() -> Outlier {
@@ -209,7 +211,7 @@ fn precedence_follows_the_exit_code() {
 }
 
 #[test]
-fn build_records_the_verdict_it_would_exit_with() {
+fn finalize_records_the_verdict_it_would_exit_with() {
     let config: FleetConfig = toml::from_str(r#"hosts = ["n1", "n2"]"#).expect("config");
     let mut observations: BTreeMap<String, HostObservations> = ["n1", "n2"]
         .into_iter()
@@ -222,7 +224,11 @@ fn build_records_the_verdict_it_would_exit_with() {
             reason: "residual too large".into(),
         },
     ));
-    let results = report::build(&config, observations, 1, 2);
+    let mut results = report::build(&config, observations, 1, 2);
+    // A snapshot of a run in flight carries no verdict ...
+    assert_eq!(results.verdict, None);
+    // ... the finished document does.
+    results.finalize();
     assert_eq!(results.verdict, Some(Verdict::Failures));
     assert_eq!(results.verdict, Some(report::verdict(&results)));
 }

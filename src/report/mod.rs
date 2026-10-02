@@ -133,10 +133,11 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
-    /// `verdict(self)` as `build` computed it: the same classification the
-    /// exit code reports, so consumers never parse the exit status.
-    /// `None` = not recorded (pre-v13 documents, via the serde default);
-    /// call `verdict` to classify those.
+    /// `verdict(self)` of the finished run (`finalize`): the same
+    /// classification the exit code reports, so consumers never parse the
+    /// exit status. `None` = no final verdict: a partial snapshot of a run
+    /// still in flight (`*.partial.json`), or a pre-v13 document (serde
+    /// default); call `verdict` for a provisional classification.
     #[serde(default)]
     pub verdict: Option<Verdict>,
     pub fleet: FleetAnalysis,
@@ -413,7 +414,7 @@ pub fn build(
         run_suffix(finished_epoch_secs, &observations)
     );
 
-    let mut results = RunResults {
+    RunResults {
         schema_version: SCHEMA_VERSION,
         run_id,
         started_epoch_secs,
@@ -429,9 +430,17 @@ pub fn build(
         fleet,
         aggregates,
         calibration,
-    };
-    results.verdict = Some(verdict(&results));
-    results
+    }
+}
+
+impl RunResults {
+    /// Mark the document as a finished run: record its verdict. Called
+    /// once, on the final document only — a partial snapshot of a run in
+    /// flight keeps `verdict: None`, because a verdict over incomplete
+    /// data would read as final.
+    pub fn finalize(&mut self) {
+        self.verdict = Some(verdict(self));
+    }
 }
 
 /// Reduce raw (possibly repeated) metric records into per-subject

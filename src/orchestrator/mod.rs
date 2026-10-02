@@ -144,10 +144,9 @@ struct PartialWriter {
 }
 
 impl PartialWriter {
-    /// Analyse and publish `observations` as they stand. Snapshots are a
-    /// convenience for onlookers: a failure here is logged and forgotten,
-    /// never propagated into the run.
-    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+    /// The in-flight document: the run id onlookers follow, and no
+    /// verdict (`RunResults::finalize` is for the final document only).
+    fn document(&self, observations: BTreeMap<String, HostObservations>) -> report::RunResults {
         let mut results = report::build(
             &self.config,
             observations,
@@ -155,6 +154,14 @@ impl PartialWriter {
             epoch_secs(),
         );
         results.run_id = self.run_id.clone();
+        results
+    }
+
+    /// Analyse and publish `observations` as they stand. Snapshots are a
+    /// convenience for onlookers: a failure here is logged and forgotten,
+    /// never propagated into the run.
+    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+        let results = self.document(observations);
         let dir = Path::new(report::history::DEFAULT_DIR);
         match report::history::save_partial(&results, dir) {
             Ok(path) => {
@@ -315,6 +322,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // document lands where onlookers were already watching.
     results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
+    results.finalize();
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -1209,6 +1217,35 @@ fn parse_json_document<T: DeserializeOwned>(text: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_snapshots_carry_no_verdict() {
+        let config: FleetConfig = toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+        let writer = PartialWriter {
+            run_id: "1-abcdef".into(),
+            config,
+            started_epoch_secs: 1,
+        };
+        let mut observations = BTreeMap::new();
+        let mut obs = HostObservations::default();
+        obs.outcomes.push((
+            TestId::CpuCorrectness,
+            Scope::Node,
+            crate::proto::TestOutcome::Failed {
+                reason: "mismatch".into(),
+            },
+        ));
+        observations.insert("n1".to_string(), obs);
+        let partial = writer.document(observations);
+        assert_eq!(partial.run_id, "1-abcdef");
+        assert_eq!(partial.verdict, None);
+        let json = serde_json::to_value(&partial).expect("serialize");
+        assert!(json["verdict"].is_null(), "{json}");
+
+        let mut fin = partial.clone();
+        fin.finalize();
+        assert_eq!(fin.verdict, Some(report::Verdict::Failures));
+    }
 
     #[test]
     fn peer_endpoints_drop_the_login_user_and_ssh_port() {
