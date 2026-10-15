@@ -21,6 +21,29 @@ Non-scope:
   NCCL_* values a node supplies itself (shell profile, `/etc/nccl.conf`,
   `~/.nccl.conf`): only the `[nccl] env` map is known to the orchestrator
   (see nccl_env.md, which never captures inherited variables).
+- Intra-node and barrier communicators: the model uses the **fleet**
+  level's resolved env (`[nccl]` global with `[nccl.levels.fleet]` on
+  top). That is the multi-host communicator, the one whose NIC choice
+  decides inter-node bandwidth. A `[nccl.levels.intranode]` or
+  `[nccl.levels.barrier]` NCCL_IB_HCA does not change the summary.
+
+## Predicted vs observed socket fallback
+This module *predicts* a socket fallback from the inventory and the
+fleet-level env, before any NCCL run. `report::nccl_transport`
+(`fleet.socket_fallbacks`) *observes* one from NCCL's INFO log after the
+run. Both decide "the host had a usable IB/RoCE port" through the same
+function, `IbPortInventory::nccl_usable()`: logical state ACTIVE and an
+InfiniBand or Ethernet link layer, via `nccl_port_exclusion()`. So the two
+views cannot disagree about which hosts had something to fall back from.
+With the IB transport on, `IbAvailability::of` == `ActivePort` exactly
+when the summary has a port that is selected or `filtered_by_hca`: a port
+that got past the state and link-layer checks. With it off
+(`NCCL_NET=Socket` / `NCCL_IB_DISABLE`), NCCL stops before scanning
+ports, so every port records the env reason, and the observed view
+treats the sockets as deliberate. Before v13, inventories carried no
+link layer; `Unknown` is not usable in either view. A test
+(`predicted_and_observed_views_agree_on_usable_ports`) pins this on the
+fixtures. Both are hard evidence in the verdict (exit 3).
 
 ## What NCCL does, and what is modelled
 In order (`crate::nccl_ib::classify_port`; the first that applies is the
@@ -79,7 +102,9 @@ recorded exclusion):
      `/sys/bus/pci/devices`.
 2. **Orchestrator** (`orchestrator/derive.rs`): `node_phase` routes every
    inventory through `derive_inventory_events(snapshot,
-   &InventoryDerivation)`, the one hook for inventory-derived tests. It
+   &InventoryDerivation)`, the one hook for inventory-derived tests.
+   `InventoryDerivation::from_config` resolves `NcclIbConfig` from the
+   **fleet** level's env (`config.nccl_levels()?.level(Fleet)`). It
    emits, behind the snapshot:
    - `gpu_idle` outcomes, one per GPU;
    - then, when the env is known, the Node-scope `nccl_nics` outcome;
@@ -94,7 +119,7 @@ recorded exclusion):
    - `report/nccl_nics.rs` renders the "nccl nics" section from
      `hosts.*.nccl_nics` and the recorded outcome.
 
-   A document whose hosts carry no summary (pre-v13, or no derivation)
+   A document whose hosts carry no summary (pre-v16, or no derivation)
    shows no section and no NIC consistency fields.
 
 ## The summary (`proto::nccl_nics::NcclNicSummary`)
@@ -124,8 +149,11 @@ so the outcome, metric, consistency fields and table cannot drift:
 - Transport off by `NCCL_NET=Socket` or `NCCL_IB_DISABLE` → Skipped, with
   that reason.
 - Ports exist, none selected → **Failed**. The reason names the HCA value
-  and every port's exclusion, and the failure feeds the verdict
-  (Stragglers).
+  and every port's exclusion. In the verdict this is **hard** evidence
+  (`report::failed_outcome_tier(NcclNics)` = `Hard`, verdict `failures`,
+  exit 3), consistent with the observed `fleet.socket_fallbacks`: a
+  multi-host run that would silently move its collectives onto TCP is
+  broken, not slow.
 - Otherwise Passed (including under an unmodelled plugin; the caveat
   shows in the report note).
 
@@ -183,7 +211,7 @@ Shared bridges decide first; NUMA decides otherwise.
 ## Types and files
 - `src/proto/ib.rs`:
   - port-level types: `IbPortInventory` (+ the private compatibility
-    decoder `IbPortWire`, which lifts a v1-v10 `rate_gbps` into
+    decoder `IbPortWire`, which lifts a v1-v12 `rate_gbps` into
     `PortRate::Known`), `PortRate`, `IbRate` / `IbRateError` (serde,
     tagged `kind`), `IbSpeed`, `PortState`, `PhysState`, `LinkLayer`,
     `RoceVersion`;
@@ -224,8 +252,11 @@ Shared bridges decide first; NUMA decides otherwise.
 - The agent never decides selection. `TestId::NcclNics` and
   `AgentEvent::NcclNics` are never emitted by an agent.
 - The report never re-derives NIC results from an inventory.
-- A selected port is ACTIVE with an InfiniBand or Ethernet link layer.
+- A selected port is ACTIVE with an InfiniBand or Ethernet link layer
+  (`IbPortInventory::nccl_usable`, the same predicate `IbAvailability`
+  uses).
+- The env modelled is the fleet level's.
 - `HcaFilter::parse` is total: every string has NCCL's meaning.
-- An unknown link layer (pre-v11 inventories) is never selected.
-- All new wire and document fields are serde-defaulted (proto v11,
-  schema v13).
+- An unknown link layer (pre-v13 inventories) is never selected.
+- All new wire and document fields are serde-defaulted (proto v13,
+  schema v16).

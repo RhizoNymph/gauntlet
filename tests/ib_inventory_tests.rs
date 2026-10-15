@@ -890,7 +890,7 @@ fn the_report_does_not_rederive_from_the_inventory() {
 }
 
 #[test]
-fn a_host_falling_back_to_sockets_makes_the_verdict_stragglers() {
+fn a_predicted_socket_fallback_is_hard_evidence() {
     let fixture = Fixture::new("ib-fallback");
     let hosts = ["n1", "n2"];
     let config = config(&hosts, "[nccl]\nenv = { NCCL_IB_HCA = \"=mlx5_0\" }");
@@ -899,7 +899,12 @@ fn a_host_falling_back_to_sockets_makes_the_verdict_stragglers() {
     inventories[1].ib_ports[0].state = "DOWN".into();
 
     let results = run(&config, inventories);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    // Hard tier, like the observed `fleet.socket_fallbacks`.
+    assert_eq!(
+        report::failed_outcome_tier(TestId::NcclNics),
+        report::EvidenceTier::Hard
+    );
+    assert_eq!(report::verdict(&results), Verdict::Failures);
     let failed: Vec<&String> = results.hosts["n2"]
         .outcomes
         .iter()
@@ -914,6 +919,98 @@ fn a_host_falling_back_to_sockets_makes_the_verdict_stragglers() {
         table.contains("FAIL: NCCL_IB_HCA==mlx5_0 selects no"),
         "{table}"
     );
+}
+
+#[test]
+fn the_selection_follows_the_fleet_level_env() {
+    let fixture = Fixture::new("ib-levels");
+    // The global env and the intra-node level say one thing; the fleet
+    // level (the multi-host communicator) says another, and wins.
+    let config = config(
+        &["n1"],
+        "[nccl]\nenv = { NCCL_IB_HCA = \"mlx5_0\" }\n\
+         [nccl.levels.intranode]\nenv = { NCCL_IB_HCA = \"mlx5_1\" }\n\
+         [nccl.levels.fleet]\nenv = { NCCL_IB_HCA = \"^mlx5_2\", NCCL_NET = \"IB\" }",
+    );
+    let results = run(&config, vec![fixture.inventory("n1")]);
+    let summary = results.hosts["n1"].nccl_nics.as_ref().expect("recorded");
+    assert_eq!(summary.hca.as_deref(), Some("^mlx5_2"));
+    assert_eq!(summary.net, NetChoice::Ib);
+    assert_eq!(selected_ids(summary), ["mlx5_0:1", "mlx5_1:1"]);
+    assert!(
+        rendered(&results).contains("nccl nics (NCCL_IB_HCA=^mlx5_2)"),
+        "the header shows the fleet-level value"
+    );
+
+    // A fleet-level NCCL_IB_DISABLE alone turns the IB transport off.
+    let config = config_for_disable();
+    let results = run(&config, vec![fixture.inventory("n1")]);
+    let summary = results.hosts["n1"].nccl_nics.as_ref().expect("recorded");
+    assert!(summary.ib_disabled);
+    assert!(summary.selected.is_empty());
+}
+
+fn config_for_disable() -> FleetConfig {
+    config(
+        &["n1"],
+        "[nccl.levels.fleet]\nenv = { NCCL_IB_DISABLE = 1 }",
+    )
+}
+
+#[test]
+fn predicted_and_observed_views_agree_on_usable_ports() {
+    // Every per-port variation the two views must agree on: the fixture
+    // as probed, each port forced DOWN in turn, an unknown link layer,
+    // and no ports at all.
+    let fixture = Fixture::new("ib-agree");
+    let base = fixture.inventory("n1");
+    let mut cases = vec![base.clone()];
+    for index in 0..base.ib_ports.len() {
+        let mut only_down = base.clone();
+        only_down.ib_ports[index].state = "DOWN".into();
+        cases.push(only_down);
+    }
+    let mut all_down = base.clone();
+    for port in &mut all_down.ib_ports {
+        port.state = "DOWN".into();
+    }
+    cases.push(all_down);
+    let mut unknown_layers = base.clone();
+    for port in &mut unknown_layers.ib_ports {
+        port.link_layer = LinkLayer::Unknown;
+    }
+    cases.push(unknown_layers);
+    let mut none = base.clone();
+    none.ib_ports.clear();
+    cases.push(none);
+
+    for (case, inventory) in cases.into_iter().enumerate() {
+        // Predicted: some port gets past the state / link-layer checks
+        // (selected, or excluded only by the HCA filter). Only configs that
+        // leave the IB transport on: with NCCL_NET=Socket or
+        // NCCL_IB_DISABLE, NCCL stops before looking at any port, so the
+        // summary records the env reason for every port, and the observed
+        // view skips the finding through `socket_is_deliberate` instead.
+        for config in [unset(), hca("^mlx5"), hca("=mlx5_3")] {
+            let summary = summarize(&inventory, &config);
+            let predicted_usable = !summary.selected.is_empty()
+                || summary
+                    .excluded
+                    .iter()
+                    .any(|port| port.reason == PortExclusion::FilteredByHca);
+            // Observed: #13's IbAvailability over the same inventory.
+            let obs = gauntlet::orchestrator::collect::HostObservations {
+                inventory: Some(inventory.clone()),
+                ..Default::default()
+            };
+            let observed = report::nccl_transport::IbAvailability::of(&obs, None);
+            assert_eq!(
+                observed == report::nccl_transport::IbAvailability::ActivePort,
+                predicted_usable,
+                "case {case} under {config:?}"
+            );
+        }
+    }
 }
 
 #[test]

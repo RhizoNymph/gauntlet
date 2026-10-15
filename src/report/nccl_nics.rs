@@ -12,7 +12,7 @@ use std::io::Write;
 use anyhow::Result;
 
 use super::{RunResults, new_table, section};
-use crate::proto::nccl_nics::{ExcludedPort, IB_HCA, SelectedPort, describe_hca};
+use crate::proto::nccl_nics::{ExcludedPort, SelectedPort, describe_hca};
 use crate::proto::{NcclNicSummary, TestId, TestOutcome};
 
 /// "mlx5_0:1 infiniband 200G (ibp12s0, gpu0,gpu1 pcie_switch)".
@@ -83,11 +83,11 @@ pub fn render(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     {
         return Ok(());
     }
-    let hca = results
-        .nccl_env
-        .as_ref()
-        .and_then(|env| env.get(IB_HCA))
-        .map(String::as_str);
+    // The fleet-level NCCL_IB_HCA the summaries were derived under (one
+    // config per run, so every summary records the same value).
+    let hca = summaries
+        .first()
+        .and_then(|(_, summary, _)| summary.hca.as_deref());
     let mut table = new_table(&[
         "host",
         "ports nccl would use",

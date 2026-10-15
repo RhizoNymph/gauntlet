@@ -22,6 +22,8 @@ pub mod deploy;
 pub mod derive;
 mod intranode;
 mod nccl;
+mod nccl_shim;
+mod network_plan;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -38,13 +40,15 @@ use tracing::{debug, info, warn};
 
 use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
-use self::session::{HostSession, single_quote};
+use self::network_plan::NetworkPhasePlan;
+use self::session::{AgentEnv, HostSession, single_quote};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
-use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
+use crate::net_steps::{NetStep, NetSteps, disabled_outcomes};
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit,
@@ -145,10 +149,9 @@ struct PartialWriter {
 }
 
 impl PartialWriter {
-    /// Analyse and publish `observations` as they stand. Snapshots are a
-    /// convenience for onlookers: a failure here is logged and forgotten,
-    /// never propagated into the run.
-    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+    /// The in-flight document: the run id onlookers follow, and no
+    /// verdict (`RunResults::finalize` is for the final document only).
+    fn document(&self, observations: BTreeMap<String, HostObservations>) -> report::RunResults {
         let mut results = report::build(
             &self.config,
             observations,
@@ -156,6 +159,14 @@ impl PartialWriter {
             epoch_secs(),
         );
         results.run_id = self.run_id.clone();
+        results
+    }
+
+    /// Analyse and publish `observations` as they stand. Snapshots are a
+    /// convenience for onlookers: a failure here is logged and forgotten,
+    /// never propagated into the run.
+    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+        let results = self.document(observations);
         let dir = Path::new(report::history::DEFAULT_DIR);
         match report::history::save_partial(&results, dir) {
             Ok(path) => {
@@ -173,7 +184,8 @@ impl PartialWriter {
 pub async fn run(args: RunArgs) -> Result<()> {
     let config = FleetConfig::load(&args.config)
         .with_context(|| format!("loading {}", args.config.display()))?;
-    let phases = config.resolve_phases(&args.phases)?;
+    let plan = config.run_plan(&args.phases, &args.net_steps)?;
+    let phases = plan.phases();
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
@@ -221,7 +233,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, config.nccl_env()?, &sink).await;
+    let sessions = connect_fleet(&config, config.nccl_levels()?, &sink).await;
     let sessions = deploy_fleet(&config, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
@@ -229,10 +241,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
     info!(
         hosts = sessions.len(),
         phases = ?phases,
+        net_steps = ?plan
+            .net_steps()
+            .map(|steps| steps.iter().map(NetStep::name).collect::<Vec<_>>()),
         "fleet ready"
     );
 
-    let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
+    // The libnccl shim lives under remote_dir, which (node-local by
+    // default) can lose it on reboot while the agent is re-uploaded; runs
+    // that use NCCL rebuild it here instead of relying on a past bootstrap.
+    let mut inventories: BTreeMap<String, InventorySnapshot> = if nccl_shim::phases_use_nccl(phases)
+    {
+        nccl_shim::ensure_fleet_shims(&sessions, config.ssh.max_concurrent).await
+    } else {
+        BTreeMap::new()
+    };
     // Error-counter baselines, taken once before the first load phase; the
     // matching delta pass runs after the last load phase of the last repeat.
     let mut counter_baselines: BTreeMap<String, CounterSnapshot> = BTreeMap::new();
@@ -242,7 +265,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         if args.repeat > 1 {
             info!(repeat, of = args.repeat, "repeat start");
         }
-        for phase in &phases {
+        for phase in phases {
             // The inventory is a census, not a measurement.
             if *phase == Phase::Inventory && repeat > 0 {
                 continue;
@@ -274,10 +297,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     }
                 }
                 Phase::Network => {
+                    // `run_plan` resolves a step set whenever the phase
+                    // list contains Network.
+                    let Some(net_steps) = plan.net_steps() else {
+                        bail!("network phase scheduled without a resolved step set");
+                    };
                     network_phase(
                         &config,
                         &sessions,
                         &mut inventories,
+                        net_steps,
                         args.sample_pairs,
                         &sink,
                     )
@@ -306,6 +335,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // document lands where onlookers were already watching.
     results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
+    results.finalize();
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -354,14 +384,15 @@ fn epoch_secs() -> u64 {
 /// the handshake). Order follows the config so host indices are stable.
 async fn connect_fleet(
     config: &FleetConfig,
-    nccl_env: &NcclEnv,
+    nccl: &NcclLevelEnvs,
     sink: &ObservationSink,
 ) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
-    // Set on every agent spawn's command line: the one path by which NCCL
-    // tuning reaches every communicator (sweep, barrier, both overlap
+    // Set on every agent spawn's command line, per the level the spawned
+    // process hosts: the one path by which NCCL tuning reaches every
+    // communicator (intra-node and fleet sweeps, barrier, both overlap
     // steps) without the agent ever mutating its own environment.
-    let nccl_env = Arc::new(nccl_env.clone());
+    let nccl_env = Arc::new(nccl.clone());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
@@ -373,7 +404,7 @@ async fn connect_fleet(
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh, &nccl_env).await {
+            match HostSession::connect(host, &ssh, nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
                     sink.error(&addr, format!("ssh connect failed: {error:#}"));
@@ -463,6 +494,9 @@ async fn node_phase(
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let derivation = Arc::new(InventoryDerivation::from_config(config));
+    // One phase per spawn, so the process hosts at most one NCCL level
+    // (network: the intra-node sweep; overlap: the node-local overlap).
+    let env = phase.nccl_level().map_or(AgentEnv::Base, AgentEnv::Nccl);
 
     let mut tasks = JoinSet::new();
     for session in sessions {
@@ -475,7 +509,7 @@ async fn node_phase(
             let mut inventory = None;
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(env, &["run"], Some(document), |event| {
                     // Inventory-derived tests (gpu_idle, nccl_nics) need
                     // orchestrator config; they follow the snapshot they
                     // judge through the same sink (`derive`).
@@ -553,7 +587,7 @@ async fn counter_baseline_pass(
             let mut baseline = None;
             let outcome = tokio::time::timeout(
                 COUNTER_PASS_TIMEOUT,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
                     if let AgentEvent::CounterBaseline { snapshot } = event {
                         baseline = Some(*snapshot);
                     }
@@ -616,7 +650,7 @@ async fn counter_delta_pass(
             let addr = session.addr().to_string();
             let outcome = tokio::time::timeout(
                 COUNTER_PASS_TIMEOUT,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
                     if matches!(&event, AgentEvent::CounterDeltas { .. }) {
                         sink.event(&addr, event);
                     }
@@ -655,17 +689,60 @@ async fn network_phase(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
+    steps: &NetSteps,
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
+    // Deselected steps leave an explicit trace on every host, so a
+    // bandwidth-only run reads as "not run", never as "missing".
+    let disabled = disabled_outcomes(steps);
+    if !disabled.is_empty() {
+        info!(
+            skipped = ?disabled.iter().map(|(test, _)| *test).collect::<Vec<_>>(),
+            "network steps disabled by config"
+        );
+        for session in sessions {
+            for (test, outcome) in &disabled {
+                sink.event(
+                    session.addr(),
+                    AgentEvent::Outcome {
+                        test: *test,
+                        scope: Scope::Node,
+                        outcome: outcome.clone(),
+                    },
+                );
+            }
+        }
+    }
     // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
     // node pairs (TCP), then the full fleet (NCCL over the fabric).
-    if config.tests.nccl_intranode {
+    // One pure decision (`NetworkPhasePlan`) covers the step selection and
+    // main's structure: the intra-node coverage the one-host fleet-sweep
+    // gate needs follows the very step that dispatches the intra-node
+    // sweep; deselecting `nccl` drops every world shape, rail and NCCL
+    // barrier; deselecting `barrier` suppresses both NCCL placements and
+    // the TCP barrier.
+    let plan = NetworkPhasePlan::new(steps);
+    if plan.intranode {
         intranode::intranode_sweep(config, sessions, inventories, sink).await;
     }
-    pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl::nccl_sweep(config, sessions, inventories, sink).await;
-    tcp_barrier_sweep(config, sessions, sink).await;
+    if plan.pairwise {
+        pairwise_sweep(config, sessions, sample_pairs, sink).await;
+    }
+    if let Some(nccl_step) = plan.nccl {
+        nccl::nccl_sweep(
+            config,
+            sessions,
+            inventories,
+            sink,
+            nccl_step.coverage,
+            nccl_step.barrier,
+        )
+        .await;
+    }
+    if plan.tcp_barrier {
+        tcp_barrier_sweep(config, sessions, sink).await;
+    }
 }
 
 /// Tournament rounds of disjoint pairs: within a round every pair runs
@@ -1165,6 +1242,35 @@ fn parse_json_document<T: DeserializeOwned>(text: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_snapshots_carry_no_verdict() {
+        let config: FleetConfig = toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+        let writer = PartialWriter {
+            run_id: "1-abcdef".into(),
+            config,
+            started_epoch_secs: 1,
+        };
+        let mut observations = BTreeMap::new();
+        let mut obs = HostObservations::default();
+        obs.outcomes.push((
+            TestId::CpuCorrectness,
+            Scope::Node,
+            crate::proto::TestOutcome::Failed {
+                reason: "mismatch".into(),
+            },
+        ));
+        observations.insert("n1".to_string(), obs);
+        let partial = writer.document(observations);
+        assert_eq!(partial.run_id, "1-abcdef");
+        assert_eq!(partial.verdict, None);
+        let json = serde_json::to_value(&partial).expect("serialize");
+        assert!(json["verdict"].is_null(), "{json}");
+
+        let mut fin = partial.clone();
+        fin.finalize();
+        assert_eq!(fin.verdict, Some(report::Verdict::Failures));
+    }
 
     #[test]
     fn peer_endpoints_drop_the_login_user_and_ssh_port() {

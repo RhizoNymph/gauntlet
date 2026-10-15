@@ -24,6 +24,9 @@ pub mod net;
 pub mod pci;
 pub mod sweep;
 pub mod sysfs;
+// Its callers are gpu-gated; the pure parts are tested everywhere.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub mod transport;
 pub mod window;
 
 #[cfg(feature = "gpu")]

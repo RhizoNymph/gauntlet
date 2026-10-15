@@ -203,6 +203,20 @@ impl NcclEnv {
         Ok(resolved)
     }
 
+    /// `self` with every entry of `over` layered on top: keys present in
+    /// both take `over`'s value, keys only in `self` survive. Both sides are
+    /// already validated, so the result is too. This is how a
+    /// `[nccl.levels.<level>]` override becomes that level's env.
+    pub fn overlay(&self, over: &NcclEnv) -> NcclEnv {
+        let mut merged = self.0.clone();
+        merged.extend(
+            over.0
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Self(merged)
+    }
+
     pub fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(NcclEnvValue::as_str)
     }
@@ -446,6 +460,24 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn overlay_replaces_shared_keys_and_keeps_the_rest() {
+        let base = NcclEnv::from_map(&map(&[("NCCL_ALGO", "Tree"), ("NCCL_DEBUG", "WARN")]))
+            .expect("base");
+        let over = NcclEnv::from_map(&map(&[("NCCL_ALGO", "Ring"), ("NCCL_P2P_LEVEL", "NVL")]))
+            .expect("over");
+        assert_eq!(
+            base.overlay(&over).to_string_map(),
+            map(&[
+                ("NCCL_ALGO", "Ring"),
+                ("NCCL_DEBUG", "WARN"),
+                ("NCCL_P2P_LEVEL", "NVL"),
+            ])
+        );
+        assert_eq!(base.overlay(&NcclEnv::default()), base);
+        assert_eq!(NcclEnv::default().overlay(&over), over);
     }
 
     #[test]

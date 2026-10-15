@@ -1,4 +1,4 @@
-//! InfiniBand / RoCE inventory types (proto v11).
+//! InfiniBand / RoCE inventory types (proto v13).
 //!
 //! Everything here is a *fact* the agent reads from sysfs, typed:
 //! `/sys/class/infiniband/<dev>/ports/<p>/{state,phys_state,rate,
@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use super::nccl_nics::PortExclusion;
 
 /// Bits per byte, for line-rate conversions.
 const BITS_PER_BYTE: f64 = 8.0;
@@ -461,14 +463,14 @@ pub struct IbPortInventory {
     /// Symbolic logical state ("ACTIVE", "DOWN", ...), unchanged on the
     /// wire since v1; typed reading via [`IbPortInventory::logical_state`].
     pub state: String,
-    /// `rate` (proto v11; replaces the bare `rate_gbps`).
+    /// `rate` (proto v13; replaces the bare `rate_gbps`).
     pub rate: PortRate,
     pub link_downed_count: Option<u64>,
-    /// `link_layer` (proto v11); `Unknown` for older inventories.
+    /// `link_layer` (proto v13); `Unknown` for older inventories.
     pub link_layer: LinkLayer,
-    /// `phys_state` (proto v11).
+    /// `phys_state` (proto v13).
     pub phys_state: PhysState,
-    /// Network interfaces bound to this port, sorted (proto v11). RoCE:
+    /// Network interfaces bound to this port, sorted (proto v13). RoCE:
     /// the GID table's `ndevs` (a LAG reports its bond); otherwise the PCI
     /// function's `net/*` with a matching `dev_port`, VF/SF representors
     /// excluded.
@@ -484,10 +486,33 @@ impl IbPortInventory {
     pub fn payload_gbps(&self) -> Option<f64> {
         self.rate.payload_gbps(&self.link_layer)
     }
+
+    /// Why NCCL's IB transport could never use this port, whatever the
+    /// env: not ACTIVE, or a link layer other than InfiniBand / Ethernet.
+    /// The single definition of a usable port, shared by the predicted view
+    /// (`nccl_ib::classify_port`) and the observed one
+    /// (`report::nccl_transport::IbAvailability`), so they cannot disagree.
+    pub fn nccl_port_exclusion(&self) -> Option<PortExclusion> {
+        if self.logical_state() != PortState::Active {
+            Some(PortExclusion::NotActive {
+                state: self.state.clone(),
+            })
+        } else if !self.link_layer.nccl_capable() {
+            Some(PortExclusion::UnsupportedLinkLayer)
+        } else {
+            None
+        }
+    }
+
+    /// An ACTIVE InfiniBand or RoCE port: one NCCL's IB transport can use
+    /// when the env lets it.
+    pub fn nccl_usable(&self) -> bool {
+        self.nccl_port_exclusion().is_none()
+    }
 }
 
 /// Every shape `IbPortInventory` has had on the wire: v11 (`rate`) and
-/// v1-v10 (`rate_gbps` only).
+/// v1-v12 (`rate_gbps` only).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IbPortWire {

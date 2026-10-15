@@ -9,6 +9,7 @@
 
 use crate::config::FleetConfig;
 use crate::nccl_ib::{NcclIbConfig, summarize};
+use crate::nccl_level::NcclLevel;
 use crate::proto::{AgentEvent, InventorySnapshot, TestId, gpu_idle_outcomes};
 
 /// The config slice the derivations need, resolved once per phase.
@@ -22,10 +23,17 @@ pub struct InventoryDerivation {
 }
 
 impl InventoryDerivation {
+    /// The NIC selection is modelled under the *fleet* level's resolved
+    /// env (`[nccl]` global with `[nccl.levels.fleet]` on top): the
+    /// multi-host communicator is the one whose NIC choice decides the
+    /// inter-node bandwidth. Intra-node communicators never leave the box.
     pub fn from_config(config: &FleetConfig) -> Self {
         Self {
             gpu_idle_max_used_mib: config.thresholds.gpu_idle_max_used_mib,
-            nccl_ib: config.nccl_env().ok().map(NcclIbConfig::from_env),
+            nccl_ib: config
+                .nccl_levels()
+                .ok()
+                .map(|levels| NcclIbConfig::from_env(levels.level(NcclLevel::Fleet))),
         }
     }
 }

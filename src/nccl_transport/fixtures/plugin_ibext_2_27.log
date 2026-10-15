@@ -1,0 +1,13 @@
+dgx-b07:77120:77120 [0] NCCL INFO Bootstrap: Using ibp24s0:10.2.0.7<0>
+dgx-b07:77120:77120 [0] NCCL INFO NET/Plugin: Loaded net plugin IBext_v8 (v8)
+dgx-b07:77120:77120 [0] NCCL INFO cudaDriverVersion 12080
+NCCL version 2.27.3+cuda12.8
+dgx-b07:77120:77120 [0] NCCL INFO NCCL version 2.27.3+cuda12.8
+dgx-b07:77120:77188 [0] NCCL INFO NET/IB : Using [0]mlx5_0:1/IB [1]mlx5_3:1/IB [2]mlx5_4:1/IB [3]mlx5_5:1/IB [RO]; OOB ibp24s0:10.2.0.7<0>
+dgx-b07:77120:77188 [0] NCCL INFO Using network IBext_v8
+dgx-b07:77120:77188 [0] NCCL INFO ncclCommInitRankConfig comm 0x56aa7f20 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 18000 commId 0x91c3 - Init START
+dgx-b07:77120:77188 [0] NCCL INFO Channel 00/0 : 15[7] -> 0[0] [receive] via NET/IBext_v8/0/GDRDMA
+dgx-b07:77120:77188 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/CUMEM/read
+dgx-b07:77120:77195 [7] NCCL INFO Channel 00/0 : 7[7] -> 8[0] [send] via NET/IBext_v8/3/GDRDMA
+dgx-b07:77120:77188 [0] NCCL INFO Connected all rings
+dgx-b07:77120:77188 [0] NCCL INFO ncclCommInitRankConfig comm 0x56aa7f20 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 18000 commId 0x91c3 - Init COMPLETE

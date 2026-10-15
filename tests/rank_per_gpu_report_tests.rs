@@ -125,7 +125,7 @@ fn a_bad_non_zero_gpu_path_is_a_per_gpu_fleet_retention_outlier() {
     assert_eq!(flagged.len(), 1, "{flagged:?}");
     assert_eq!(flagged[0].key, "n3:gpu1", "{flagged:?}");
     assert!(flagged[0].deviation_mads < 0.0);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 fn node_record(test: TestId, name: &str, value: f64, unit: Unit) -> MetricRecord {
@@ -179,7 +179,7 @@ fn nccl_barrier_stragglers_are_one_row_per_host_with_per_gpu_percentiles() {
         .map(|straggler| straggler.key.as_str())
         .collect();
     assert_eq!(flagged, ["n2"]);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
     let p50 = &results.aggregates["nccl_barrier.p50_us"];
     assert!(
         p50.contains_key("n1:gpu0") && p50.contains_key("n1:gpu1"),

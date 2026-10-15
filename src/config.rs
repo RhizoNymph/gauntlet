@@ -8,10 +8,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
+use crate::nccl_level::{NcclLevel, NcclLevelEnvs};
+use crate::net_steps::{NetStep, NetSteps};
 use crate::proto::{
     AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
     OverlapSpec, Phase,
 };
+use crate::remote_dir::RemoteDir;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -35,10 +38,25 @@ pub enum ConfigError {
     BadBarrierFrac { got: f64 },
     #[error("unknown phase name: {name}")]
     UnknownPhase { name: String },
+    #[error(
+        "unknown network step name: {name} (expected one of: {})",
+        NetStep::help_list()
+    )]
+    UnknownNetStep { name: String },
+    /// The network-step selection (config, `--net-steps`, minus
+    /// `nccl_intranode = false`) leaves nothing to run.
+    #[error("no network steps selected; drop the network phase instead")]
+    NoNetSteps,
     /// `[nccl]` violates the NCCL env policy (non-NCCL key, empty or
     /// NUL-bearing value, NCCL_SOCKET_IFNAME set twice).
     #[error("invalid [nccl] section: {source}")]
     Nccl { source: NcclEnvError },
+    /// `[nccl.levels.<level>] env` violates the same policy as `[nccl] env`.
+    #[error("invalid [nccl.levels.{level}] section: {source}")]
+    NcclLevel {
+        level: NcclLevel,
+        source: NcclEnvError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,11 +71,12 @@ pub struct FleetConfig {
     pub thresholds: Thresholds,
     #[serde(default)]
     pub nccl: NcclConfig,
-    /// `nccl` resolved and validated, filled once by `validate` (or on
-    /// first access). Private and write-once: the only value it can ever
-    /// hold is one `NcclConfig::resolve` accepted.
+    /// `nccl` resolved and validated (global env plus every level's
+    /// effective env), filled once by `validate` (or on first access).
+    /// Private and write-once: the only value it can ever hold is one
+    /// `NcclConfig::resolve_levels` accepted.
     #[serde(skip)]
-    resolved_nccl_env: OnceLock<NcclEnv>,
+    resolved_nccl: OnceLock<NcclLevelEnvs>,
 }
 
 /// Hosts may be written as a bare address string or a full table.
@@ -90,7 +109,10 @@ pub struct SshConfig {
     /// Identity file; defaults to agent/ssh-config resolution.
     pub key: Option<PathBuf>,
     /// Directory on each node for the agent binary and scratch files.
-    pub remote_dir: String,
+    /// Expanded on the node: a leading `~` and `$USER` / `${USER}` only.
+    /// Defaults to the node-local `/tmp/gauntlet-$USER` (a home directory
+    /// is often shared NFS on clusters).
+    pub remote_dir: RemoteDir,
     pub connect_timeout_secs: u64,
     /// Concurrent session-establishment limit (full sessions stay open after).
     pub max_concurrent: usize,
@@ -101,11 +123,32 @@ impl Default for SshConfig {
         Self {
             user: None,
             key: None,
-            remote_dir: "~/.gauntlet".into(),
+            remote_dir: RemoteDir::default(),
             connect_timeout_secs: 10,
             max_concurrent: 32,
         }
     }
+}
+
+/// How the fleet NCCL sweep lays out its world (`[tests] nccl_world`).
+///
+/// - `rank_per_gpu` (default): one rank per GPU on every NCCL-capable
+///   host — what training runs; the ring mixes NVLink/PCIe with the
+///   fabric.
+/// - `rank_per_node`: one rank per host, on its GPU 0. Every peer is on
+///   another node, so all collective traffic crosses the NIC (pure
+///   inter-node, the nccl-tests one-GPU-per-node shape).
+/// - `per_rail`: one world per local GPU index `r` (rail `r`), each one
+///   rank per host on that host's GPU `r` (hosts with more than `r` GPUs
+///   join), run one rail after another so each rail's NIC/PCIe path is
+///   measured alone and its number is attributable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NcclWorldShape {
+    #[default]
+    RankPerGpu,
+    RankPerNode,
+    PerRail,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +174,10 @@ pub struct TestConfig {
     /// GEMM (hot SDC screen). 0 disables.
     pub gemm_sdc_check_secs: u64,
     pub gpu_bandwidth_mib: u64,
+    /// Network-phase steps to run (`intranode`, `pairwise`, `nccl`,
+    /// `barrier`); defaults to all. Deselected steps record Skipped
+    /// outcomes ("disabled by config"). `--net-steps` overrides.
+    pub net_steps: Vec<NetStep>,
     pub net_latency_secs: u64,
     pub net_bandwidth_secs: u64,
     /// Base port for peer listeners; each concurrent pair gets base+i.
@@ -142,6 +189,9 @@ pub struct TestConfig {
     /// node, NVLink/PCIe) before the pairwise and fleet levels. Reuses
     /// `nccl_sizes` / `nccl_iters_per_size`.
     pub nccl_intranode: bool,
+    /// World shape of the fleet NCCL sweep (the barrier probe and the
+    /// fleet overlap step always run rank-per-GPU).
+    pub nccl_world: NcclWorldShape,
     /// Barrier-skew microbenchmark iterations (0 disables it).
     pub barrier_iters: u32,
     /// Payload of the tiny barrier all-reduce, in bytes.
@@ -175,6 +225,7 @@ impl Default for TestConfig {
             gemm_dtypes: vec![GemmDtype::F32, GemmDtype::Bf16, GemmDtype::F16],
             gemm_sdc_check_secs: 5,
             gpu_bandwidth_mib: 1024,
+            net_steps: NetStep::ALL.to_vec(),
             net_latency_secs: 3,
             net_bandwidth_secs: 5,
             net_port_base: 29500,
@@ -182,6 +233,7 @@ impl Default for TestConfig {
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
             nccl_intranode: true,
+            nccl_world: NcclWorldShape::RankPerGpu,
             barrier_iters: 2000,
             barrier_bytes: 8,
             overlap_secs: 30,
@@ -241,13 +293,74 @@ pub struct NcclConfig {
     /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`; string,
     /// integer or boolean values).
     pub env: BTreeMap<String, RawNcclEnvValue>,
+    /// Per-level overrides layered on top of `env` (`[nccl.levels.<level>]`).
+    pub levels: NcclLevelsConfig,
+}
+
+/// `[nccl.levels]`: one optional override table per NCCL call site. Field
+/// names are the `NcclLevel` names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelsConfig {
+    pub intranode: NcclLevelConfig,
+    pub fleet: NcclLevelConfig,
+    pub barrier: NcclLevelConfig,
+    pub overlap_intranode: NcclLevelConfig,
+    pub overlap_fleet: NcclLevelConfig,
+}
+
+/// `[nccl.levels.<level>]` as written in the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelConfig {
+    /// NCCL knobs for this level only, layered over `[nccl] env` (same key
+    /// and value rules). NCCL_SOCKET_IFNAME may be overridden here even
+    /// when `[nccl] socket_ifname` sets it globally: layering is the point.
+    pub env: BTreeMap<String, RawNcclEnvValue>,
+}
+
+impl NcclLevelsConfig {
+    pub fn get(&self, level: NcclLevel) -> &NcclLevelConfig {
+        match level {
+            NcclLevel::Intranode => &self.intranode,
+            NcclLevel::Fleet => &self.fleet,
+            NcclLevel::Barrier => &self.barrier,
+            NcclLevel::OverlapIntranode => &self.overlap_intranode,
+            NcclLevel::OverlapFleet => &self.overlap_fleet,
+        }
+    }
+
+    /// Validate every non-empty override table, in `NcclLevel::ALL` order
+    /// (the first failure is reported with its level).
+    pub fn resolve(&self) -> Result<BTreeMap<NcclLevel, NcclEnv>, ConfigError> {
+        NcclLevel::ALL
+            .into_iter()
+            .filter(|level| !self.get(*level).env.is_empty())
+            .map(|level| {
+                stringify_raw(&self.get(level).env)
+                    .and_then(|raw| NcclEnv::from_map(&raw))
+                    .map(|env| (level, env))
+                    .map_err(|source| ConfigError::NcclLevel { level, source })
+            })
+            .collect()
+    }
 }
 
 impl NcclConfig {
-    /// Validate the section into the single resolved env: `env` stringified,
-    /// plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
+    /// Validate the global part into the single run-wide env: `env`
+    /// stringified, plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
     pub fn resolve(&self) -> Result<NcclEnv, NcclEnvError> {
         NcclEnv::resolve(self.socket_ifname.as_deref(), &stringify_raw(&self.env)?)
+    }
+
+    /// Validate the whole section: the global env, then every level's
+    /// override layered on top of it.
+    pub fn resolve_levels(&self) -> Result<NcclLevelEnvs, ConfigError> {
+        let global = self
+            .resolve()
+            .map_err(|source| ConfigError::Nccl { source })?;
+        let overrides = self.levels.resolve()?;
+        Ok(NcclLevelEnvs::resolve(global, &overrides))
     }
 }
 
@@ -289,7 +402,10 @@ impl FleetConfig {
         if !(frac > 0.0 && frac <= 1.0) {
             return Err(ConfigError::BadBarrierFrac { got: frac });
         }
-        self.nccl_env()?;
+        self.nccl_levels()?;
+        // `tests.net_steps` is deliberately not resolved here: the CLI may
+        // override it, and only a run that selects the network phase needs
+        // a non-empty set (`run_plan`). Names are already checked by serde.
         Ok(())
     }
 
@@ -347,14 +463,21 @@ impl FleetConfig {
     /// way every `NcclEnv` handed out passed `NcclConfig::resolve`, so an
     /// invalid env can never be observed. After `load` this cannot fail.
     pub fn nccl_env(&self) -> Result<&NcclEnv, ConfigError> {
-        if let Some(env) = self.resolved_nccl_env.get() {
-            return Ok(env);
+        self.nccl_levels().map(NcclLevelEnvs::global)
+    }
+
+    /// The resolved NCCL env of every level (`[nccl]` global env with each
+    /// `[nccl.levels.<level>]` override layered on top). The orchestrator
+    /// starts each NCCL-hosting agent process with its level's env.
+    ///
+    /// Same caching and validation guarantees as `nccl_env`: resolved once
+    /// (by `validate`), and only ever a value `resolve_levels` accepted.
+    pub fn nccl_levels(&self) -> Result<&NcclLevelEnvs, ConfigError> {
+        if let Some(envs) = self.resolved_nccl.get() {
+            return Ok(envs);
         }
-        let env = self
-            .nccl
-            .resolve()
-            .map_err(|source| ConfigError::Nccl { source })?;
-        Ok(self.resolved_nccl_env.get_or_init(|| env))
+        let envs = self.nccl.resolve_levels()?;
+        Ok(self.resolved_nccl.get_or_init(|| envs))
     }
 
     /// The intra-node sweep parameters, or `None` when the sweep is
@@ -396,5 +519,77 @@ impl FleetConfig {
                 Phase::parse(name).ok_or_else(|| ConfigError::UnknownPhase { name: name.clone() })
             })
             .collect()
+    }
+
+    /// Resolve the network-phase step set: `--net-steps` strings when
+    /// given, else `tests.net_steps`; `tests.nccl_intranode = false` always
+    /// removes the intra-node step. Errors on unknown names and on an
+    /// empty result.
+    pub fn resolve_net_steps(&self, cli_steps: &[String]) -> Result<NetSteps, ConfigError> {
+        let mut steps = match parse_net_steps(cli_steps)? {
+            Some(cli) => cli,
+            None => self.tests.net_steps.iter().copied().collect(),
+        };
+        if !self.tests.nccl_intranode {
+            steps.remove(&NetStep::Intranode);
+        }
+        NetSteps::new(steps).ok_or(ConfigError::NoNetSteps)
+    }
+
+    /// Everything `gauntlet run` needs from config plus CLI, resolved in
+    /// one place: the phase list, and the network step set — resolved
+    /// (with the `--net-steps` override applied first) only when the
+    /// network phase is selected, so a run that skips it can never be
+    /// rejected over `net_steps`. `--net-steps` names are checked either
+    /// way, so a typo never passes silently.
+    pub fn run_plan(
+        &self,
+        cli_phases: &[String],
+        cli_net_steps: &[String],
+    ) -> Result<RunPlan, ConfigError> {
+        let phases = self.resolve_phases(cli_phases)?;
+        let net_steps = if phases.contains(&Phase::Network) {
+            Some(self.resolve_net_steps(cli_net_steps)?)
+        } else {
+            parse_net_steps(cli_net_steps)?;
+            None
+        };
+        Ok(RunPlan { phases, net_steps })
+    }
+}
+
+/// `--net-steps` strings as a set; `None` when the flag was not given.
+fn parse_net_steps(
+    cli_steps: &[String],
+) -> Result<Option<std::collections::BTreeSet<NetStep>>, ConfigError> {
+    if cli_steps.is_empty() {
+        return Ok(None);
+    }
+    cli_steps
+        .iter()
+        .map(|name| {
+            NetStep::parse(name).ok_or_else(|| ConfigError::UnknownNetStep { name: name.clone() })
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// The resolved schedule of one `gauntlet run`. Built only by
+/// `FleetConfig::run_plan`: `net_steps` is present exactly when `phases`
+/// contains `Phase::Network`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlan {
+    phases: Vec<Phase>,
+    net_steps: Option<NetSteps>,
+}
+
+impl RunPlan {
+    pub fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    /// The network step set; `None` when the network phase is not run.
+    pub fn net_steps(&self) -> Option<&NetSteps> {
+        self.net_steps.as_ref()
     }
 }

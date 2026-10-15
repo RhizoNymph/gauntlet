@@ -1,0 +1,15 @@
+ip-10-0-1-23:30117:30117 [0] NCCL INFO Bootstrap : Using ens32:10.0.1.23<0>
+ip-10-0-1-23:30117:30117 [0] NCCL INFO NET/Plugin: Loaded net plugin Libfabric (v7)
+ip-10-0-1-23:30117:30117 [0] NCCL INFO NET/OFI Initializing aws-ofi-nccl 1.7.4-aws
+ip-10-0-1-23:30117:30117 [0] NCCL INFO NET/OFI Using Libfabric version 1.19
+ip-10-0-1-23:30117:30117 [0] NCCL INFO NET/OFI Selected Provider is efa (found 4 nics)
+ip-10-0-1-23:30117:30117 [0] NCCL INFO cudaDriverVersion 12020
+NCCL version 2.19.3+cuda12.2
+ip-10-0-1-23:30117:30117 [0] NCCL INFO NCCL version 2.19.3+cuda12.2
+ip-10-0-1-23:30117:30169 [0] NCCL INFO Using network Libfabric
+ip-10-0-1-23:30117:30169 [0] NCCL INFO comm 0x5612a3b0 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 101c0 commId 0x4aa2c7e1 - Init START
+ip-10-0-1-23:30117:30169 [0] NCCL INFO Channel 00/0 : 15[7] -> 0[0] [receive] via NET/Libfabric/0/GDRDMA
+ip-10-0-1-23:30117:30169 [0] NCCL INFO Channel 00/0 : 0[0] -> 1[1] via P2P/IPC
+ip-10-0-1-23:30117:30176 [7] NCCL INFO Channel 00/0 : 7[7] -> 8[0] [send] via NET/Libfabric/3/GDRDMA
+ip-10-0-1-23:30117:30169 [0] NCCL INFO Connected all rings
+ip-10-0-1-23:30117:30169 [0] NCCL INFO comm 0x5612a3b0 rank 0 nranks 16 cudaDev 0 nvmlDev 0 busId 101c0 commId 0x4aa2c7e1 - Init COMPLETE

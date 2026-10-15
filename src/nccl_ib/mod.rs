@@ -30,7 +30,7 @@ use crate::nccl_env::NcclEnv;
 use crate::proto::nccl_nics::{
     ExcludedPort, GpuLocality, IB_DISABLE, IB_HCA, NET, NetChoice, PortExclusion, SelectedPort,
 };
-use crate::proto::{IbPortInventory, InventorySnapshot, NcclNicSummary, PortState, pci_locality};
+use crate::proto::{IbPortInventory, InventorySnapshot, NcclNicSummary, pci_locality};
 use hca::HcaFilter;
 
 /// The NCCL knobs that decide the IB transport's port list.
@@ -144,13 +144,8 @@ pub fn classify_port(config: &NcclIbConfig, port: &IbPortInventory) -> Result<()
     if config.ib_disabled() {
         return Err(PortExclusion::IbDisabled);
     }
-    if port.logical_state() != PortState::Active {
-        return Err(PortExclusion::NotActive {
-            state: port.state.clone(),
-        });
-    }
-    if !port.link_layer.nccl_capable() {
-        return Err(PortExclusion::UnsupportedLinkLayer);
+    if let Some(exclusion) = port.nccl_port_exclusion() {
+        return Err(exclusion);
     }
     if !config.hca().matches(&port.device, port.port) {
         return Err(PortExclusion::FilteredByHca);

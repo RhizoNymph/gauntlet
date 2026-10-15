@@ -69,7 +69,7 @@ all-core throughput run so the package is already at thermal steady state.
 ## Reporting
 
 SDC hits are hard failures, never MAD outliers: Failed outcomes already
-drive `Verdict::Stragglers` (exit code 1). Additionally
+drive `Verdict::Failures` (exit code 3). Additionally
 `fleet.sdc_failures` (schema v4) groups Failed outcomes of the four
 correctness screens (`cpu_correctness`, `cpu_sdc_hot`,
 `gpu_gemm_correctness`, `gpu_gemm_sdc`) as
