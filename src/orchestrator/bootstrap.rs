@@ -772,6 +772,7 @@ mod tests {
                 .map(|(name, ok)| (name.to_string(), ok))
                 .collect(),
             cuda_visible_gpus: None,
+            gpu_driver: None,
         }
     }
 

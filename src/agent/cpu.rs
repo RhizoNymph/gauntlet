@@ -145,8 +145,9 @@ fn run_correctness(
         handles
             .into_iter()
             .map(|handle| {
-                handle.join().unwrap_or_else(|_| TestOutcome::Failed {
-                    reason: "correctness worker panicked".to_string(),
+                // The screen never reached a verdict: not an SDC finding.
+                handle.join().unwrap_or_else(|_| {
+                    TestOutcome::infrastructure_failure("correctness worker panicked")
                 })
             })
             .collect()
@@ -274,9 +275,9 @@ fn run_hot_correctness(
             .into_iter()
             .map(|handle| {
                 handle.join().unwrap_or_else(|_| {
-                    Err(TestOutcome::Failed {
-                        reason: "hot SDC worker panicked".to_string(),
-                    })
+                    Err(TestOutcome::infrastructure_failure(
+                        "hot SDC worker panicked",
+                    ))
                 })
             })
             .collect()

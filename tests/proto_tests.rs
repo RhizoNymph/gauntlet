@@ -24,6 +24,7 @@ fn sample_inventory() -> InventorySnapshot {
         xid_errors: vec![79],
         gpu_libs: std::collections::BTreeMap::new(),
         cuda_visible_gpus: None,
+        gpu_driver: None,
     }
 }
 

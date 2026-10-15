@@ -27,14 +27,15 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use cudarc::driver::{CudaContext, CudaSlice};
+use cudarc::driver::CudaSlice;
 use cudarc::nccl::ReduceOp;
 
 use super::gemm::{dtype_tag, sustained_gflops_value};
-use super::guard;
 use super::node_comm::{NodeComm, nccl_error};
 use super::worker::GemmLoad;
+use super::{device_availability, guard_typed, runtime_failure_outcome};
 use crate::agent::EventSink;
+use crate::agent::gpu_driver::DeviceAvailability;
 use crate::agent::nccl::{F32_BYTES, all_reduce_bus_gib_per_sec, message_elements};
 use crate::agent::transport::CaptureWindow;
 use crate::agent::window::hard_deadline_secs;
@@ -60,14 +61,29 @@ fn per_iter_secs(elapsed_secs: f64, iters: u64) -> f64 {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run the overlap test. Node-level failures (driver init, communicator
-/// init) become Failed outcomes; fewer than two GPUs is a Skipped outcome
-/// (a world of one moves nothing, so there is no contention to measure).
+/// Run the overlap test. A node without a usable GPU (no NVIDIA hardware,
+/// or a driver that cannot drive it: `gpu_driver`'s finding) and fewer
+/// than two GPUs are Skipped outcomes (a world of one moves nothing, so
+/// there is no contention to measure); a driver fault or a communicator
+/// failure is Failed.
 pub fn run(sink: &EventSink, spec: &OverlapSpec) -> Result<()> {
-    let device_count = match guard("cuda driver init", || Ok(CudaContext::device_count()?)) {
-        Ok(count) => count.max(0) as u32,
-        Err(reason) => {
-            node_outcomes(sink, |r| TestOutcome::Failed { reason: r }, &reason);
+    run_with(sink, spec, device_availability())
+}
+
+/// `run` on an already classified device probe.
+pub(crate) fn run_with(
+    sink: &EventSink,
+    spec: &OverlapSpec,
+    availability: DeviceAvailability,
+) -> Result<()> {
+    let device_count = match availability {
+        DeviceAvailability::Usable(count) => count.get(),
+        DeviceAvailability::Unavailable { reason } => {
+            node_outcomes(sink, |r| TestOutcome::Skipped { reason: r }, &reason);
+            return Ok(());
+        }
+        DeviceAvailability::Fault { reason } => {
+            node_outcomes(sink, TestOutcome::infrastructure_failure, &reason);
             return Ok(());
         }
     };
@@ -83,8 +99,11 @@ pub fn run(sink: &EventSink, spec: &OverlapSpec) -> Result<()> {
             spec.duration_secs
         ),
     );
-    if let Err(reason) = guard("overlap", || execute(sink, spec, device_count)) {
-        node_outcomes(sink, |r| TestOutcome::Failed { reason: r }, &reason);
+    if let Err(error) = guard_typed("overlap", || execute(sink, spec, device_count)) {
+        let outcome = runtime_failure_outcome(&error);
+        for test in [TestId::OverlapGemm, TestId::OverlapAllReduce] {
+            sink.outcome(test, Scope::Node, outcome.clone());
+        }
     }
     Ok(())
 }
@@ -242,5 +261,62 @@ mod tests {
         assert!((per_iter_secs(10.0, 100) - 0.1).abs() < 1e-12);
         // Cannot happen in the driver loop, but never divide by zero.
         assert_eq!(per_iter_secs(5.0, 0), 5.0);
+    }
+
+    fn spec() -> OverlapSpec {
+        OverlapSpec {
+            duration_secs: 1,
+            baseline_secs: 1,
+            gemm_dim: 64,
+            gemm_dtype: crate::proto::GemmDtype::Bf16,
+            msg_bytes: 1 << 20,
+        }
+    }
+
+    #[test]
+    fn an_unusable_node_skips_both_overlap_tests() {
+        for reason in [
+            "no NVIDIA GPU (none on the PCI bus)",
+            "no usable GPU (driver unavailable)",
+        ] {
+            let outcomes = super::super::tests::outcomes_of(|sink| {
+                run_with(
+                    sink,
+                    &spec(),
+                    DeviceAvailability::Unavailable {
+                        reason: reason.into(),
+                    },
+                )
+                .expect("overlap");
+            });
+            let tests: Vec<TestId> = outcomes.iter().map(|(test, ..)| *test).collect();
+            assert_eq!(tests, [TestId::OverlapGemm, TestId::OverlapAllReduce]);
+            for (_, _, outcome) in outcomes {
+                assert_eq!(
+                    outcome,
+                    TestOutcome::Skipped {
+                        reason: reason.into()
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_driver_fault_fails_both_overlap_tests() {
+        let outcomes = super::super::tests::outcomes_of(|sink| {
+            run_with(
+                sink,
+                &spec(),
+                DeviceAvailability::Fault {
+                    reason: "cuda driver init: CUDA_ERROR_UNKNOWN".into(),
+                },
+            )
+            .expect("overlap");
+        });
+        assert_eq!(outcomes.len(), 2);
+        for (_, _, outcome) in outcomes {
+            assert!(matches!(outcome, TestOutcome::Failed { .. }), "{outcome:?}");
+        }
     }
 }

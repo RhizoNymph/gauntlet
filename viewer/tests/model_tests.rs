@@ -71,6 +71,7 @@ fn inventory(hostname: &str, kernel: &str) -> InventorySnapshot {
         xid_errors: Vec::new(),
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: None,
+        gpu_driver: None,
     }
 }
 

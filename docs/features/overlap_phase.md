@@ -49,9 +49,15 @@ rounds × window cost for little extra attribution.
    0-2), sending `AgentTaskSpec` (with `OverlapTaskSpec`) to `agent run` on
    every host simultaneously.
 2. Agent (`agent/gpu/overlap.rs::run`):
-   - `< 2` GPUs → Skipped outcomes (a world of one moves nothing);
-     driver-init failure → Failed outcomes; all cudarc entry goes through
-     `gpu::guard` (dlopen panics become findings, per the phase-2 pattern).
+   - The node's classified `DeviceAvailability` (phase-2 "Device
+     availability", `run_with`): no usable GPU (no NVIDIA hardware, or
+     `CUDA_ERROR_NO_DEVICE` / `NOT_INITIALIZED` / an init-time load
+     failure) → Skipped `overlap_gemm` + `overlap_all_reduce` naming the
+     PCI GPUs, since the missing driver is the `gpu_driver` finding; `< 2`
+     GPUs → Skipped (a world of one moves nothing); a driver fault →
+     Failed (infrastructure) outcomes. A failure of the combined run is
+     classified the same way (`runtime_failure_outcome`). All cudarc entry
+     goes through `gpu::guard_typed`.
    - `execute`: `NodeComm::init` (`gpu/node_comm.rs`, shared with the
      intra-node NCCL sweep): one `CudaContext` per GPU; NCCL communicator
      via `Comm::from_devices` (`ncclCommInitAll`, single process, one rank

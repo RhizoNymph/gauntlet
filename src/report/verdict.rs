@@ -141,6 +141,11 @@ pub const fn failed_outcome_tier(test: TestId) -> EvidenceTier {
         // (`fleet.socket_fallbacks`). Skipped (no ports, NCCL_NET=Socket,
         // NCCL_IB_DISABLE) never reaches this.
         TestId::NcclNics => EvidenceTier::Hard,
+        // NVIDIA GPUs on the PCI bus that the driver cannot drive (module
+        // missing for the running kernel, not loaded, nvidia-smi failing):
+        // broken software on the node, and the *one* finding for that root
+        // cause — the GPU tests on such a host record Skipped.
+        TestId::GpuDriver => EvidenceTier::Hard,
     }
 }
 
@@ -148,7 +153,7 @@ pub const fn failed_outcome_tier(test: TestId) -> EvidenceTier {
 ///
 /// | input                                  | tier            |
 /// |----------------------------------------|-----------------|
-/// | Failed outcome, hard-tier test         | hard            |
+/// | Failed outcome, hard-tier test (incl. gpu_driver) | hard |
 /// | `fleet.sdc_failures`                   | hard            |
 /// | `fleet.counter_findings`               | hard            |
 /// | `fleet.socket_fallbacks`               | hard            |
@@ -233,5 +238,10 @@ mod tests {
     fn only_gpu_idle_is_soft() {
         assert_eq!(failed_outcome_tier(TestId::GpuIdle), EvidenceTier::Soft);
         assert_eq!(failed_outcome_tier(TestId::GpuGemmSdc), EvidenceTier::Hard);
+    }
+
+    #[test]
+    fn an_unavailable_driver_is_hard_evidence() {
+        assert_eq!(failed_outcome_tier(TestId::GpuDriver), EvidenceTier::Hard);
     }
 }

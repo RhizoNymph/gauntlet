@@ -33,7 +33,8 @@ connected fleet graph plus a quantitative metric table.
 - Fleet graph: nodes on a ring, one edge per host pair. Node color encodes
   host health: green ok, amber = performance outlier or threshold
   violation, red = failed/errored. Nodes whose only findings are version
-  skew (inventory consistency dissent) render as hollow amber rings — the
+  skew (inventory consistency dissent, or a field with no majority —
+  every host of a `consistency_splits` field, noted "(no majority)") render as hollow amber rings — the
   fleet-card chips split the same way ("perf outliers" vs "version skew"),
   so skew never masquerades as a straggler. Edge color encodes
   pairwise-path health; edge midpoints show worst-case direction
@@ -84,7 +85,7 @@ runs/<run_id>.json
        └─ model::ViewModel::new(&RunResults)     [pure, tested]
             ├─ nodes:  severity ⇐ failed_hosts / Failed outcomes (non-pair
             │          scope) = Bad; outliers, threshold violations,
-            │          consistency dissent = Warn. Roofline digest from
+            │          consistency dissent or split = Warn. Roofline digest from
             │          calibration.rooflines.
             ├─ edges:  built from HostPair-scoped metrics (net_bandwidth
             │          gib_per_sec, net_latency rtt_p50/p99), kept per

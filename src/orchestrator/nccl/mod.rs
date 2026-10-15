@@ -848,4 +848,12 @@ mod tests {
         // No CUDA count at all: the host contributes no ranks.
         assert_eq!(nccl_rank_count(&inventory(8, None)), 0);
     }
+
+    #[test]
+    fn a_host_with_an_unavailable_driver_contributes_no_ranks() {
+        // nvidia-smi failed (gpus = 0) and CUDA_ERROR_NO_DEVICE left the
+        // count unknown: excluded from every fleet world.
+        assert_eq!(nccl_rank_count(&inventory(0, None)), 0);
+        assert_eq!(nccl_rank_count(&inventory(0, Some(0))), 0);
+    }
 }

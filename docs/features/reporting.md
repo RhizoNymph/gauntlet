@@ -16,14 +16,29 @@ started, finished)`:
    inserted, so `outliers.is_empty()` means a clean fleet.
 3. Absolute `thresholds.absolute` bounds → `fleet.threshold_violations`
    (offending sample keys; only non-empty groups inserted).
-4. `proto::consistency_fields` majority vote → `fleet.consistency`
-   (fields where ≥1 host dissents; majority = most common value, ties
-   broken by the lexicographically smallest value). Optional fields
-   (nvidia_driver, cuda_version) report "(absent)" rather than being
-   skipped, so present-vs-absent skew dissents; `lib:<name>` fields carry
-   the dlopen probe results on GPU-bearing hosts. Each host's
-   `NcclNicSummary::consistency_fields` (nccl_ib_ports /
-   nccl_ib_link_layer / nccl_ib_ceiling_gbps) join the vote.
+4. Majority vote over the typed `proto::consistency_values`
+   (`report/consistency.rs`, schema v18):
+   - Values are `FieldValue::Present(String)` or `Missing` (optional
+     fields such as nvidia_driver / cuda_version that a host lacks;
+     rendered "(absent)"). The majority is computed over **present values
+     only**: a missing value can never win.
+   - A present value held by strictly more hosts than any other present
+     value is the majority → `fleet.consistency[field] = { majority_value,
+     dissenters }`, dissenters being every host with another value,
+     **missing included** (a host without a value dissents whenever any
+     host has one).
+   - Present values with no strict plurality (a tie, e.g. 580.65.06 /
+     590.48.01 / absent) → no majority: `fleet.consistency_splits[field]
+     = { values }` with every host's value; nobody is called a
+     dissenter. The terminal table shows these rows with majority
+     "(no majority)"; the viewer notes "(no majority)".
+   - All hosts equal (or all missing) → nothing reported.
+   `lib:<name>` fields carry the dlopen probe results on GPU-bearing
+   hosts. Each host's `NcclNicSummary::consistency_fields`
+   (nccl_ib_ports / nccl_ib_link_layer / nccl_ib_ceiling_gbps) join the
+   vote as present values. (Before v18 ties went to the lexicographically
+   smallest value, which let "(absent)" outvote two hosts with different
+   drivers.)
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
    (The per-host NCCL NIC summary and its ceiling live in
@@ -177,9 +192,9 @@ Per-host `NodeRoofline`:
 ## Rendering
 `render_table` (comfy-table, writer-injected for tests) emits a header line
 then sections: per-host summary (pass/fail/skip counts + key rooflines),
-silent data corruption, gpus in use (gpu_idle), nccl nics (only when
+silent data corruption (correctness findings only, never infrastructure errors), gpus in use (gpu_idle), nccl nics (only when
 some host has an IB/RoCE port), outliers (subject, metric, value vs fleet median, MADs), absolute-threshold
-violations, inventory consistency dissenters, failed hosts, and the link
+violations, inventory consistency dissenters (and "(no majority)" rows for splits), failed hosts, and the link
 alpha-beta digest (whose `bound` column shows the active constraint's
 label, e.g. `alpha=0`, or `-` for a clean fit). Empty sections either state "none" (outliers,
 consistency) or are omitted (violations, failures, links). `render_saved`
@@ -297,17 +312,18 @@ input to `verdict()`:
 | input                                              | tier            |
 |----------------------------------------------------|-----------------|
 | Failed outcome of a hard-tier test (correctness, SDC screens, NCCL, intra-node, overlap, inventory visibility, ...) | hard (3) |
-| `fleet.sdc_failures` (derived from Failed outcomes; checked directly too) | hard (3) |
+| `fleet.sdc_failures` (correctness findings among Failed SDC-screen outcomes, never infrastructure errors — `report::is_sdc_finding`; checked directly too) | hard (3) |
 | `fleet.counter_findings` (error counters that went up under load) | hard (3) |
 | `fleet.socket_fallbacks` (multi-host NCCL communicator on TCP sockets while IB was not disabled) | hard (3) |
 | Failed `nccl_nics` outcome (predicted socket fallback: usable IB/RoCE ports, none selected under the fleet-level env) | hard (3) |
+| Failed `gpu_driver` outcome (NVIDIA GPUs on the PCI bus, driver unavailable: module missing for the running kernel / not loaded, nvidia-smi failing); the GPU tests on that host are Skipped, so the root cause counts once | hard (3) |
 | `fleet.failed_hosts` (Fatal, transport, timeout, deploy) | host failure (2) |
 | Failed `gpu_idle` outcome                          | soft (1)        |
 | `fleet.outliers` (MAD)                             | soft (1)        |
 | `fleet.threshold_violations` (absolute bounds)     | soft (1)        |
 | `fleet.barrier_stragglers`                         | soft (1)        |
 | `fleet.jitter_outliers`                            | informational   |
-| `fleet.consistency`                                | informational   |
+| `fleet.consistency`, `fleet.consistency_splits`    | informational   |
 | `Skipped` outcomes                                 | informational   |
 
 Absolute thresholds count as soft: a value under a configured floor is a

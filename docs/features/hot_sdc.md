@@ -70,12 +70,28 @@ all-core throughput run so the package is already at thermal steady state.
 
 SDC hits are hard failures, never MAD outliers: Failed outcomes already
 drive `Verdict::Failures` (exit code 3). Additionally
-`fleet.sdc_failures` (schema v4) groups Failed outcomes of the four
-correctness screens (`cpu_correctness`, `cpu_sdc_hot`,
-`gpu_gemm_correctness`, `gpu_gemm_sdc`) as
+`fleet.sdc_failures` (schema v4) groups the *SDC findings* among Failed
+outcomes of the four correctness screens (`cpu_correctness`,
+`cpu_sdc_hot`, `gpu_gemm_correctness`, `gpu_gemm_sdc`) as
 `"host[:scope]: reason"`, and the terminal table renders them in a
 dedicated "silent data corruption (hard failures)" section above the
-fleet-relative sections. Metrics still flow through the normal aggregate
+fleet-relative sections.
+
+Only genuine correctness failures are SDC findings (schema v18,
+`report::is_sdc_finding`): the test id must be a correctness screen
+*and* the failure kind (`proto::FailureKind`, from
+`TestOutcome::failure_kind`) must be `Finding` — a mismatch or a
+non-finite result. Infrastructure errors that kept a screen from running
+(a CUDA/driver error, a panicked worker) are `Infrastructure`: still hard
+Failed outcomes of their test, never listed as data corruption. Because
+`TestOutcome::Failed` carries only a reason string (on the wire, built in
+many places), the kind rides the reason: agents build infrastructure
+failures with `TestOutcome::infrastructure_failure`, which prefixes
+`"infrastructure error: "`, and as a backstop any reason containing a
+CUDA driver error code (`CUDA_ERROR_`) is infrastructure — no mismatch
+report ever contains one. A node without a usable GPU records the GPU
+screens Skipped (docs/features/phase2_gpu.md) and the driver as the
+`gpu_driver` finding. Metrics still flow through the normal aggregate
 machinery; all-zero mismatch groups have zero MAD and are never flagged.
 
 ## Files
@@ -111,3 +127,6 @@ machinery; all-zero mismatch groups have zero MAD and are never flagged.
 - Both spec fields are `#[serde(default)]`: absence means disabled, and
   v1 documents keep decoding.
 - Any SDC mismatch anywhere ⇒ per-scope Failed outcome ⇒ exit code ≥ 1.
+- `fleet.sdc_failures` never lists an infrastructure failure (CUDA or
+  driver error, panicked worker); worker panics in the CPU screens are
+  built with `TestOutcome::infrastructure_failure`.

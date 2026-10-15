@@ -10,18 +10,20 @@
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use thiserror::Error;
 
 use crate::agent::EventSink;
+use crate::agent::gpu_driver::{self, DriverProbeRoots};
 use crate::agent::gpu_occupancy::{self, AgentIdentity, PciBusId};
 use crate::agent::sysfs::read_trimmed;
 use crate::agent::{ib, pci};
 use crate::proto::{
-    AgentEvent, GpuInventory, GpuOccupancy, InventorySnapshot, NicInventory, PciLocation, Scope,
-    TestId, TestOutcome, gpu_visibility_mismatch,
+    AgentEvent, GpuInventory, GpuOccupancy, InventorySnapshot, NicInventory, NvidiaSmiFailure,
+    PciLocation, Scope, TestId, TestOutcome, gpu_visibility_mismatch,
 };
 
 /// Upper bound on any single external probe. `collect()` runs at most a
@@ -69,18 +71,24 @@ pub fn collect() -> Result<InventorySnapshot> {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").context("reading /proc/cpuinfo")?;
     let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
 
-    let (gpus, nvidia_driver) = probe_gpus();
+    let GpuProbe {
+        gpus,
+        driver: nvidia_driver,
+        smi,
+    } = probe_gpus();
     let cuda_version = if gpus.is_empty() {
         None
     } else {
         probe_cuda_version()
     };
+    let kernel = kernel_release();
+    let gpu_driver = gpu_driver::probe(&DriverProbeRoots::default(), smi, &kernel);
 
     let ib = ib::probe(Path::new(ib::INFINIBAND_ROOT));
 
     Ok(InventorySnapshot {
         hostname,
-        kernel: kernel_release(),
+        kernel,
         cpu_model: cpu_model(&cpuinfo),
         logical_cores: logical_cores(&cpuinfo),
         numa_nodes: numa_node_count(),
@@ -96,6 +104,7 @@ pub fn collect() -> Result<InventorySnapshot> {
         xid_errors: probe_xid_errors(),
         gpu_libs: probe_gpu_libs(),
         cuda_visible_gpus: probe_cuda_visible_gpus(),
+        gpu_driver: Some(gpu_driver),
     })
 }
 
@@ -253,17 +262,33 @@ fn probe_nics() -> Vec<NicInventory> {
 // nvidia-smi
 // ---------------------------------------------------------------------------
 
-/// Returns the per-GPU inventory (occupancy included) plus the driver
-/// version reported alongside it. An absent or failing `nvidia-smi` means
-/// "no GPUs", not an error; a failing compute-apps query leaves every GPU's
-/// process list unknown.
-fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
-    let Some(gpu_query) = run_capture(
+/// What the nvidia-smi GPU query found.
+struct GpuProbe {
+    gpus: Vec<GpuInventory>,
+    driver: Option<String>,
+    /// GPUs listed, or how the query failed: the driver-state input.
+    smi: Result<usize, NvidiaSmiFailure>,
+}
+
+/// The per-GPU inventory (occupancy included), the driver version reported
+/// alongside it, and the query's status. An absent or failing `nvidia-smi`
+/// means "no GPUs" in the inventory, not an error (the driver state then
+/// says whether the PCI bus disagrees); a failing compute-apps query
+/// leaves every GPU's process list unknown.
+fn probe_gpus() -> GpuProbe {
+    let gpu_query = match run_probe(
         "nvidia-smi",
         &[GPU_QUERY, "--format=csv,noheader,nounits"],
         PROBE_TIMEOUT,
-    ) else {
-        return (Vec::new(), None);
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return GpuProbe {
+                gpus: Vec::new(),
+                driver: None,
+                smi: Err(error.nvidia_smi_failure()),
+            };
+        }
     };
     let compute_apps = run_capture(
         "nvidia-smi",
@@ -283,7 +308,11 @@ fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
     for location in gpus.iter_mut().filter_map(|gpu| gpu.pci.as_mut()) {
         pci::resolve(pci_root, location);
     }
-    (gpus, driver)
+    GpuProbe {
+        smi: Ok(gpus.len()),
+        gpus,
+        driver,
+    }
 }
 
 /// Pure core of `probe_gpus`: the `GPU_QUERY` CSV joined with the
@@ -557,51 +586,127 @@ pub(crate) fn parse_xid_line(line: &str) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 /// Run a probe command and capture its stdout, giving up after `timeout`.
-///
-/// The child is spawned with piped stdout drained on a helper thread (a
-/// blocking `wait()` would deadlock if the child filled the pipe) and killed
-/// if it outlives the deadline, so a wedged tool can never stall `collect()`.
-/// A missing binary, a non-zero exit, or a timeout all yield `None`.
+/// A missing binary, a non-zero exit, or a timeout all yield `None`; use
+/// [`run_probe`] when the caller needs to know which.
 pub(crate) fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    run_probe(program, args, timeout).ok()
+}
+
+/// Why a probe command produced no usable output.
+#[derive(Debug, Error)]
+pub(crate) enum ProbeError {
+    #[error("not found")]
+    NotFound,
+    #[error("could not start: {0}")]
+    Spawn(std::io::Error),
+    #[error("could not be waited on: {0}")]
+    Wait(std::io::Error),
+    #[error("timed out")]
+    TimedOut,
+    /// Exited non-zero; `output` is stdout followed by stderr, lossily
+    /// decoded (tools print their failure on either).
+    #[error("exited with {status}")]
+    Exited { status: ExitStatus, output: String },
+    #[error("output is not UTF-8")]
+    NotUtf8,
+}
+
+impl ProbeError {
+    /// What a failed nvidia-smi GPU query tells about the driver.
+    fn nvidia_smi_failure(self) -> NvidiaSmiFailure {
+        match self {
+            ProbeError::NotFound => NvidiaSmiFailure::NotFound,
+            ProbeError::TimedOut => NvidiaSmiFailure::TimedOut,
+            ProbeError::Exited { status, output } => NvidiaSmiFailure::Failed {
+                message: first_line(&output).map_or_else(|| status.to_string(), str::to_string),
+            },
+            other @ (ProbeError::Spawn(_) | ProbeError::Wait(_) | ProbeError::NotUtf8) => {
+                NvidiaSmiFailure::Failed {
+                    message: other.to_string(),
+                }
+            }
+        }
+    }
+}
+
+fn first_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// Run a probe command and capture its stdout, giving up after `timeout`.
+///
+/// The child is spawned with piped stdout and stderr, each drained on a
+/// helper thread (a blocking `wait()` would deadlock if the child filled a
+/// pipe), and killed if it outlives the deadline, so a wedged tool can
+/// never stall `collect()`.
+pub(crate) fn run_probe(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, ProbeError> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let drain = std::thread::spawn(move || {
-        let mut buffer = Vec::new();
-        let _ = stdout.take(MAX_CAPTURE_BYTES).read_to_end(&mut buffer);
-        buffer
-    });
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => ProbeError::NotFound,
+            _ => ProbeError::Spawn(error),
+        })?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(pipe) = pipe {
+                let _ = pipe.take(MAX_CAPTURE_BYTES).read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+    );
 
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break None;
+                    break Err(ProbeError::TimedOut);
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => {
+            Err(error) => {
                 let _ = child.kill();
-                break None;
+                break Err(ProbeError::Wait(error));
             }
         }
     };
-    // Joining is safe either way: killing the child closes the pipe, so the
-    // drain thread always terminates.
-    let bytes = drain.join().ok()?;
-    if !status?.success() {
-        return None;
+    // Joining is safe either way: killing the child closes the pipes, so
+    // the drain threads always terminate. A drain thread cannot panic; a
+    // failed join reads as empty output.
+    let out = stdout.join().unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
+    let status = status?;
+    if !status.success() {
+        let mut output = String::from_utf8_lossy(&out).into_owned();
+        output.push('\n');
+        output.push_str(&String::from_utf8_lossy(&err));
+        return Err(ProbeError::Exited { status, output });
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(out).map_err(|_| ProbeError::NotUtf8)
 }
 
 #[cfg(test)]
@@ -793,6 +898,47 @@ mod tests {
     fn gpu_query_names_the_occupancy_fields_last() {
         assert!(GPU_QUERY.ends_with("driver_version,pci.bus_id,memory.used"));
         assert_eq!(GPU_QUERY.matches(',').count(), 14, "15 fields");
+    }
+
+    #[test]
+    fn probe_failures_are_typed() {
+        assert!(matches!(
+            run_probe("gauntlet-no-such-binary", &[], QUICK_TIMEOUT),
+            Err(ProbeError::NotFound)
+        ));
+        // nvidia-smi prints its "has failed" text and exits non-zero.
+        let failed = run_probe(
+            "sh",
+            &["-c", "echo; echo 'NVIDIA-SMI has failed because it couldn'\"'\"'t communicate with the NVIDIA driver.' >&2; exit 9"],
+            PROBE_TIMEOUT,
+        )
+        .expect_err("non-zero exit");
+        assert!(matches!(failed, ProbeError::Exited { .. }), "{failed:?}");
+        assert_eq!(
+            failed.nvidia_smi_failure(),
+            NvidiaSmiFailure::Failed {
+                message: "NVIDIA-SMI has failed because it couldn't communicate with the \
+                          NVIDIA driver."
+                    .into()
+            }
+        );
+        let silent = run_probe("sh", &["-c", "exit 4"], PROBE_TIMEOUT).expect_err("exit 4");
+        let NvidiaSmiFailure::Failed { message } = silent.nvidia_smi_failure() else {
+            panic!("expected Failed");
+        };
+        assert!(message.contains('4'), "{message}");
+        assert!(matches!(
+            run_probe("sleep", &["5"], Duration::from_millis(50)),
+            Err(ProbeError::TimedOut)
+        ));
+        assert_eq!(
+            ProbeError::NotFound.nvidia_smi_failure(),
+            NvidiaSmiFailure::NotFound
+        );
+        assert_eq!(
+            run_probe("sh", &["-c", "echo ok"], PROBE_TIMEOUT).expect("ok"),
+            "ok\n"
+        );
     }
 
     #[test]

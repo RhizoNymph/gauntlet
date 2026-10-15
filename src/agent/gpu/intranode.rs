@@ -5,11 +5,11 @@
 //! `agent::intranode`.
 
 use anyhow::Result;
-use cudarc::driver::{CudaContext, CudaSlice};
+use cudarc::driver::CudaSlice;
 use cudarc::nccl::ReduceOp;
 
-use super::guard;
 use super::node_comm::{NodeComm, nccl_error};
+use super::{device_availability, guard};
 use crate::agent::EventSink;
 use crate::agent::intranode::{self, MultiGpuWorld};
 use crate::agent::sweep::{
@@ -20,25 +20,22 @@ use crate::nccl_level::NcclLevel;
 use crate::nccl_transport::CommSpan;
 use crate::proto::{LogLevel, NcclSweepSpec};
 
-/// Run the intra-node sweep on this node. Never errors: every failure
-/// (driver, communicator, collective, loader panic) becomes a Failed
-/// outcome, fewer than two GPUs a Skipped one.
+/// Run the intra-node sweep on this node. Never errors: a node without a
+/// usable GPU (no NVIDIA hardware, or a driver that cannot drive it) and
+/// fewer than two GPUs are Skipped outcomes; every other failure (driver
+/// fault, communicator, collective, loader panic) a Failed one.
 pub fn run(sink: &EventSink, spec: &NcclSweepSpec) -> Result<()> {
-    intranode::run_gated(
-        sink,
-        || guard("cuda driver init", || Ok(CudaContext::device_count()?)).map(|n| n.max(0) as u32),
-        |world| {
-            sink.log(
-                LogLevel::Info,
-                format!(
-                    "intra-node nccl sweep: {} GPUs, {} sizes",
-                    world.get(),
-                    spec.sizes.len()
-                ),
-            );
-            guard("intra-node nccl sweep", || execute(sink, spec, world))
-        },
-    );
+    intranode::run_gated_devices(sink, device_availability, |world| {
+        sink.log(
+            LogLevel::Info,
+            format!(
+                "intra-node nccl sweep: {} GPUs, {} sizes",
+                world.get(),
+                spec.sizes.len()
+            ),
+        );
+        guard("intra-node nccl sweep", || execute(sink, spec, world))
+    });
     Ok(())
 }
 

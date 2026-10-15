@@ -86,7 +86,7 @@ Overview:
     fleet.socket_fallbacks (the observed fallback). The fleet level's env
     also decides, orchestrator-side, which inventoried IB/RoCE ports NCCL
     would use (the predicted view): every arriving inventory goes through
-    orchestrator::derive::derive_inventory_events (gpu_idle outcomes;
+    orchestrator::derive::derive_inventory_events (gpu_driver outcome; gpu_idle outcomes;
     nccl_nics outcome + ceiling metric + NcclNics summary), which the
     collector records like agent events (hosts.*.nccl_nics).
     report::build only reads those results (consistency fields, the "nccl
@@ -152,7 +152,15 @@ Features Index:
       PCI address/NUMA node/upstream bridges from the innermost host
       bridge; proto v13) and GPU PCI placement; clock sync offset;
       per-GPU occupancy (memory used/total, compute processes by bus id).
-    entry_points: [agent/inventory.rs, agent/ib.rs, agent/pci.rs, agent/sysfs.rs, agent/gpu_occupancy.rs]
+      GPU driver state (proto v14 / schema v18): NVIDIA GPUs detected on
+      the PCI bus from sysfs vendor/class independently of the driver,
+      with the nvidia module's state (/sys/module, modules.dep of the
+      running kernel) and how nvidia-smi failed, as a typed
+      GpuDriverState (no NVIDIA hardware / driver ok / driver unavailable
+      with a non-empty PCI GPU list); the orchestrator derives one
+      gpu_driver outcome per host (Failed = hard evidence, Passed,
+      Skipped), the single finding for a missing driver.
+    entry_points: [agent/inventory.rs, agent/gpu_driver.rs, agent/ib.rs, agent/pci.rs, agent/sysfs.rs, agent/gpu_occupancy.rs, proto/gpu_driver.rs, orchestrator/derive.rs]
     depends_on: []
     doc: docs/features/phase0_inventory.md
   gpu_idle:
@@ -187,7 +195,15 @@ Features Index:
       training dtype), sustained 30-60s cuBLAS GEMM with clock/temp sampling
       (thermal-throttle detection), D2D + pinned H2D/D2H bandwidth (PCIe
       downtraining detection), NVLink p2p pair bandwidth/latency. All cudarc.
-    entry_points: [agent/gpu/]
+      Driver init is classified (DeviceAvailability: usable / unavailable
+      / fault; pure classify_driver_error over cudarc's DriverError): no
+      NVIDIA GPU or a driver that cannot drive it (NO_DEVICE,
+      NOT_INITIALIZED, init-time load failure) records every GPU test
+      Skipped naming the PCI GPUs (gpu_driver carries the finding); a
+      genuine CUDA error on a working driver stays Failed as an
+      infrastructure failure. The overlap phase and intra-node sweep gate
+      on the same classification.
+    entry_points: [agent/gpu/, agent/gpu_driver.rs]
     depends_on: [phase0_inventory]
     doc: docs/features/phase2_gpu.md
   hot_sdc:
@@ -198,8 +214,12 @@ Features Index:
       throughput-neutral), and an all-core CPU screen interleaving checksum
       rounds with the power-heavy FMA workload. Mismatches are hard
       per-scope failures with clock/temp context; fleet.sdc_failures +
-      dedicated table section.
-    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs]
+      dedicated table section, listing only correctness findings: the
+      failure kind (proto::FailureKind via TestOutcome::failure_kind;
+      infrastructure failures carry an "infrastructure error: " reason
+      prefix, CUDA_ERROR_ codes count as infrastructure too) keeps driver
+      and CUDA errors out (schema v18).
+    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs, proto/failure.rs]
     depends_on: [phase1_cpu_mem_disk, phase2_gpu]
     doc: docs/features/hot_sdc.md
   phase3_network:
@@ -405,6 +425,11 @@ Features Index:
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
+      Consistency (schema v18) votes over typed present/missing values:
+      the majority is a strict plurality of present values (a missing
+      value never wins, and dissents whenever any host has a value); a
+      field without one goes to fleet.consistency_splits with every
+      host's value instead of naming arbitrary dissenters.
     entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, report/consistency.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport, nccl_nics, slurm_launch]
     doc: docs/features/reporting.md

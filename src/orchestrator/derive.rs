@@ -5,12 +5,14 @@
 //! through [`derive_inventory_events`], whose events follow the inventory
 //! through the normal sink, so the collector records them (and partial
 //! snapshots show them) exactly like agent events. The report only ever
-//! reads these recorded results; it never re-derives.
+//! reads these recorded results; it never re-derives. The `gpu_driver`
+//! outcome needs no config, but rides the same hook so every
+//! inventory-derived test is made in one place.
 
 use crate::config::FleetConfig;
 use crate::nccl_ib::{NcclIbConfig, summarize};
 use crate::nccl_level::NcclLevel;
-use crate::proto::{AgentEvent, InventorySnapshot, TestId, gpu_idle_outcomes};
+use crate::proto::{AgentEvent, InventorySnapshot, Scope, TestId, gpu_idle_outcomes};
 
 /// The config slice the derivations need, resolved once per phase.
 #[derive(Debug, Clone)]
@@ -39,6 +41,9 @@ impl InventoryDerivation {
 }
 
 /// Everything derived from one inventory, in emission order:
+/// - when the snapshot records a driver state: the node-scope `gpu_driver`
+///   outcome (Failed: NVIDIA GPUs on the PCI bus, driver unavailable;
+///   Passed: driver ok; Skipped: no NVIDIA hardware);
 /// - one `gpu_idle` outcome per GPU (index order);
 /// - when the NCCL env is known: the node-scope `nccl_nics` outcome, the
 ///   `nccl_nics.ceiling_gib_per_sec` metric when it applies, and the
@@ -47,19 +52,30 @@ pub fn derive_inventory_events(
     snapshot: &InventorySnapshot,
     derivation: &InventoryDerivation,
 ) -> Vec<AgentEvent> {
-    let mut events: Vec<AgentEvent> = gpu_idle_outcomes(snapshot, derivation.gpu_idle_max_used_mib)
-        .into_iter()
-        .map(|(scope, outcome)| AgentEvent::Outcome {
-            test: TestId::GpuIdle,
-            scope,
-            outcome,
+    let mut events: Vec<AgentEvent> = snapshot
+        .gpu_driver
+        .as_ref()
+        .map(|state| AgentEvent::Outcome {
+            test: TestId::GpuDriver,
+            scope: Scope::Node,
+            outcome: state.outcome(),
         })
+        .into_iter()
         .collect();
+    events.extend(
+        gpu_idle_outcomes(snapshot, derivation.gpu_idle_max_used_mib)
+            .into_iter()
+            .map(|(scope, outcome)| AgentEvent::Outcome {
+                test: TestId::GpuIdle,
+                scope,
+                outcome,
+            }),
+    );
     if let Some(nccl_ib) = &derivation.nccl_ib {
         let summary = summarize(snapshot, nccl_ib);
         events.push(AgentEvent::Outcome {
             test: TestId::NcclNics,
-            scope: crate::proto::Scope::Node,
+            scope: Scope::Node,
             outcome: summary.outcome(),
         });
         if let Some(record) = summary.ceiling_metric() {
