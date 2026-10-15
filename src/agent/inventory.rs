@@ -16,28 +16,48 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::agent::EventSink;
-use crate::proto::{AgentEvent, GpuInventory, IbPortInventory, InventorySnapshot, NicInventory};
+use crate::agent::gpu_occupancy::{self, AgentIdentity, PciBusId};
+use crate::agent::sysfs::read_trimmed;
+use crate::agent::{ib, pci};
+use crate::proto::{
+    AgentEvent, GpuInventory, GpuOccupancy, InventorySnapshot, NicInventory, PciLocation, Scope,
+    TestId, TestOutcome, gpu_visibility_mismatch,
+};
 
 /// Upper bound on any single external probe. `collect()` runs at most a
 /// handful of these, keeping the documented < 5s budget with room to spare.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const QUICK_TIMEOUT: Duration = Duration::from_secs(1);
 /// Kernel logs can be huge; a bounded read keeps the Xid scan cheap.
 const MAX_CAPTURE_BYTES: u64 = 8 << 20;
 
 /// Fields queried from `nvidia-smi` in one shot. `driver_version` is folded
 /// into the same query rather than costing a second process spawn.
+/// New fields go at the end so existing positions stay put.
 const GPU_QUERY: &str = concat!(
     "--query-gpu=index,name,uuid,vbios_version,memory.total,",
     "ecc.errors.uncorrected.volatile.total,remapped_rows.pending,",
     "pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,",
-    "pcie.link.width.max,persistence_mode,driver_version"
+    "pcie.link.width.max,persistence_mode,driver_version,",
+    // Occupancy (proto v10): the bus id joins the compute-apps query onto
+    // a GPU index; memory.used feeds the gpu_idle threshold.
+    "pci.bus_id,memory.used"
 );
 
 /// Collect the snapshot and emit it as an event.
 pub fn run(sink: &EventSink) -> Result<()> {
     let snapshot = Box::new(collect()?);
+    // A GPU-visibility mismatch is a per-host finding: this host will run
+    // fewer fleet NCCL ranks than it has GPUs.
+    let mismatch = gpu_visibility_mismatch(&snapshot);
     sink.emit(&AgentEvent::Inventory { snapshot });
+    if let Some(reason) = mismatch {
+        sink.outcome(
+            TestId::Inventory,
+            Scope::Node,
+            TestOutcome::Failed { reason },
+        );
+    }
     Ok(())
 }
 
@@ -56,6 +76,8 @@ pub fn collect() -> Result<InventorySnapshot> {
         probe_cuda_version()
     };
 
+    let ib = ib::probe(Path::new(ib::INFINIBAND_ROOT));
+
     Ok(InventorySnapshot {
         hostname,
         kernel: kernel_release(),
@@ -69,10 +91,29 @@ pub fn collect() -> Result<InventorySnapshot> {
         cuda_version,
         gpus,
         nics: probe_nics(),
-        ib_ports: probe_ib_ports(),
+        ib_ports: ib.ports,
+        ib_devices: ib.devices,
         xid_errors: probe_xid_errors(),
         gpu_libs: probe_gpu_libs(),
+        cuda_visible_gpus: probe_cuda_visible_gpus(),
     })
+}
+
+/// How many devices the CUDA driver can open — the count the fleet NCCL
+/// world sizes rank blocks from. Guarded: a missing libcuda panics inside
+/// cudarc, which must degrade to "unknown", never abort the probe.
+#[cfg(feature = "gpu")]
+fn probe_cuda_visible_gpus() -> Option<u32> {
+    crate::agent::gpu::guard("cuda device count", || {
+        Ok(cudarc::driver::CudaContext::device_count()?)
+    })
+    .ok()
+    .and_then(|count| u32::try_from(count).ok())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn probe_cuda_visible_gpus() -> Option<u32> {
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -208,61 +249,71 @@ fn probe_nics() -> Vec<NicInventory> {
     nics
 }
 
-fn probe_ib_ports() -> Vec<IbPortInventory> {
-    let Ok(devices) = std::fs::read_dir("/sys/class/infiniband") else {
-        return Vec::new();
-    };
-    let mut ports = Vec::new();
-    for device in devices.flatten() {
-        let device_name = device.file_name().to_string_lossy().into_owned();
-        let Ok(port_dirs) = std::fs::read_dir(device.path().join("ports")) else {
-            continue;
-        };
-        for port_dir in port_dirs.flatten() {
-            let Ok(port) = port_dir.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let path = port_dir.path();
-            // `state` reads as "4: ACTIVE"; keep the symbolic half.
-            let state = read_trimmed(path.join("state"))
-                .map(|raw| {
-                    raw.split_once(':')
-                        .map(|(_, name)| name.trim().to_string())
-                        .unwrap_or(raw)
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            // `rate` reads as "100 Gb/sec (4X EDR)".
-            let rate_gbps = read_trimmed(path.join("rate"))
-                .and_then(|raw| raw.split_whitespace().next()?.parse::<f64>().ok());
-            let link_downed_count = read_trimmed(path.join("counters/link_downed"))
-                .and_then(|raw| raw.parse::<u64>().ok());
-            ports.push(IbPortInventory {
-                device: device_name.clone(),
-                port,
-                state,
-                rate_gbps,
-                link_downed_count,
-            });
-        }
-    }
-    ports.sort_by(|a, b| (&a.device, a.port).cmp(&(&b.device, b.port)));
-    ports
-}
-
 // ---------------------------------------------------------------------------
 // nvidia-smi
 // ---------------------------------------------------------------------------
 
-/// Returns the per-GPU inventory plus the driver version reported alongside
-/// it. An absent or failing `nvidia-smi` means "no GPUs", not an error.
+/// Returns the per-GPU inventory (occupancy included) plus the driver
+/// version reported alongside it. An absent or failing `nvidia-smi` means
+/// "no GPUs", not an error; a failing compute-apps query leaves every GPU's
+/// process list unknown.
 fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
-    let Some(output) = run_capture(
+    let Some(gpu_query) = run_capture(
         "nvidia-smi",
         &[GPU_QUERY, "--format=csv,noheader,nounits"],
         PROBE_TIMEOUT,
     ) else {
         return (Vec::new(), None);
     };
+    let compute_apps = run_capture(
+        "nvidia-smi",
+        &[
+            gpu_occupancy::COMPUTE_APPS_QUERY,
+            "--format=csv,noheader,nounits",
+        ],
+        PROBE_TIMEOUT,
+    );
+    let (mut gpus, driver) = gpus_from_nvidia_smi(
+        &gpu_query,
+        compute_apps.as_deref(),
+        &AgentIdentity::current(),
+        gpu_occupancy::exe_basename,
+    );
+    let pci_root = Path::new(pci::PCI_DEVICES_ROOT);
+    for location in gpus.iter_mut().filter_map(|gpu| gpu.pci.as_mut()) {
+        pci::resolve(pci_root, location);
+    }
+    (gpus, driver)
+}
+
+/// Pure core of `probe_gpus`: the `GPU_QUERY` CSV joined with the
+/// compute-apps CSV (`None` = that query failed) by PCI bus id.
+pub(crate) fn gpus_from_nvidia_smi(
+    gpu_query: &str,
+    compute_apps: Option<&str>,
+    identity: &AgentIdentity,
+    exe_of: impl Fn(u32) -> Option<String>,
+) -> (Vec<GpuInventory>, Option<String>) {
+    let (rows, driver) = parse_gpu_query(gpu_query);
+    let by_bus = gpu_occupancy::processes_by_bus(
+        compute_apps.map(gpu_occupancy::parse_compute_apps),
+        identity,
+        exe_of,
+    );
+    let gpus = rows
+        .into_iter()
+        .map(|(mut gpu, bus_id)| {
+            gpu.occupancy.compute_processes = gpu_occupancy::processes_for(by_bus.as_ref(), bus_id);
+            gpu
+        })
+        .collect();
+    (gpus, driver)
+}
+
+/// Parse the `GPU_QUERY` CSV into per-GPU inventories (occupancy memory
+/// filled, process list still unknown) paired with each GPU's bus id, plus
+/// the driver version from the first row. Rows are sorted by index.
+fn parse_gpu_query(output: &str) -> (Vec<(GpuInventory, Option<PciBusId>)>, Option<String>) {
     let mut gpus = Vec::new();
     let mut driver = None;
     for line in output.lines() {
@@ -280,16 +331,26 @@ fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
                 .and_then(csv_field)
                 .map(str::to_string);
         }
-        gpus.push(GpuInventory {
+        let field_u64 = |position: usize| {
+            fields
+                .get(position)
+                .copied()
+                .and_then(csv_field)
+                .and_then(|raw| raw.parse::<u64>().ok())
+        };
+        // `nounits` renders memory.total / memory.used in MiB.
+        let memory_total_mib = field_u64(4);
+        let bus_id = fields
+            .get(13)
+            .copied()
+            .and_then(csv_field)
+            .and_then(|raw| raw.parse::<PciBusId>().ok());
+        let gpu = GpuInventory {
             index,
             name: csv_field(fields[1]).unwrap_or("unknown").to_string(),
             uuid: csv_field(fields[2]).unwrap_or_default().to_string(),
             vbios: csv_field(fields[3]).unwrap_or_default().to_string(),
-            // `nounits` renders memory.total in MiB.
-            mem_total_bytes: csv_field(fields[4])
-                .and_then(|raw| raw.parse::<u64>().ok())
-                .map(|mib| mib * 1024 * 1024)
-                .unwrap_or(0),
+            mem_total_bytes: memory_total_mib.map(|mib| mib * 1024 * 1024).unwrap_or(0),
             ecc_volatile_errors: csv_field(fields[5]).and_then(|raw| raw.parse::<u64>().ok()),
             remapped_rows_pending: csv_field(fields[6]).and_then(parse_yes_no),
             pcie_gen_current: csv_field(fields[7]).and_then(|raw| raw.parse::<u32>().ok()),
@@ -300,15 +361,24 @@ fn probe_gpus() -> (Vec<GpuInventory>, Option<String>) {
             // much slower query; phase 2 measures the links directly.
             nvlinks_active: None,
             persistence_mode: csv_field(fields[11]).and_then(parse_yes_no),
-        });
+            occupancy: GpuOccupancy {
+                memory_used_mib: field_u64(14),
+                memory_total_mib,
+                compute_processes: None,
+            },
+            // The address only; `probe_gpus` resolves NUMA node and
+            // upstream bridges against sysfs.
+            pci: bus_id.map(|bus| PciLocation::address_only(bus.to_string())),
+        };
+        gpus.push((gpu, bus_id));
     }
-    gpus.sort_by_key(|gpu| gpu.index);
+    gpus.sort_by_key(|(gpu, _)| gpu.index);
     (gpus, driver)
 }
 
 /// `nvidia-smi` prints "N/A", "[N/A]" or "[Not Supported]" for fields the
 /// device or driver does not expose.
-fn csv_field(raw: &str) -> Option<&str> {
+pub(crate) fn csv_field(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -465,7 +535,7 @@ fn probe_xid_errors() -> Vec<u32> {
     codes.into_iter().collect()
 }
 
-fn parse_xid_line(line: &str) -> Option<u32> {
+pub(crate) fn parse_xid_line(line: &str) -> Option<u32> {
     let (_, rest) = line.split_once("NVRM: Xid")?;
     // Skip the "(PCI:0000:65:00)" device tag when present.
     let rest = match rest.split_once(')') {
@@ -486,19 +556,13 @@ fn parse_xid_line(line: &str) -> Option<u32> {
 // Small IO helpers
 // ---------------------------------------------------------------------------
 
-fn read_trimmed(path: impl AsRef<Path>) -> Option<String> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
-}
-
 /// Run a probe command and capture its stdout, giving up after `timeout`.
 ///
 /// The child is spawned with piped stdout drained on a helper thread (a
 /// blocking `wait()` would deadlock if the child filled the pipe) and killed
 /// if it outlives the deadline, so a wedged tool can never stall `collect()`.
 /// A missing binary, a non-zero exit, or a timeout all yield `None`.
-fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+pub(crate) fn run_capture(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -597,6 +661,138 @@ mod tests {
         assert_eq!(parse_duration_ms("-500us"), Some(-0.5));
         assert_eq!(parse_duration_ms("2s"), Some(2000.0));
         assert_eq!(parse_duration_ms("garbage"), None);
+    }
+
+    // -- GPU occupancy fixtures ------------------------------------------
+    //
+    // `GPU_QUERY` rows as nvidia-smi prints them under
+    // `--format=csv,noheader,nounits` (a consumer RTX 3090: no ECC, no row
+    // remapping), then the compute-apps rows.
+
+    const RTX3090_BUSY: &str = "0, NVIDIA GeForce RTX 3090, GPU-5a1b, 94.02.42.00.A9, 24576, \
+        [N/A], [N/A], 4, 4, 16, 16, Enabled, 570.133.07, 00000000:01:00.0, 23264\n";
+    const RTX3090_IDLE: &str = "0, NVIDIA GeForce RTX 3090, GPU-5a1b, 94.02.42.00.A9, 24576, \
+        [N/A], [N/A], 4, 4, 16, 16, Enabled, 570.133.07, 00000000:01:00.0, 37\n";
+    /// The field report's vLLM node. nvidia-smi's process table there also
+    /// showed Xorg (12 MiB) and sddm-greeter (20 MiB), both type G: the
+    /// compute-apps query does not list graphics clients at all.
+    const VLLM_APPS: &str = "00000000:01:00.0, 2102873, VLLM::EngineCore, 23232\n";
+
+    fn identity(own: u32) -> AgentIdentity {
+        AgentIdentity {
+            lineage: [own].into_iter().collect(),
+            agent_basenames: ["gauntlet-agent".to_string()].into_iter().collect(),
+        }
+    }
+
+    fn parse(query: &str, apps: Option<&str>) -> Vec<GpuInventory> {
+        gpus_from_nvidia_smi(query, apps, &identity(1), |_| None).0
+    }
+
+    fn outcome(gpu: &GpuInventory) -> TestOutcome {
+        crate::proto::assess_gpu_idle(&gpu.occupancy, 1024).outcome()
+    }
+
+    #[test]
+    fn the_vllm_node_is_busy() {
+        let (gpus, driver) =
+            gpus_from_nvidia_smi(RTX3090_BUSY, Some(VLLM_APPS), &identity(1), |_| {
+                Some("python3.12".into())
+            });
+        assert_eq!(driver.as_deref(), Some("570.133.07"));
+        let gpu = &gpus[0];
+        assert_eq!(gpu.mem_total_bytes, 24576 << 20);
+        assert_eq!(gpu.persistence_mode, Some(true));
+        assert_eq!(gpu.occupancy.memory_used_mib, Some(23264));
+        assert_eq!(gpu.occupancy.memory_total_mib, Some(24576));
+        let processes = gpu.occupancy.compute_processes.as_ref().expect("known");
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].owner, crate::proto::ProcessOwner::Foreign);
+        let TestOutcome::Failed { reason } = outcome(gpu) else {
+            panic!("expected Failed");
+        };
+        assert!(
+            reason.contains("VLLM::EngineCore (pid 2102873, 23232 MiB)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn graphics_only_node_is_idle() {
+        // Xorg + sddm-greeter hold 32 MiB between them but are not compute
+        // apps: the query prints nothing.
+        let gpus = parse(RTX3090_IDLE, Some(""));
+        assert_eq!(gpus[0].occupancy.compute_processes, Some(vec![]));
+        assert_eq!(gpus[0].occupancy.memory_used_mib, Some(37));
+        assert_eq!(outcome(&gpus[0]), TestOutcome::Passed);
+    }
+
+    #[test]
+    fn na_fields_and_failed_queries_are_unknown() {
+        // MIG-style N/A memory and bus id.
+        let na = "0, NVIDIA A100, GPU-1, 92.00, [N/A], [N/A], [N/A], 4, 4, 16, 16, \
+                  Enabled, 550.54.15, [N/A], [N/A]\n";
+        let gpus = parse(na, Some(VLLM_APPS));
+        let occupancy = &gpus[0].occupancy;
+        assert_eq!(occupancy.memory_used_mib, None);
+        assert_eq!(occupancy.memory_total_mib, None);
+        assert_eq!(gpus[0].mem_total_bytes, 0);
+        // No bus id: nothing can be attributed, so the list is unknown.
+        assert_eq!(occupancy.compute_processes, None);
+        assert!(matches!(outcome(&gpus[0]), TestOutcome::Skipped { .. }));
+
+        // Compute-apps query failed outright.
+        let gpus = parse(RTX3090_IDLE, None);
+        assert_eq!(gpus[0].occupancy.compute_processes, None);
+        assert!(matches!(outcome(&gpus[0]), TestOutcome::Skipped { .. }));
+
+        // A pre-v10 query shape (no bus id / memory.used columns) still
+        // parses, occupancy unknown.
+        let old = "0, H100, GPU-1, 96.00, 81559, 0, No, 5, 5, 16, 16, Enabled, 550.54.15\n";
+        let gpus = parse(old, Some(""));
+        assert_eq!(gpus[0].mem_total_bytes, 81559 << 20);
+        assert_eq!(gpus[0].occupancy.memory_used_mib, None);
+        assert_eq!(gpus[0].occupancy.compute_processes, None);
+    }
+
+    #[test]
+    fn processes_land_on_the_right_gpu_only() {
+        let query = "1, H100, GPU-b, 96.00, 81559, 0, No, 5, 5, 16, 16, Enabled, 550.54.15, \
+                     00000000:41:00.0, 60000\n\
+                     0, H100, GPU-a, 96.00, 81559, 0, No, 5, 5, 16, 16, Enabled, 550.54.15, \
+                     00000000:1B:00.0, 4\n";
+        let apps = "00000000:41:00.0, 777, python, 59990\n";
+        let gpus = parse(query, Some(apps));
+        assert_eq!(gpus.iter().map(|g| g.index).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(gpus[0].occupancy.compute_processes, Some(vec![]));
+        assert_eq!(outcome(&gpus[0]), TestOutcome::Passed);
+        let busy = gpus[1].occupancy.compute_processes.as_ref().expect("known");
+        assert_eq!(busy[0].pid, 777);
+        assert!(matches!(outcome(&gpus[1]), TestOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn a_stale_agent_is_flagged_and_our_own_is_not() {
+        let apps = "00000000:01:00.0, 4242, /home/u/.gauntlet/bin/gauntlet-agent, 310\n\
+                    00000000:01:00.0, 1, /home/u/.gauntlet/bin/gauntlet-agent, 300\n";
+        let gpus = parse(RTX3090_IDLE, Some(apps));
+        let processes = gpus[0].occupancy.compute_processes.as_ref().expect("known");
+        assert_eq!(processes.len(), 1, "own pid 1 excluded: {processes:?}");
+        assert_eq!(
+            processes[0].owner,
+            crate::proto::ProcessOwner::StaleGauntletAgent
+        );
+        let TestOutcome::Failed { reason } = outcome(&gpus[0]) else {
+            panic!("a stale agent must fail the GPU");
+        };
+        assert!(reason.contains("stale gauntlet agent"), "{reason}");
+        assert!(reason.contains("pid 4242"), "{reason}");
+    }
+
+    #[test]
+    fn gpu_query_names_the_occupancy_fields_last() {
+        assert!(GPU_QUERY.ends_with("driver_version,pci.bus_id,memory.used"));
+        assert_eq!(GPU_QUERY.matches(',').count(), 14, "15 fields");
     }
 
     #[test]

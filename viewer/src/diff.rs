@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
+use gauntlet::nccl_level::NcclLevel;
 use gauntlet::proto::Unit;
+use gauntlet::report::nccl_env::{NcclEnvChange, nccl_env_drift, nccl_level_env_drift};
 
 use crate::model::{Attribution, Issue, MetricRow, Severity, ViewModel, attribute, format_value};
 
@@ -44,17 +46,66 @@ pub struct RowDelta {
     pub improved: bool,
 }
 
+/// Whether the baseline measures the same things as the current run.
+/// Runs from different schema versions can share metric and fit names
+/// whose *meaning* changed (e.g. schema v8 moved the fleet NCCL world from
+/// one rank per node to one rank per GPU), so their deltas are shown but
+/// flagged as not directly comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Comparability {
+    #[default]
+    Comparable,
+    SchemaMismatch {
+        current: u32,
+        baseline: u32,
+    },
+}
+
+impl Comparability {
+    pub fn between(current: &ViewModel, baseline: &ViewModel) -> Self {
+        if current.schema_version == baseline.schema_version {
+            Comparability::Comparable
+        } else {
+            Comparability::SchemaMismatch {
+                current: current.schema_version,
+                baseline: baseline.schema_version,
+            }
+        }
+    }
+
+    /// Chip text for the diff header, if the runs are not directly
+    /// comparable.
+    pub fn note(self) -> Option<String> {
+        match self {
+            Comparability::Comparable => None,
+            Comparability::SchemaMismatch { current, baseline } => Some(format!(
+                "baseline schema v{baseline} ≠ v{current}: not directly comparable"
+            )),
+        }
+    }
+}
+
 /// Everything the UI needs to render diff mode. Keys mirror `ViewModel`:
 /// rows by (group, subject), edges by the ordered host pair.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DiffView {
     pub baseline_run_id: String,
+    pub comparability: Comparability,
     pub rows: BTreeMap<(String, String), RowDelta>,
     /// Only subjects with at least one regression appear here.
     pub node_severity: BTreeMap<String, Severity>,
     pub node_issues: BTreeMap<String, Vec<Issue>>,
     pub edge_severity: BTreeMap<(String, String), Severity>,
     pub edge_issues: BTreeMap<(String, String), Vec<Issue>>,
+    /// NCCL tuning that differs from the baseline run. Non-empty means the
+    /// two runs' NCCL numbers were produced under different knobs, so
+    /// their deltas are not like-for-like. `None` when either run did not
+    /// record its env — nothing is shown rather than invented drift.
+    pub nccl_env_drift: Option<Vec<NcclEnvChange>>,
+    /// Per-level NCCL tuning that differs from the baseline beyond the
+    /// global drift (levels without such changes are omitted). `None` when
+    /// either run did not record per-level envs.
+    pub nccl_level_env_drift: Option<BTreeMap<NcclLevel, Vec<NcclEnvChange>>>,
 }
 
 struct Finding {
@@ -152,9 +203,16 @@ impl DiffView {
 
         let mut view = DiffView {
             baseline_run_id: baseline.run_id.clone(),
+            comparability: Comparability::between(current, baseline),
             rows,
+            nccl_env_drift: nccl_env_drift(baseline.nccl_env.as_ref(), current.nccl_env.as_ref()),
             ..DiffView::default()
         };
+        view.nccl_level_env_drift = nccl_level_env_drift(
+            baseline.nccl_level_env.as_ref(),
+            current.nccl_level_env.as_ref(),
+            view.nccl_env_drift.as_deref().unwrap_or_default(),
+        );
         for (host, findings) in node_findings {
             let (severity, issues) = finalize(findings);
             view.node_severity.insert(host.clone(), severity);

@@ -173,6 +173,17 @@ pub fn is_stalled(live: bool, modified: Option<SystemTime>, now: SystemTime) -> 
     }
 }
 
+/// Repeat counts the GUI cycles through: single shot, then enough samples
+/// for spread to mean something.
+pub fn cycle_repeat(current: u32) -> u32 {
+    match current {
+        1 => 3,
+        3 => 5,
+        5 => 10,
+        _ => 1,
+    }
+}
+
 /// "YYYY-MM-DD HH:MM:SS" in UTC.
 pub fn format_epoch_utc(epoch_secs: u64) -> String {
     let days = (epoch_secs / 86_400) as i64;

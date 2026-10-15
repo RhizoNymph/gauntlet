@@ -1,11 +1,14 @@
 //! `gauntlet bootstrap`: make every node ready without manual setup.
 //!
-//! Steps per host (bounded-concurrency fan-out):
-//!   1. connectivity — open the ssh session, fail fast with a clear reason;
+//! Steps per host (bounded-concurrency fan-out; the transport — ssh or
+//! srun steps inside a Slurm allocation — comes from `resolve_launch`):
+//!   1. connectivity — open the session, fail fast with a clear reason;
 //!   2. arch check — `uname -m` must match the orchestrator's;
-//!   3. deploy — `deploy::ensure_agent`;
+//!   3. deploy — `deploy::ensure_fleet`, fleet-wide (srun's sbcast reaches
+//!      every node at once);
 //!   4. probe — run `agent probe`, parse the InventorySnapshot: GPU count,
-//!      driver present, CUDA libs resolvable, IB ports up, clock sync;
+//!      driver present, CUDA libs resolvable, IB ports up, clock sync, GPUs
+//!      idle (no foreign compute process, memory within threshold);
 //!   5. tuning (only with --tune; each step is sudo-gated and a refusal is
 //!      reported, not fatal): `nvidia-smi -pm 1` (persistence mode),
 //!      cpu governor -> performance.
@@ -21,23 +24,38 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::info;
 
-use super::deploy::ensure_agent;
+mod gpu_idle;
+
+use self::gpu_idle::gpu_idle_check;
+use super::deploy::{self, DeployOutcome};
+use super::fanout::fan_out;
+#[cfg(test)]
+use super::nccl_shim::{NCCL_SHIM_SCRIPT, nccl_shim_needed};
+use super::nccl_shim::{ShimOutcome, ensure_shim, probe};
 use super::session::HostSession;
+use super::transport::{Launcher, resolve_launch};
+use crate::build_info::BuildInfo;
 use crate::cli::BootstrapArgs;
-use crate::config::{FleetConfig, HostConfig, SshConfig};
-use crate::proto::InventorySnapshot;
+use crate::config::{FleetConfig, HostConfig};
+use crate::launch::LaunchRecord;
+use crate::nccl_level::NcclLevelEnvs;
+use crate::proto::{InventorySnapshot, PortState};
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
 /// viewer renders the same matrix from this document.
-pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 1;
+///
+/// v2: `gauntlet_version` (crate version plus build-time git revision of
+/// the binary that bootstrapped, which is also the agent it deployed).
+pub const BOOTSTRAP_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BootstrapReport {
     pub schema_version: u32,
+    /// `None` = not recorded (v1 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub finished_epoch_secs: u64,
     pub hosts: Vec<HostReadiness>,
 }
@@ -105,37 +123,76 @@ const CLOCK_WARN_MS: f64 = 100.0;
 const CLOCK_FAIL_MS: f64 = 1_000.0;
 
 pub async fn run(args: BootstrapArgs) -> Result<()> {
-    let config = FleetConfig::load(&args.config)
+    let config = FleetConfig::load_for(&args.config, args.launch)
         .with_context(|| format!("loading {}", args.config.display()))?;
+    // Same launcher (and in srun mode the same allocation-derived fleet) as
+    // `gauntlet run`, so the matrix checks what a run will use.
+    let (config, launcher) = resolve_launch(&config, args.launch).await?;
     let hosts: Vec<HostConfig> = config.hosts().collect();
-    let ssh = Arc::new(config.ssh.clone());
-    let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
+    // Same spawn environment as `gauntlet run`, so probes see what runs see.
+    let nccl_env = Arc::new(config.nccl_levels()?.clone());
+    let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
+    let max_concurrent = config.ssh.max_concurrent.max(1);
     info!(
         hosts = hosts.len(),
-        max_concurrent = config.ssh.max_concurrent,
+        launch = %launcher.record(),
+        max_concurrent,
         tune = args.tune,
         "bootstrapping fleet"
     );
     warn_if_debug_build();
 
-    let mut tasks = JoinSet::new();
-    for (index, host) in hosts.iter().cloned().enumerate() {
-        let ssh = Arc::clone(&ssh);
-        let permits = Arc::clone(&permits);
-        let tune = args.tune;
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            (index, prepare_host(host, &ssh, tune).await)
-        });
-    }
+    // 1. connectivity + arch, per host.
+    let connected = fan_out(hosts.to_vec(), max_concurrent, {
+        let launcher = launcher.clone();
+        let nccl_env = Arc::clone(&nccl_env);
+        move |host| {
+            let launcher = launcher.clone();
+            let nccl_env = Arc::clone(&nccl_env);
+            async move { connect_host(&launcher, host, nccl_env).await }
+        }
+    })
+    .await;
 
-    let mut slots: Vec<Option<HostReadiness>> = vec![None; hosts.len()];
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, readiness)) => slots[index] = Some(readiness),
-            Err(error) => debug!(%error, "bootstrap task did not complete"),
+    // 2. deploy, fleet-wide: srun broadcasts the binary once with sbcast,
+    //    so it cannot be a per-host step.
+    let mut stages: Vec<Option<Stage>> = connected;
+    let ready: Vec<(usize, Arc<HostSession>)> = stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stage)| match stage {
+            Some(Stage::Ready { session, .. }) => Some((index, Arc::clone(session))),
+            _ => None,
+        })
+        .collect();
+    let ready_sessions: Vec<Arc<HostSession>> = ready
+        .iter()
+        .map(|(_, session)| Arc::clone(session))
+        .collect();
+    let deploy_timeout = std::time::Duration::from_secs(config.tests.phase_timeout_secs.max(1));
+    let outcomes =
+        deploy::ensure_fleet(&launcher, &ready_sessions, max_concurrent, deploy_timeout).await;
+    for ((index, _), outcome) in ready.into_iter().zip(outcomes) {
+        if let Some(stage) = stages[index].take() {
+            stages[index] = Some(stage.after_deploy(outcome));
         }
     }
+
+    // 3. probe, shim, derived checks, tuning: per host.
+    let tune = args.tune;
+    let slots = fan_out(stages, max_concurrent, move |stage| async move {
+        match stage {
+            Some(Stage::Ready { session, checks }) => {
+                Some(finish_host(&session, checks, tune, gpu_idle_max_used_mib).await)
+            }
+            Some(Stage::Done(readiness)) => Some(*readiness),
+            None => None,
+        }
+    })
+    .await
+    .into_iter()
+    .map(Option::flatten)
+    .collect::<Vec<Option<HostReadiness>>>();
 
     // Invariant: every configured host appears exactly once, in config order.
     let rows: Vec<HostReadiness> = slots
@@ -157,6 +214,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     if args.json {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: Some(BuildInfo::current()),
             finished_epoch_secs: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs())
@@ -181,24 +239,67 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     Ok(())
 }
 
-/// Full per-host sequence. Never returns an error: a failure is a matrix
-/// cell, and one bad node must not abort the rest of the fleet.
-async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostReadiness {
+/// A host between bootstrap steps: still going (session open, checks so
+/// far), or finished with its final row (a short-circuiting Fail).
+enum Stage {
+    Ready {
+        session: Arc<HostSession>,
+        checks: Vec<ReadinessCheck>,
+    },
+    Done(Box<HostReadiness>),
+}
+
+impl Stage {
+    fn done(host: &str, checks: Vec<ReadinessCheck>) -> Self {
+        Stage::Done(Box::new(HostReadiness {
+            host: host.to_string(),
+            checks,
+            inventory: None,
+        }))
+    }
+
+    /// Record the deploy column; a failed deploy finishes the host.
+    fn after_deploy(self, outcome: Result<DeployOutcome>) -> Self {
+        match self {
+            Stage::Ready {
+                session,
+                mut checks,
+            } => match outcome {
+                Ok(outcome) => {
+                    checks.push(ReadinessCheck::ok("deploy", outcome.to_string()));
+                    Stage::Ready { session, checks }
+                }
+                Err(error) => {
+                    checks.push(ReadinessCheck::fail("deploy", format!("{error:#}")));
+                    Stage::done(session.addr(), checks)
+                }
+            },
+            done @ Stage::Done(_) => done,
+        }
+    }
+}
+
+/// `connectivity` and `arch`. Never returns an error: a failure is a
+/// matrix cell, and one bad node must not abort the rest of the fleet.
+async fn connect_host(
+    launcher: &Launcher,
+    host: HostConfig,
+    nccl_env: Arc<NcclLevelEnvs>,
+) -> Stage {
     let addr = host.addr.clone();
     let mut checks = Vec::new();
 
-    let session = match HostSession::connect(host, ssh).await {
+    let session = match launcher.connect(host, nccl_env).await {
         Ok(session) => {
-            checks.push(ReadinessCheck::ok("connectivity", session.remote_dir()));
-            session
+            checks.push(ReadinessCheck::ok(
+                "connectivity",
+                connectivity_detail(launcher.record(), session.remote_dir()),
+            ));
+            Arc::new(session)
         }
         Err(error) => {
             checks.push(ReadinessCheck::fail("connectivity", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
+            return Stage::done(&addr, checks);
         }
     };
 
@@ -210,37 +311,36 @@ async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostRead
             checks.push(check);
             if fatal {
                 // Deploying a binary the node cannot execute helps nobody.
-                return HostReadiness {
-                    host: addr,
-                    checks,
-                    inventory: None,
-                };
+                return Stage::done(&addr, checks);
             }
         }
         Err(error) => {
             checks.push(ReadinessCheck::fail("arch", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
+            return Stage::done(&addr, checks);
         }
     }
+    Stage::Ready { session, checks }
+}
 
-    match ensure_agent(&session).await {
-        Ok(true) => checks.push(ReadinessCheck::ok("deploy", "uploaded")),
-        Ok(false) => checks.push(ReadinessCheck::ok("deploy", "up to date")),
-        Err(error) => {
-            checks.push(ReadinessCheck::fail("deploy", format!("{error:#}")));
-            return HostReadiness {
-                host: addr,
-                checks,
-                inventory: None,
-            };
-        }
+/// The `connectivity` cell: over ssh the resolved agent dir (as always);
+/// over srun, that a step reached the node inside which job.
+fn connectivity_detail(launch: LaunchRecord, remote_dir: &str) -> String {
+    match launch {
+        LaunchRecord::Ssh => remote_dir.to_string(),
+        LaunchRecord::Srun { job_id } => format!("srun step in job {job_id}: {remote_dir}"),
     }
+}
 
-    let inventory = match probe(&session).await {
+/// Everything after deploy: probe, NCCL shim, derived checks, tuning.
+async fn finish_host(
+    session: &HostSession,
+    mut checks: Vec<ReadinessCheck>,
+    tune: bool,
+    gpu_idle_max_used_mib: u64,
+) -> HostReadiness {
+    let addr = session.addr().to_string();
+
+    let inventory = match probe(session).await {
         Ok(inventory) => {
             checks.push(ReadinessCheck::ok(
                 "probe",
@@ -262,17 +362,12 @@ async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostRead
         }
     };
 
-    let inventory = match maybe_build_nccl_shim(&session, inventory).await {
-        (inventory, Some(shim_check)) => {
-            checks.push(shim_check);
-            inventory
-        }
-        (inventory, None) => inventory,
-    };
+    let (inventory, shim) = ensure_shim(session, inventory).await;
+    checks.extend(shim_check(&shim));
 
-    checks.extend(readiness_checks(&inventory));
+    checks.extend(readiness_checks(&inventory, gpu_idle_max_used_mib));
     if tune {
-        checks.extend(apply_tuning(&session, &inventory).await);
+        checks.extend(apply_tuning(session, &inventory).await);
     }
 
     HostReadiness {
@@ -282,76 +377,28 @@ async fn prepare_host(host: HostConfig, ssh: &SshConfig, tune: bool) -> HostRead
     }
 }
 
-/// Remote script that symlinks the NCCL runtime soname under a name cudarc
-/// searches, inside the agent's own directory (no sudo, no system change).
-/// `{lib_dir}` is substituted with `<remote_dir>/lib`.
-const NCCL_SHIM_SCRIPT: &str = r#"mkdir -p {lib_dir} && target=""; for p in $(ldconfig -p 2>/dev/null | awk '/libnccl\.so\.2 /{print $NF}') /usr/lib/x86_64-linux-gnu/libnccl.so.2 /usr/lib64/libnccl.so.2 /usr/lib/libnccl.so.2; do if [ -e "$p" ]; then target="$p"; break; fi; done; if [ -n "$target" ]; then ln -sf "$target" {lib_dir}/libnccl.so && echo "$target"; else exit 3; fi"#;
-
-/// Does this inventory describe the runtime-only NCCL install (libnccl.so.2
-/// present, but no name cudarc's loader searches)?
-fn nccl_shim_needed(inventory: &InventorySnapshot) -> bool {
-    !inventory.gpus.is_empty()
-        && inventory.gpu_libs.get("nccl") == Some(&false)
-        && inventory.gpu_libs.get("nccl_runtime") == Some(&true)
-}
-
-/// cudarc's loader does not search libnccl.so.2 (NCCL's actual runtime
-/// soname), so a node with only the runtime package installed cannot run the
-/// NCCL sweep. Build `<remote_dir>/lib/libnccl.so -> libnccl.so.2`; every
-/// agent invocation already carries LD_LIBRARY_PATH=<remote_dir>/lib, so
-/// dlopen("libnccl.so") then resolves. Re-probes afterwards so the returned
-/// inventory reflects reality.
-async fn maybe_build_nccl_shim(
-    session: &HostSession,
-    inventory: InventorySnapshot,
-) -> (InventorySnapshot, Option<ReadinessCheck>) {
-    if !nccl_shim_needed(&inventory) {
-        return (inventory, None);
+/// The readiness-matrix cell for a shim outcome; `None` when the node did
+/// not need one (no column noise on ordinary nodes).
+fn shim_check(outcome: &ShimOutcome) -> Option<ReadinessCheck> {
+    match outcome {
+        ShimOutcome::NotNeeded => None,
+        ShimOutcome::Built { target } => Some(ReadinessCheck::ok(
+            "nccl_shim",
+            format!("libnccl.so -> {target}"),
+        )),
+        ShimOutcome::StillUnloadable { target } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("shim created ({target}) but libnccl still not loadable"),
+        )),
+        ShimOutcome::CreateFailed { error } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("libnccl.so.2 present but shim creation failed: {error}"),
+        )),
+        ShimOutcome::ReprobeFailed { error, .. } => Some(ReadinessCheck::warn(
+            "nccl_shim",
+            format!("re-probe after shim failed: {error}"),
+        )),
     }
-    let script = NCCL_SHIM_SCRIPT.replace("{lib_dir}", &format!("{}/lib", session.remote_dir()));
-    let target = match session.exec(&script).await {
-        Ok(stdout) => stdout.trim().to_string(),
-        Err(error) => {
-            return (
-                inventory,
-                Some(ReadinessCheck::warn(
-                    "nccl_shim",
-                    format!("libnccl.so.2 present but shim creation failed: {error:#}"),
-                )),
-            );
-        }
-    };
-    match probe(session).await {
-        Ok(reprobed) if reprobed.gpu_libs.get("nccl") == Some(&true) => (
-            reprobed,
-            Some(ReadinessCheck::ok(
-                "nccl_shim",
-                format!("libnccl.so -> {target}"),
-            )),
-        ),
-        Ok(reprobed) => (
-            reprobed,
-            Some(ReadinessCheck::warn(
-                "nccl_shim",
-                format!("shim created ({target}) but libnccl still not loadable"),
-            )),
-        ),
-        Err(error) => (
-            inventory,
-            Some(ReadinessCheck::warn(
-                "nccl_shim",
-                format!("re-probe after shim failed: {error:#}"),
-            )),
-        ),
-    }
-}
-
-async fn probe(session: &HostSession) -> Result<InventorySnapshot> {
-    let output = session.run_agent_capture(&["probe"], None).await?;
-    if !output.success() {
-        bail!("agent probe failed: {}", output.detail());
-    }
-    serde_json::from_str(output.stdout.trim()).context("parsing InventorySnapshot from agent probe")
 }
 
 /// Node arch as reported by `uname -m`, mapped onto `std::env::consts::ARCH`
@@ -388,10 +435,14 @@ fn arch_check(uname_machine: &str, local_arch: &str) -> ReadinessCheck {
 
 /// The readiness checks derivable from a probe: pure, so the policy is
 /// testable without a fleet.
-fn readiness_checks(inventory: &InventorySnapshot) -> Vec<ReadinessCheck> {
+fn readiness_checks(
+    inventory: &InventorySnapshot,
+    gpu_idle_max_used_mib: u64,
+) -> Vec<ReadinessCheck> {
     vec![
         gpu_driver_check(inventory),
         gpu_libs_check(inventory),
+        gpu_idle_check(inventory, gpu_idle_max_used_mib),
         clock_sync_check(inventory),
         ib_ports_check(inventory),
         governor_check(inventory),
@@ -488,13 +539,13 @@ fn ib_ports_check(inventory: &InventorySnapshot) -> ReadinessCheck {
     let active: Vec<&str> = inventory
         .ib_ports
         .iter()
-        .filter(|port| port.state.eq_ignore_ascii_case("active"))
+        .filter(|port| port.logical_state() == PortState::Active)
         .map(|port| port.device.as_str())
         .collect();
     let inactive: Vec<String> = inventory
         .ib_ports
         .iter()
-        .filter(|port| !port.state.eq_ignore_ascii_case("active"))
+        .filter(|port| port.logical_state() != PortState::Active)
         .map(|port| format!("{}:{} {}", port.device, port.port, port.state))
         .collect();
 
@@ -682,7 +733,9 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{GpuInventory, IbPortInventory};
+    use crate::proto::{GpuInventory, GpuOccupancy, GpuProcess, IbPortInventory, ProcessOwner};
+
+    const GPU_IDLE_MAX: u64 = 1024;
 
     fn inventory() -> InventorySnapshot {
         InventorySnapshot {
@@ -702,14 +755,23 @@ mod tests {
                 device: "mlx5_0".into(),
                 port: 1,
                 state: "Active".into(),
-                rate_gbps: Some(400.0),
+                rate: crate::proto::PortRate::Known {
+                    gbps: 400.0,
+                    lanes: None,
+                    speed: None,
+                },
                 link_downed_count: Some(0),
+                link_layer: Default::default(),
+                phys_state: Default::default(),
+                netdevs: Vec::new(),
             }],
+            ib_devices: Vec::new(),
             xid_errors: Vec::new(),
             gpu_libs: [("cuda", true), ("cublas", true), ("nccl", true)]
                 .into_iter()
                 .map(|(name, ok)| (name.to_string(), ok))
                 .collect(),
+            cuda_visible_gpus: None,
         }
     }
 
@@ -728,6 +790,12 @@ mod tests {
             pcie_width_max: Some(16),
             nvlinks_active: Some(18),
             persistence_mode: persistence,
+            occupancy: GpuOccupancy {
+                memory_used_mib: Some(4),
+                memory_total_mib: Some(81_559),
+                compute_processes: Some(Vec::new()),
+            },
+            pci: None,
         }
     }
 
@@ -760,7 +828,7 @@ mod tests {
 
     #[test]
     fn a_healthy_node_passes_every_derived_check() {
-        let checks = readiness_checks(&inventory());
+        let checks = readiness_checks(&inventory(), GPU_IDLE_MAX);
         assert!(
             checks.iter().all(|check| check.status == CheckStatus::Ok),
             "{checks:?}"
@@ -772,7 +840,7 @@ mod tests {
         let mut inv = inventory();
         inv.nvidia_driver = None;
         inv.gpus.clear();
-        let checks = readiness_checks(&inv);
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
         assert_eq!(status(&checks, "gpu_driver"), CheckStatus::Warn);
         assert_eq!(status(&checks, "persistence_mode"), CheckStatus::Ok);
     }
@@ -799,8 +867,15 @@ mod tests {
             device: "mlx5_1".into(),
             port: 1,
             state: "Active".into(),
-            rate_gbps: Some(400.0),
+            rate: crate::proto::PortRate::Known {
+                gbps: 400.0,
+                lanes: None,
+                speed: None,
+            },
             link_downed_count: Some(0),
+            link_layer: Default::default(),
+            phys_state: Default::default(),
+            netdevs: Vec::new(),
         });
         assert_eq!(ib_ports_check(&inv).status, CheckStatus::Warn);
         inv.ib_ports.clear();
@@ -812,7 +887,7 @@ mod tests {
         let mut inv = inventory();
         inv.gpus.push(gpu(1, Some(false)));
         inv.cpu_governor = Some("powersave".into());
-        let checks = readiness_checks(&inv);
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
         assert_eq!(status(&checks, "persistence_mode"), CheckStatus::Warn);
         assert_eq!(status(&checks, "governor"), CheckStatus::Warn);
     }
@@ -912,6 +987,29 @@ mod tests {
     }
 
     #[test]
+    fn shim_outcomes_map_onto_the_nccl_shim_column() {
+        assert_eq!(shim_check(&ShimOutcome::NotNeeded), None);
+        let built = shim_check(&ShimOutcome::Built {
+            target: "/usr/lib/libnccl.so.2".into(),
+        })
+        .expect("cell");
+        assert_eq!(built.name, "nccl_shim");
+        assert_eq!(built.status, CheckStatus::Ok);
+        assert!(built.detail.contains("/usr/lib/libnccl.so.2"));
+        for outcome in [
+            ShimOutcome::StillUnloadable { target: "t".into() },
+            ShimOutcome::CreateFailed { error: "e".into() },
+            ShimOutcome::ReprobeFailed {
+                target: "t".into(),
+                error: "e".into(),
+            },
+        ] {
+            let cell = shim_check(&outcome).expect("cell");
+            assert_eq!(cell.status, CheckStatus::Warn, "{outcome:?}");
+        }
+    }
+
+    #[test]
     fn shim_needed_only_for_runtime_only_nccl_on_gpu_hosts() {
         let mut inv = inventory();
         inv.gpu_libs = libs(&[("nccl", false), ("nccl_runtime", true)]);
@@ -968,9 +1066,60 @@ mod tests {
     }
 
     #[test]
+    fn gpu_idle_names_the_foreign_process() {
+        let mut inv = inventory();
+        inv.gpus.push(gpu(1, Some(true)));
+        inv.gpus[1].occupancy = GpuOccupancy {
+            memory_used_mib: Some(23_264),
+            memory_total_mib: Some(24_576),
+            compute_processes: Some(vec![GpuProcess {
+                pid: 2_102_873,
+                name: "VLLM::EngineCore".into(),
+                used_mib: Some(23_232),
+                owner: ProcessOwner::Foreign,
+            }]),
+        };
+        let checks = readiness_checks(&inv, GPU_IDLE_MAX);
+        let check = checks
+            .iter()
+            .find(|check| check.name == "gpu_idle")
+            .expect("gpu_idle column");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(
+            check.detail,
+            "gpu1: in use by VLLM::EngineCore (pid 2102873, 23232 MiB); \
+             23264/24576 MiB used (> 1024 MiB threshold)"
+        );
+        // The matrix cell carries the same detail.
+        let rows = vec![HostReadiness {
+            host: "node1".into(),
+            checks,
+            inventory: Some(inv),
+        }];
+        let mut rendered = Vec::new();
+        render_matrix(&rows, &mut rendered).expect("render");
+        let rendered = String::from_utf8(rendered).expect("utf8");
+        assert!(rendered.contains("gpu_idle"), "{rendered}");
+        assert!(rendered.contains("VLLM::EngineCore"), "{rendered}");
+        // `--json` carries the column and the probed occupancy.
+        let report = BootstrapReport {
+            schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
+            finished_epoch_secs: 1,
+            hosts: rows,
+        };
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains(r#""name":"gpu_idle""#), "{json}");
+        assert!(json.contains(r#""compute_processes""#), "{json}");
+        let back: BootstrapReport = serde_json::from_str(&json).expect("parse");
+        assert_eq!(back, report);
+    }
+
+    #[test]
     fn readiness_report_round_trips_through_json() {
         let report = BootstrapReport {
             schema_version: BOOTSTRAP_SCHEMA_VERSION,
+            gauntlet_version: None,
             finished_epoch_secs: 1_700_000_000,
             hosts: vec![HostReadiness {
                 host: "10.0.0.1".into(),

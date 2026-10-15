@@ -3,8 +3,9 @@
 ```yaml
 Overview:
   description: >
-    Rust CLI that reads a fleet of hosts from a TOML config, deploys itself to
-    each node over ssh, and runs a phased suite of correctness and performance
+    Rust CLI that reads a fleet of hosts from a TOML config (or, in srun
+    launch mode, from the Slurm allocation it runs in), deploys itself to
+    each node over ssh or as srun job steps, and runs a phased suite of correctness and performance
     tests (CPU, DRAM, disk, GPU, intra/inter-node network, NCCL collectives).
     Output is a schema-versioned JSON document plus a human table, with
     fleet-relative outlier detection (median + MAD) as the primary straggler
@@ -13,14 +14,28 @@ Overview:
     network fits per link class.
   subsystems:
     orchestrator: >
-      Runs on the operator's machine (`gauntlet run`). Tokio task per host,
-      persistent ssh sessions via the `openssh` crate (native-mux
-      ControlMaster multiplexing, respects ~/.ssh/config). Deploys the agent
-      (sftp upload of the running binary, staged then renamed, skipped when
-      the remote sha256 matches), drives the phase schedule, aggregates
-      results over an mpsc channel into a single lock-free collector task.
+      Runs on the operator's machine (`gauntlet run`), or on a node inside
+      a Slurm allocation in srun launch mode. Tokio task per host; every
+      node operation goes through a `HostSession` over one transport
+      (orchestrator/transport): persistent ssh sessions via the `openssh`
+      crate (native-mux ControlMaster multiplexing, respects
+      ~/.ssh/config), or `srun` job steps of the current allocation
+      (`--overlap`, one named step per agent process, killed with a
+      batched `scancel` of the named step; an abandoned srun is sent
+      SIGTERM so it cancels its step). Deploys the agent (ssh: sftp upload
+      of the running binary to a per-upload random temp name, then an
+      atomic rename; srun: a step-scoped sbcast to the stale nodes, then
+      the same temp-name/rename install per node; skipped when the remote
+      sha256 matches) into the remote dir (`ssh.remote_dir` /
+      `[launch.srun] dir`, default node-local `/tmp/gauntlet-$USER`, `~`
+      and `$USER` expanded on the node, owner-checked, physical path),
+      drives the phase schedule, aggregates results over an mpsc channel
+      into a single lock-free collector task.
     agent: >
-      Same binary in `gauntlet agent` mode, executed on each node. Built for
+      Same binary in `gauntlet agent` mode, executed on each node. At
+      startup, before any thread exists, the agent moves its protocol
+      channel to a private dup of stdout and points fd 1 at stderr, so
+      library output (NCCL_DEBUG, CUDA) cannot corrupt events. Built for
       glibc (static musl cannot dlopen, which cudarc requires; a musl build
       only makes sense with --no-default-features). GPU tests use cudarc with
       dynamic-loading + the cuda-12040 API baseline: libcuda/libcublas/libnccl
@@ -28,23 +43,56 @@ Overview:
       beyond the driver stack). Emits JSON-lines events over stdout. Has peer
       (two-sided TCP tests) and nccl subcommand modes.
     scheduler: >
-      Phase DAG. Phases 0-2 are embarrassingly parallel across nodes. Phase 3
-      pairwise tests use round-robin tournament scheduling: n-1 rounds of n/2
-      disjoint pairs, wall time linear in n. Target scale 32-256 nodes; a
-      sampled mode exists for quick runs.
+      Phase DAG. Phases 0-2 and the overlap phase are embarrassingly
+      parallel across nodes. Phase 3 is a hierarchy: the intra-node NCCL
+      sweep rides the same per-node fan-out (node-local communicator, no
+      rendezvous), then pairwise tests use round-robin tournament
+      scheduling (n-1 rounds of n/2 disjoint pairs, wall time linear in
+      n), then the fleet NCCL sweep. The overlap phase (compute + comms under combined load)
+      runs last: its retention ratios divide the isolated phase-2 baselines
+      from the same run. Target scale 32-256 nodes; a sampled mode exists
+      for quick runs.
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
-      MADs, applies optional absolute thresholds, renders table + JSON, sets
-      exit code. Runs persisted for diffing against last known-good. With
+      MADs, applies optional absolute thresholds, renders table + JSON,
+      classifies a typed Verdict (clean / outliers / host_failures /
+      failures -> exit 0 / 1 / 2 / 3) recorded in the JSON along with the
+      producing binary's version + git revision. Runs persisted for
+      diffing against last known-good. With
       --repeat N, metrics aggregate into per-subject distribution moments
       (median/MAD/min/max/mean/stddev); outliers flag on medians and
       high run-to-run spread flags as jitter. A run in
       flight also republishes itself every 2s as runs/<run_id>.partial.json so
       viewers can tail progress.
   data_flow: >
-    config.toml -> orchestrator -> (scp agent, spawn `gauntlet agent` per
-    host/pair) -> agent JSON-lines on stdout -> per-host tokio task decodes ->
-    mpsc -> collector -> outlier analysis -> report.json + terminal table.
+    config.toml (+ Slurm allocation in srun mode: SLURM_JOB_ID,
+    `scontrol show hostnames` / `scontrol --oneliner show node` on
+    $SLURM_JOB_NODELIST) -> launcher resolution -> orchestrator ->
+    (deploy agent, spawn `gauntlet agent` per host/pair/NCCL rank over ssh
+    or as an srun step) -> agent JSON-lines on stdout (srun forwards the
+    task's stdio unchanged) -> per-host tokio task decodes -> mpsc ->
+    collector -> outlier analysis -> report.json + terminal table.
+    The resolved `[nccl]` env (validated NCCL_* map) is the environment of
+    every agent spawn — on the remote `env ... gauntlet agent ...` command
+    line over ssh, on the local srun process (exported with --export=ALL)
+    over srun; never on the wire, never via set_var in the agent — and
+    recorded run-level in RunResults.nccl_env, next to RunResults.launch
+    (ssh, or srun + job id). A process hosting an NCCL communicator gets
+    its level's effective env instead (global <- `[nccl.levels.<level>]`,
+    recorded in RunResults.nccl_level_env) plus NCCL debug-log variables
+    the config does not set; after its workload the agent parses that
+    NCCL INFO log and emits an `nccl_transport` event (network transport,
+    plugin, HCAs, peer channels) -> hosts.*.nccl_transports ->
+    fleet.socket_fallbacks (the observed fallback). The fleet level's env
+    also decides, orchestrator-side, which inventoried IB/RoCE ports NCCL
+    would use (the predicted view): every arriving inventory goes through
+    orchestrator::derive::derive_inventory_events (gpu_idle outcomes;
+    nccl_nics outcome + ceiling metric + NcclNics summary), which the
+    collector records like agent events (hosts.*.nccl_nics).
+    report::build only reads those results (consistency fields, the "nccl
+    nics" section) and never re-derives. Both views share one definition
+    of a usable port (IbPortInventory::nccl_usable). Agents report sysfs
+    facts only.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -53,24 +101,77 @@ Overview:
     runs/<run_id>.json lands.
 
 Features Index:
+  slurm_launch:
+    description: >
+      `[launch] mode = "srun"` / `--launch srun` (schema v17): agents start
+      as srun job steps of the allocation the orchestrator runs in
+      (`srun <flags> --nodes=1 --ntasks=1 --nodelist=<host>
+      --job-name=gauntlet:<host>:<args> --export=ALL <agent> agent ...`;
+      default flags --overlap, --cpu-bind=none, --kill-on-bad-exit=1,
+      typed and config-overridable; managed, stdio-changing and
+      signal-changing options rejected in every getopt spelling). Hosts
+      default to the allocation (`scontrol show hostnames`, pure parser)
+      or must be a subset of it, keyed by NodeName with NodeAddr (one
+      `scontrol --oneliner show node`) as data_addr; no SLURM_JOB_ID is a
+      typed error. NCCL env via the srun process env (orchestrator NCCL_*
+      and GPU-visibility vars stripped); `<dir>/lib` prepended to
+      LD_LIBRARY_PATH inside the step so srun keeps its own. Deploy by a
+      step-scoped sbcast (carrier step on the stale nodes, per-node
+      fallback) to /tmp/gauntlet-$USER (or a shared path), staging
+      cleaned everywhere. Every step named; kill = batched squeue lookup
+      + scancel --signal=KILL of the printed ids (array/het jobs work);
+      a dropped srun gets SIGTERM so it cancels its step. Behind a
+      transport enum (Ssh | Srun) so nothing above HostSession changes.
+    entry_points: [launch/, orchestrator/transport/, orchestrator/session.rs, orchestrator/deploy.rs, orchestrator/fanout.rs, config.rs, cli.rs]
+    depends_on: [bootstrap, nccl_env, phase3_network]
+    doc: docs/features/slurm_launch.md
   bootstrap:
     description: >
-      `gauntlet bootstrap`: connectivity check, arch check, agent deploy,
-      capability probe (agent probe -> InventorySnapshot), optional --tune
+      `gauntlet bootstrap`: connectivity check, arch check, agent deploy
+      (fleet-wide step: per-host sftp, or one sbcast in srun mode),
+      capability probe (agent probe -> InventorySnapshot, including the
+      gpu_idle column), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
-      schema-versioned document (the GUI viewer's interface).
-    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
-    depends_on: []
+      schema-versioned document (the GUI viewer's interface; v2 records
+      gauntlet_version). remote_dir is a validated template (default
+      /tmp/gauntlet-$USER, owner-checked, created 700). `--launch` selects
+      ssh or srun (connectivity cell names the Slurm job); deploy is a
+      fleet-wide step (per-host sftp, or a step-scoped sbcast).
+    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs, orchestrator/session.rs, remote_dir.rs]
+    depends_on: [slurm_launch]
     doc: docs/features/bootstrap.md
   phase0_inventory:
     description: >
       Inventory and sanity: kernel/driver/CUDA/NIC-firmware/MTU/governor/NUMA
       inventory; fleet consistency check (flag nodes differing from majority);
       GPU health counters (ECC, row remaps, dmesg Xid, PCIe link gen/width,
-      NVLink status/errors); IB port state; clock sync offset.
-    entry_points: [agent/inventory.rs]
+      NVLink status/errors); IB devices and ports (state, phys state,
+      typed rate (known / unparseable with its error / unreadable), link
+      layer + RoCE versions, bound netdevs (GID-table ndevs for RoCE),
+      PCI address/NUMA node/upstream bridges from the innermost host
+      bridge; proto v13) and GPU PCI placement; clock sync offset;
+      per-GPU occupancy (memory used/total, compute processes by bus id).
+    entry_points: [agent/inventory.rs, agent/ib.rs, agent/pci.rs, agent/sysfs.rs, agent/gpu_occupancy.rs]
     depends_on: []
+    doc: docs/features/phase0_inventory.md
+  gpu_idle:
+    description: >
+      Pre-flight "is anyone else on this GPU" check (proto v10 / schema
+      v11). The agent records per-GPU GpuOccupancy (nvidia-smi memory.used/
+      total plus --query-compute-apps joined by PCI bus id; graphics-only
+      clients excluded by construction; its own process lineage dropped;
+      any other gauntlet-agent kept as StaleGauntletAgent). The
+      orchestrator derives one TestId::GpuIdle outcome per GPU as the
+      inventory arrives (proto::assess_gpu_idle against
+      thresholds.gpu_idle_max_used_mib, default 1024): Failed names each
+      process, pid and MiB and makes the verdict Outliers (soft tier:
+      environmental, not broken hardware); unknown is
+      Skipped. Bootstrap shows the same policy as its gpu_idle column
+      (warn); the report adds a "gpus in use" section. Detection only: no
+      phase is auto-skipped.
+    entry_points: [agent/gpu_occupancy.rs, proto/occupancy.rs, orchestrator/mod.rs, orchestrator/bootstrap/gpu_idle.rs, report/gpu_idle.rs]
+    depends_on: [phase0_inventory]
     doc: docs/features/phase0_inventory.md
   phase1_cpu_mem_disk:
     description: >
@@ -89,30 +190,230 @@ Features Index:
     entry_points: [agent/gpu/]
     depends_on: [phase0_inventory]
     doc: docs/features/phase2_gpu.md
+  hot_sdc:
+    description: >
+      Silent-data-corruption screens under thermal load (SDC is
+      temperature/voltage dependent): periodic bitwise verification of the
+      sustained GEMM output during the loaded window (busy-time scheduled,
+      throughput-neutral), and an all-core CPU screen interleaving checksum
+      rounds with the power-heavy FMA workload. Mismatches are hard
+      per-scope failures with clock/temp context; fleet.sdc_failures +
+      dedicated table section.
+    entry_points: [agent/gpu/sdc.rs, agent/gpu/gemm.rs, agent/cpu.rs]
+    depends_on: [phase1_cpu_mem_disk, phase2_gpu]
+    doc: docs/features/hot_sdc.md
   phase3_network:
     description: >
-      Pairwise TCP RTT distribution (p50/p99) and bandwidth via agent peer
-      mode, tournament-scheduled full mesh. NCCL all-reduce/all-gather message
-      -size sweeps, hierarchical: intra-node, node pairs, full fleet. Fits
-      t = alpha + beta*size per link class for simulator calibration.
-    entry_points: [agent/net.rs, agent/nccl.rs, analysis/schedule.rs, orchestrator/mod.rs]
-    depends_on: [phase0_inventory]
+      Hierarchical network tests, innermost first. Intra-node (proto
+      v8/schema v9, tests.nccl_intranode): all-reduce + all-gather
+      message-size sweep across every local GPU (single process,
+      ncclCommInitAll, NVLink/PCIe) via the per-node fan-out, on hosts with
+      a loadable libnccl and >= 2 CUDA-visible GPUs (others Skipped with the
+      reason); per-size series feed calibration link classes
+      nccl_{allreduce,allgather}_intranode_<n>gpu, and a per-node
+      bus_gib_per_sec_peak_<n>gpu headline is MAD-compared across nodes of
+      the same GPU count (degraded NVLink, downtrained PCIe switch, missing
+      P2P path). Then pairwise TCP RTT distribution (p50/p99) and bandwidth
+      via agent peer mode, tournament-scheduled full mesh. Then the fleet
+      NCCL sweep. Both NCCL sweep levels share one per-size timing loop
+      (agent/sweep.rs); each level supplies only its launch and timer. Fits
+      t = alpha + beta*size per link class for simulator calibration
+      (least squares constrained to alpha, beta >= 0, the active bound
+      recorded per fit; schema v12). The
+      fleet NCCL world is one rank per GPU (proto v7): each NCCL-capable host
+      owns a contiguous, validated rank block (RankBlock/RankAssignment,
+      laid out by RankLayout from the CUDA-visible GPU counts in the
+      phase-0 inventory) ordered by local GPU index, and one agent nccl
+      process per host drives its whole block (all fallible setup first,
+      then grouped ncclCommInitRank + grouped collectives from one
+      thread), so every GPU's PCIe/NIC path is exercised, not just GPU
+      0's. Failures are attributed: the first primary failure aborts the
+      rest of the world (remote kill), only the culprit is Failed, hosts
+      it aborted are Skipped/warned; abandoned agents are always killed
+      remotely; per-rank reports are accepted only from the owning host.
+      World shapes (proto v12 / schema v14, tests.nccl_world): the fleet
+      sweep alone can run rank_per_node (one rank per host on GPU 0, every
+      peer on another node: pure inter-node) or per_rail (rail r = GPU r of
+      every host that has one, rails run sequentially), laid out by the
+      pure orchestrator/nccl/shape.rs into RankLayouts whose RankBlocks
+      carry the first local GPU; series land under nccl_inter_all_* and fit
+      nccl_{allreduce,allgather}_inter_node_<n>rank (keyed by world size).
+      Per-rail: a host to blame for one rail is excluded from later rails
+      and the barrier (orchestrator/nccl/rails.rs), and every host records
+      one outcome per test for the whole sweep. The sweep runs only on
+      worlds with >= 2 ranks, and >= 2 hosts while the intra-node sweep
+      runs (Skipped naming the failed condition). Every fleet sweep's lead
+      emits a fleet-level headline: bus_gib_per_sec_peak (rank-per-GPU,
+      rank-per-node), per rail _rail<r> plus the worst-rail
+      bus_gib_per_sec_peak_min_rail — aggregated across repeats and
+      threshold-checked but never MAD-compared (one value per run, no
+      fleet peers; the barrier fleet_span_* follow the same rule).
+      Barrier probe and fleet overlap always stay rank-per-GPU.
+      Steps are a typed selection (tests.net_steps / --net-steps:
+      intranode, pairwise, nccl, barrier); deselected steps record
+      Skipped "disabled by config", so `--net-steps nccl` is a quick
+      NCCL-only check. Deselecting nccl drops every world shape, rail
+      and NCCL barrier; deselecting barrier suppresses both NCCL
+      barrier placements and the TCP barrier; the intra-node
+      coverage the one-host gate needs follows the intranode step
+      (orchestrator/network_plan.rs).
+    entry_points: [net_steps.rs, agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/network_plan.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
+    depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
+  barrier_skew:
+    description: >
+      Straggler microbenchmark: ~2000 iterations of a tiny collective with
+      per-rank timing. NCCL path (tiny all-reduce on the sweep's fleet
+      communicator, one rank per GPU — its own rank-per-GPU job when the
+      sweep runs a NIC-forcing world shape; straggler = min local elapsed, the
+      wait-time inversion; a host's ranks share one arrival and are
+      tallied as one arrival group, results keyed host:gpuN) plus a
+      pure-TCP star-barrier fallback for CPU-only fleets (straggler = max
+      release-to-response on the coordinator's clock, keyed per host).
+      Per-rank p50/p90/p99/max feed MAD analysis; a slowest-rank tally
+      with a noise margin gets its own flagging rule
+      (fleet.barrier_stragglers, part of the verdict). Fleet-level
+      per-iteration barrier-span distribution is recorded against the
+      lead host.
+    entry_points: [analysis/skew.rs, agent/barrier.rs, agent/nccl/sweep.rs, orchestrator/barrier.rs, orchestrator/mod.rs, orchestrator/nccl/]
+    depends_on: [phase3_network]
+    doc: docs/features/barrier_skew.md
+  nccl_env:
+    description: >
+      `[nccl] env` passthrough (proto v9 / schema v10): a validated
+      name -> value map restricted to `^NCCL_[A-Z0-9_]+$` keys (no
+      LD_PRELOAD / CUDA_VISIBLE_DEVICES smuggling), non-empty NUL-free
+      values; `socket_ifname` stays typed and folds in as
+      NCCL_SOCKET_IFNAME (setting both is a ConfigError). The orchestrator
+      puts the resolved map, single-quoted, on the `env` command line of
+      every agent spawn (HostSession), so every NCCL communicator — fleet
+      sweep/barrier, fleet overlap, intra-node overlap — starts under it
+      without the multi-threaded agent mutating its environment. Recorded
+      run-level in `RunResults.nccl_env`; the viewer's diff mode lists
+      drift against the baseline.
+      Per-level overrides (proto v11 / schema v13): `[nccl.levels.<level>]
+      env` layers onto the global map for one NCCL call site (NcclLevel:
+      intranode, fleet, barrier, overlap_intranode, overlap_fleet; mapped
+      from Phase::nccl_level / NcclWorkload::level). Each level has its own
+      agent process (one phase per `agent run`; the barrier probe moves to
+      its own communicator when its env differs from the fleet's or the
+      sweep runs a NIC-forcing world shape), so the
+      orchestrator starts each with its level's env (`AgentEnv::Nccl`).
+      Effective envs recorded in `RunResults.nccl_level_env`; per-level
+      drift in the viewer.
+    entry_points: [nccl_env.rs, nccl_level.rs, config.rs, orchestrator/session.rs, orchestrator/nccl/mod.rs, report/nccl_env.rs]
+    depends_on: [phase3_network, overlap_phase]
+    doc: docs/features/nccl_env.md
+  nccl_nics:
+    description: >
+      Which IB/RoCE ports NCCL would use (proto v13 / schema v16). It is
+      a pure replay of NCCL's IB device scan over a host's inventory
+      under the run's fleet-level resolved env (the multi-host
+      communicator's), applied in order:
+      - NCCL_NET (Socket forces sockets; a plugin is recorded but not
+        modelled);
+      - NCCL_IB_DISABLE (C strtoll base 0, as ncclLoadParam reads it);
+      - ACTIVE state and an IB/Ethernet link layer;
+      - NCCL_IB_HCA (`^` exclude, `=` exact, comma list, dev:port,
+        prefix match by default; HcaFilter).
+      The single inventory-derivation hook
+      (orchestrator::derive::derive_inventory_events, shared with
+      gpu_idle) records three things per host:
+      - a Node-scope `nccl_nics` outcome, Failed when usable ports exist
+        but none is selected (a predicted socket fallback; hard evidence,
+        verdict Failures, like the observed `fleet.socket_fallbacks`,
+        with which it shares IbPortInventory::nccl_usable);
+      - the fleet-comparable `nccl_nics.ceiling_gib_per_sec` metric, the
+        summed encoding-corrected line rate of the selected ports;
+      - the NcclNicSummary in `hosts.*.nccl_nics`: env inputs,
+        selected/excluded ports, typed rates (unparseable ones carry
+        their error), and GPU<->NIC PCI locality.
+      The report reads these and adds the nccl_ib_ports,
+      nccl_ib_link_layer and nccl_ib_ceiling_gbps consistency fields
+      (report/consistency.rs) and a "nccl nics" section.
+    entry_points: [nccl_ib/mod.rs, nccl_ib/hca.rs, proto/nccl_nics.rs, proto/ib.rs, orchestrator/derive.rs, report/consistency.rs, report/nccl_nics.rs]
+    depends_on: [phase0_inventory, nccl_env]
+    doc: docs/features/nccl_nics.md
+  nccl_transport:
+    description: >
+      Transport capture (proto v11 / schema v13): NCCL-hosting processes
+      are started with NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,NET and a
+      per-host/level NCCL_DEBUG_FILE (never overriding config values; a
+      config NCCL_DEBUG below INFO, or a subsys mask without INIT, adds
+      nothing and records "unknown"). The agent clears the log path before
+      NCCL starts and, on every exit after its first NCCL call (init
+      failures included), parses the log (pure parser, NCCL 2.18-2.30
+      fixtures) into one `nccl_transport` event: network transport
+      (IB/RoCE ports, socket interfaces, net plugin), peer channel counts
+      (P2P/SHM/NET/GDR/COLLNET), NCCL version. A multi-host communicator on
+      TCP sockets, on a host whose inventory shows an ACTIVE IB/RoCE port,
+      without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env, is a
+      `fleet.socket_fallbacks` finding (hard evidence: verdict Failures); Ethernet-only
+      hosts are never flagged. The table shows a "nccl transports"
+      section.
+    entry_points: [nccl_transport/, agent/transport.rs, orchestrator/session.rs, report/nccl_transport.rs]
+    depends_on: [nccl_env, phase3_network, overlap_phase]
+    doc: docs/features/nccl_transport.md
+  overlap_phase:
+    description: >
+      Combined-load straggler tests, run last. Node-local step: sustained
+      GEMM concurrent with an intra-node NCCL all-reduce on the same GPUs
+      (single process, one rank per GPU, ncclCommInitAll via the NodeComm
+      helper shared with the intra-node sweep; GEMM on a second
+      stream per device from one thread per GPU, gpu/worker.rs). Fleet
+      step (tests.overlap_fleet, >= 2 GPU hosts): the same per-GPU GEMM
+      load on every node while every GPU is also a rank of a cross-node
+      all-reduce over the real fabric (one rank per GPU since proto
+      v7/schema v8), window boundaries agreed through a MIN-reduced
+      control word (agent/window.rs, exactly one lead: global rank 0) so
+      no cross-host clock comparison is needed; every rank (= GPU)
+      reports its own OverlapFleetReport (barrier-timings pattern). Both
+      steps emit overlapped GFLOPS per GPU and isolated + overlapped
+      all-reduce bus bandwidth (node-local: per node; fleet: per GPU);
+      report::build derives retention ratios (overlapped/isolated)
+      against the phase-2 GEMM baselines and each subject's own
+      collective baseline, which feed the MAD outlier analysis as the
+      primary combined-load straggler signal. A wedged step cannot leave
+      load behind: GEMM workers stop at a spec-derived hard deadline and
+      a watchdog terminates the fleet step's agent shortly after.
+    entry_points: [agent/gpu/overlap.rs, agent/nccl/fleet_overlap.rs, agent/window.rs, orchestrator/nccl/, report/mod.rs]
+    depends_on: [phase2_gpu, phase3_network]
+    doc: docs/features/overlap_phase.md
+  counter_deltas:
+    description: >
+      Error-counter delta detection across the load phases: the agent
+      snapshots PCIe AER, GPU ECC/row-remap, dmesg Xid, NVLink, EDAC, IB
+      port and NVMe error counters before the first load phase (baseline
+      held by the orchestrator) and again after the last repeat, diffs on
+      the agent, and emits per-node CounterDeltas. Any positive increment
+      is a per-host finding (verdict Failures) rendered in its own table
+      section; full deltas (zeros included) land in the JSON. Collection
+      is best effort — nodes without a subsystem contribute nothing.
+    entry_points: [agent/counters.rs, orchestrator/mod.rs]
+    depends_on: [phase0_inventory]
+    doc: docs/features/counter_deltas.md
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
-      overlay, run history, terminal table, exit codes. Live runs publish
+      overlay, run history, terminal table, typed verdict + exit codes
+      (schema v15, monotonic in severity: 0 clean, 1 outliers/soft
+      incl. gpu_idle, 2 host failures, 3 hard evidence; 4 = error before
+      any verdict, CLI usage errors included; null verdict = run in
+      flight), run-level gauntlet_version (build.rs git
+      revision; also `gauntlet --version`). Live runs publish
       periodic partial snapshots (runs/<run_id>.partial.json, written via
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, phase1_cpu_mem_disk, phase2_gpu, phase3_network]
+    entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, report/consistency.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport, nccl_nics, slurm_launch]
     doc: docs/features/reporting.md
   viewer:
     description: >
       `gauntlet-view` (workspace member `viewer/`): native GPUI desktop app
-      rendering runs as a fully connected fleet graph — node color = host
+      rendering runs as a fully connected fleet graph (diff mode marks a
+      baseline from another schema version as not directly comparable) —
+      node color = host
       health, edge color = pairwise-path health — plus per-direction edge
       details, roofline cards, link fits, and a filterable quantitative
       metric table. Sidebar lists all runs (selectable, baseline-pinnable);

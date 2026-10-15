@@ -9,6 +9,7 @@ use gpui::{
 };
 
 use gauntlet::proto::Unit;
+use gauntlet::report::nccl_env::{format_level_overrides, format_nccl_env};
 
 use super::{
     BAD, BG, MUTED, OK, PANEL, PANEL_BORDER, RootView, SELECT, Selection, TEXT, WARN,
@@ -98,6 +99,11 @@ impl RootView {
             };
             let (warned, failed) = (count(Severity::Warn), count(Severity::Bad));
             let regressed_links = diff.edge_severity.len();
+            let level_drift = diff
+                .nccl_level_env_drift
+                .as_ref()
+                .filter(|levels| !levels.is_empty());
+            let drift = diff.nccl_env_drift.as_ref();
             card = card
                 .child(title(format!("diff vs {}", diff.baseline_run_id)))
                 .child(
@@ -121,8 +127,40 @@ impl RootView {
                                     if regressed_links == 1 { "" } else { "s" }
                                 ),
                             ))
-                        }),
+                        })
+                        .when(
+                            drift.is_some_and(|d| !d.is_empty()) || level_drift.is_some(),
+                            |row| row.child(chip(WARN, "nccl env drift".into())),
+                        ),
                 );
+            // Tuning drift explains (or invalidates) NCCL deltas, so it is
+            // spelled out, not just flagged.
+            if let Some(changes) = drift.filter(|d| !d.is_empty()) {
+                let mut drift = div().flex().flex_col().gap_1();
+                for change in changes {
+                    drift = drift.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(WARN))
+                            .child(change.describe()),
+                    );
+                }
+                card = card.child(drift);
+            }
+            if let Some(levels) = level_drift {
+                let mut drift = div().flex().flex_col().gap_1();
+                for (level, changes) in levels {
+                    for change in changes {
+                        drift = drift.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(WARN))
+                                .child(format!("[{level}] {}", change.describe())),
+                        );
+                    }
+                }
+                card = card.child(drift);
+            }
         } else {
             // Chips split by cause: performance findings vs version skew,
             // so "outliers" never means "merely unpatched".
@@ -172,6 +210,25 @@ impl RootView {
                         row.child(chip(WARN, format!("{skewed} version skew")))
                     }),
             );
+            card = card.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "nccl env: {}",
+                        format_nccl_env(vm.nccl_env.as_ref())
+                    )),
+            );
+            for (level, env) in
+                format_level_overrides(vm.nccl_env.as_ref(), vm.nccl_level_env.as_ref())
+            {
+                card = card.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(MUTED))
+                        .child(format!("nccl env [{level}]: {env}")),
+                );
+            }
         }
 
         if !vm.links.is_empty() {
@@ -193,6 +250,7 @@ impl RootView {
                         .gap_2()
                         .text_size(px(11.0))
                         .child(cell_grow(link.class.clone()).text_color(rgb(TEXT)))
+                        .when_some(link.bound, |row, b| row.child(cell_num(b.label())))
                         .child(cell_num(format!("{:.1}", link.alpha_us)))
                         .child(cell_num(format!("{:.2}", link.gib_per_sec)))
                         .child(cell_num(format!("{:.4}", link.r_squared))),

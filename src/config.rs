@@ -2,13 +2,20 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::launch::{LaunchConfig, LaunchMode};
+use crate::nccl_env::{NcclEnv, NcclEnvError, RawNcclEnvValue, stringify_raw};
+use crate::nccl_level::{NcclLevel, NcclLevelEnvs};
+use crate::net_steps::{NetStep, NetSteps};
 use crate::proto::{
-    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, Phase,
+    AgentTaskSpec, CpuTaskSpec, DiskTaskSpec, GemmDtype, GpuTaskSpec, MemTaskSpec, NcclSweepSpec,
+    OverlapSpec, Phase,
 };
+use crate::remote_dir::RemoteDir;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -22,14 +29,37 @@ pub enum ConfigError {
         path: PathBuf,
         source: Box<toml::de::Error>,
     },
-    #[error("no hosts configured")]
-    NoHosts,
+    /// Only srun launch can infer hosts (from the allocation); every other
+    /// mode needs them listed.
+    #[error("no hosts configured (launch mode {mode} needs `hosts`; only srun mode infers them)")]
+    NoHosts { mode: LaunchMode },
     #[error("duplicate host address: {addr}")]
     DuplicateHost { addr: String },
     #[error("thresholds.mad_k must be positive, got {got}")]
     BadMadK { got: f64 },
+    #[error("thresholds.barrier_slowest_frac must be in (0, 1], got {got}")]
+    BadBarrierFrac { got: f64 },
     #[error("unknown phase name: {name}")]
     UnknownPhase { name: String },
+    #[error(
+        "unknown network step name: {name} (expected one of: {})",
+        NetStep::help_list()
+    )]
+    UnknownNetStep { name: String },
+    /// The network-step selection (config, `--net-steps`, minus
+    /// `nccl_intranode = false`) leaves nothing to run.
+    #[error("no network steps selected; drop the network phase instead")]
+    NoNetSteps,
+    /// `[nccl]` violates the NCCL env policy (non-NCCL key, empty or
+    /// NUL-bearing value, NCCL_SOCKET_IFNAME set twice).
+    #[error("invalid [nccl] section: {source}")]
+    Nccl { source: NcclEnvError },
+    /// `[nccl.levels.<level>] env` violates the same policy as `[nccl] env`.
+    #[error("invalid [nccl.levels.{level}] section: {source}")]
+    NcclLevel {
+        level: NcclLevel,
+        source: NcclEnvError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,13 +67,24 @@ pub enum ConfigError {
 pub struct FleetConfig {
     #[serde(default)]
     pub ssh: SshConfig,
+    /// May be omitted in srun launch mode: the allocation's nodes are used.
+    #[serde(default)]
     pub hosts: Vec<HostEntry>,
+    /// `[launch]`: ssh (default) or srun inside a Slurm allocation.
+    #[serde(default)]
+    pub launch: LaunchConfig,
     #[serde(default)]
     pub tests: TestConfig,
     #[serde(default)]
     pub thresholds: Thresholds,
     #[serde(default)]
     pub nccl: NcclConfig,
+    /// `nccl` resolved and validated (global env plus every level's
+    /// effective env), filled once by `validate` (or on first access).
+    /// Private and write-once: the only value it can ever hold is one
+    /// `NcclConfig::resolve_levels` accepted.
+    #[serde(skip)]
+    resolved_nccl: OnceLock<NcclLevelEnvs>,
 }
 
 /// Hosts may be written as a bare address string or a full table.
@@ -76,7 +117,10 @@ pub struct SshConfig {
     /// Identity file; defaults to agent/ssh-config resolution.
     pub key: Option<PathBuf>,
     /// Directory on each node for the agent binary and scratch files.
-    pub remote_dir: String,
+    /// Expanded on the node: a leading `~` and `$USER` / `${USER}` only.
+    /// Defaults to the node-local `/tmp/gauntlet-$USER` (a home directory
+    /// is often shared NFS on clusters).
+    pub remote_dir: RemoteDir,
     pub connect_timeout_secs: u64,
     /// Concurrent session-establishment limit (full sessions stay open after).
     pub max_concurrent: usize,
@@ -87,11 +131,32 @@ impl Default for SshConfig {
         Self {
             user: None,
             key: None,
-            remote_dir: "~/.gauntlet".into(),
+            remote_dir: RemoteDir::default(),
             connect_timeout_secs: 10,
             max_concurrent: 32,
         }
     }
+}
+
+/// How the fleet NCCL sweep lays out its world (`[tests] nccl_world`).
+///
+/// - `rank_per_gpu` (default): one rank per GPU on every NCCL-capable
+///   host — what training runs; the ring mixes NVLink/PCIe with the
+///   fabric.
+/// - `rank_per_node`: one rank per host, on its GPU 0. Every peer is on
+///   another node, so all collective traffic crosses the NIC (pure
+///   inter-node, the nccl-tests one-GPU-per-node shape).
+/// - `per_rail`: one world per local GPU index `r` (rail `r`), each one
+///   rank per host on that host's GPU `r` (hosts with more than `r` GPUs
+///   join), run one rail after another so each rail's NIC/PCIe path is
+///   measured alone and its number is attributable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NcclWorldShape {
+    #[default]
+    RankPerGpu,
+    RankPerNode,
+    PerRail,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +167,9 @@ pub struct TestConfig {
     pub phase_timeout_secs: u64,
     pub cpu_correctness_secs_per_core: u64,
     pub cpu_gflops_secs: u64,
+    /// Wall seconds for the hot SDC screen (correctness interleaved with the
+    /// all-core power workload). 0 disables.
+    pub cpu_sdc_hot_secs: u64,
     pub mem_buffer_mib_per_numa: u64,
     pub mem_iters: u32,
     /// Paths exercised by the disk test (dataset dir, checkpoint dir).
@@ -110,7 +178,14 @@ pub struct TestConfig {
     pub gemm_secs: u64,
     pub gemm_dim: u32,
     pub gemm_dtypes: Vec<GemmDtype>,
+    /// Loaded seconds between bitwise output checks during the sustained
+    /// GEMM (hot SDC screen). 0 disables.
+    pub gemm_sdc_check_secs: u64,
     pub gpu_bandwidth_mib: u64,
+    /// Network-phase steps to run (`intranode`, `pairwise`, `nccl`,
+    /// `barrier`); defaults to all. Deselected steps record Skipped
+    /// outcomes ("disabled by config"). `--net-steps` overrides.
+    pub net_steps: Vec<NetStep>,
     pub net_latency_secs: u64,
     pub net_bandwidth_secs: u64,
     /// Base port for peer listeners; each concurrent pair gets base+i.
@@ -118,6 +193,27 @@ pub struct TestConfig {
     /// NCCL sweep message sizes in bytes.
     pub nccl_sizes: Vec<u64>,
     pub nccl_iters_per_size: u32,
+    /// Network phase: run the intra-node NCCL sweep (all local GPUs of each
+    /// node, NVLink/PCIe) before the pairwise and fleet levels. Reuses
+    /// `nccl_sizes` / `nccl_iters_per_size`.
+    pub nccl_intranode: bool,
+    /// World shape of the fleet NCCL sweep (the barrier probe and the
+    /// fleet overlap step always run rank-per-GPU).
+    pub nccl_world: NcclWorldShape,
+    /// Barrier-skew microbenchmark iterations (0 disables it).
+    pub barrier_iters: u32,
+    /// Payload of the tiny barrier all-reduce, in bytes.
+    pub barrier_bytes: u64,
+    /// Overlap phase: wall seconds of GEMM + all-reduce combined load.
+    pub overlap_secs: u64,
+    /// Overlap phase: isolated intra-node all-reduce baseline window.
+    pub overlap_baseline_secs: u64,
+    /// Overlap phase: all-reduce message size in MiB.
+    pub overlap_msg_mib: u64,
+    /// Overlap phase: also run the fleet-wide combined-load step (GEMM on
+    /// every GPU under a cross-node all-reduce). Skipped quietly on fleets
+    /// with fewer than two GPU-bearing hosts.
+    pub overlap_fleet: bool,
 }
 
 impl Default for TestConfig {
@@ -127,6 +223,7 @@ impl Default for TestConfig {
             phase_timeout_secs: 900,
             cpu_correctness_secs_per_core: 10,
             cpu_gflops_secs: 10,
+            cpu_sdc_hot_secs: 10,
             mem_buffer_mib_per_numa: 1024,
             mem_iters: 20,
             disk_paths: vec!["/tmp".into()],
@@ -134,13 +231,23 @@ impl Default for TestConfig {
             gemm_secs: 30,
             gemm_dim: 8192,
             gemm_dtypes: vec![GemmDtype::F32, GemmDtype::Bf16, GemmDtype::F16],
+            gemm_sdc_check_secs: 5,
             gpu_bandwidth_mib: 1024,
+            net_steps: NetStep::ALL.to_vec(),
             net_latency_secs: 3,
             net_bandwidth_secs: 5,
             net_port_base: 29500,
             // 1 KiB .. 1 GiB, powers of 4.
             nccl_sizes: (0..=10).map(|i| 1024u64 * 4u64.pow(i)).collect(),
             nccl_iters_per_size: 20,
+            nccl_intranode: true,
+            nccl_world: NcclWorldShape::RankPerGpu,
+            barrier_iters: 2000,
+            barrier_bytes: 8,
+            overlap_secs: 30,
+            overlap_baseline_secs: 5,
+            overlap_msg_mib: 64,
+            overlap_fleet: true,
         }
     }
 }
@@ -154,6 +261,16 @@ pub struct Thresholds {
     /// Optional absolute bounds keyed by "<test>.<metric>", e.g.
     /// "gpu_gemm_perf.gflops" -> { min = 100000 }.
     pub absolute: BTreeMap<String, Bound>,
+    /// Barrier-skew flag: a host is a straggler when it was the (unique,
+    /// beyond-margin) late arriver in more than this fraction of the
+    /// considered barrier iterations.
+    pub barrier_slowest_frac: f64,
+    /// `gpu_idle`: a GPU with more than this much memory in use (MiB) at
+    /// inventory time fails the check even without a listed compute
+    /// process. The default leaves headroom for a desktop's graphics
+    /// clients and driver residue; any foreign compute process fails the
+    /// check regardless.
+    pub gpu_idle_max_used_mib: u64,
 }
 
 impl Default for Thresholds {
@@ -161,6 +278,8 @@ impl Default for Thresholds {
         Self {
             mad_k: 4.0,
             absolute: BTreeMap::new(),
+            barrier_slowest_frac: 0.5,
+            gpu_idle_max_used_mib: 1024,
         }
     }
 }
@@ -172,31 +291,128 @@ pub struct Bound {
     pub max: Option<f64>,
 }
 
+/// `[nccl]` as written in the file. Resolved into the one `NcclEnv` by
+/// `FleetConfig::validate` (see `FleetConfig::nccl_env`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct NcclConfig {
     /// Value for NCCL_SOCKET_IFNAME on multi-homed nodes.
     pub socket_ifname: Option<String>,
+    /// Extra NCCL knobs, name -> value (keys `^NCCL_[A-Z0-9_]+$`; string,
+    /// integer or boolean values).
+    pub env: BTreeMap<String, RawNcclEnvValue>,
+    /// Per-level overrides layered on top of `env` (`[nccl.levels.<level>]`).
+    pub levels: NcclLevelsConfig,
+}
+
+/// `[nccl.levels]`: one optional override table per NCCL call site. Field
+/// names are the `NcclLevel` names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelsConfig {
+    pub intranode: NcclLevelConfig,
+    pub fleet: NcclLevelConfig,
+    pub barrier: NcclLevelConfig,
+    pub overlap_intranode: NcclLevelConfig,
+    pub overlap_fleet: NcclLevelConfig,
+}
+
+/// `[nccl.levels.<level>]` as written in the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct NcclLevelConfig {
+    /// NCCL knobs for this level only, layered over `[nccl] env` (same key
+    /// and value rules). NCCL_SOCKET_IFNAME may be overridden here even
+    /// when `[nccl] socket_ifname` sets it globally: layering is the point.
+    pub env: BTreeMap<String, RawNcclEnvValue>,
+}
+
+impl NcclLevelsConfig {
+    pub fn get(&self, level: NcclLevel) -> &NcclLevelConfig {
+        match level {
+            NcclLevel::Intranode => &self.intranode,
+            NcclLevel::Fleet => &self.fleet,
+            NcclLevel::Barrier => &self.barrier,
+            NcclLevel::OverlapIntranode => &self.overlap_intranode,
+            NcclLevel::OverlapFleet => &self.overlap_fleet,
+        }
+    }
+
+    /// Validate every non-empty override table, in `NcclLevel::ALL` order
+    /// (the first failure is reported with its level).
+    pub fn resolve(&self) -> Result<BTreeMap<NcclLevel, NcclEnv>, ConfigError> {
+        NcclLevel::ALL
+            .into_iter()
+            .filter(|level| !self.get(*level).env.is_empty())
+            .map(|level| {
+                stringify_raw(&self.get(level).env)
+                    .and_then(|raw| NcclEnv::from_map(&raw))
+                    .map(|env| (level, env))
+                    .map_err(|source| ConfigError::NcclLevel { level, source })
+            })
+            .collect()
+    }
+}
+
+impl NcclConfig {
+    /// Validate the global part into the single run-wide env: `env`
+    /// stringified, plus `socket_ifname` folded in as NCCL_SOCKET_IFNAME.
+    pub fn resolve(&self) -> Result<NcclEnv, NcclEnvError> {
+        NcclEnv::resolve(self.socket_ifname.as_deref(), &stringify_raw(&self.env)?)
+    }
+
+    /// Validate the whole section: the global env, then every level's
+    /// override layered on top of it.
+    pub fn resolve_levels(&self) -> Result<NcclLevelEnvs, ConfigError> {
+        let global = self
+            .resolve()
+            .map_err(|source| ConfigError::Nccl { source })?;
+        let overrides = self.levels.resolve()?;
+        Ok(NcclLevelEnvs::resolve(global, &overrides))
+    }
 }
 
 impl FleetConfig {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_for(path, None)
+    }
+
+    /// `load`, validated for the launch mode the command will actually use
+    /// (`--launch` over `[launch] mode`): `gauntlet run --launch srun` on a
+    /// config without hosts is valid, the allocation supplies them.
+    pub fn load_for(path: &Path, cli_launch: Option<LaunchMode>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
             path: path.to_path_buf(),
             source,
         })?;
-        let config: FleetConfig = toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source: Box::new(source),
-        })?;
+        let config = Self::parse(&text, path)?;
+        config.validate_for(config.launch.effective_mode(cli_launch))?;
+        Ok(config)
+    }
+
+    /// Parse and validate a config document; `path` only labels errors.
+    pub fn from_toml_str(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        let config = Self::parse(text, path)?;
         config.validate()?;
         Ok(config)
     }
 
+    fn parse(text: &str, path: &Path) -> Result<Self, ConfigError> {
+        toml::from_str(text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
+    }
+
+    /// Validate for the configured launch mode.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.hosts.is_empty() {
-            return Err(ConfigError::NoHosts);
-        }
+        self.validate_for(self.launch.mode)
+    }
+
+    /// Validate for an effective launch `mode` (which decides whether an
+    /// empty host list is acceptable).
+    pub fn validate_for(&self, mode: LaunchMode) -> Result<(), ConfigError> {
+        self.require_hosts_for(mode)?;
         let mut seen = std::collections::BTreeSet::new();
         for host in self.hosts() {
             if !seen.insert(host.addr.clone()) {
@@ -208,7 +424,40 @@ impl FleetConfig {
                 got: self.thresholds.mad_k,
             });
         }
+        let frac = self.thresholds.barrier_slowest_frac;
+        if !(frac > 0.0 && frac <= 1.0) {
+            return Err(ConfigError::BadBarrierFrac { got: frac });
+        }
+        self.nccl_levels()?;
+        // `tests.net_steps` is deliberately not resolved here: the CLI may
+        // override it, and only a run that selects the network phase needs
+        // a non-empty set (`run_plan`). Names are already checked by serde.
         Ok(())
+    }
+
+    /// An empty host list is valid only where hosts can be inferred (srun
+    /// launch). Checked against the *effective* mode, which a `--launch`
+    /// override may change after `load`.
+    pub fn require_hosts_for(&self, mode: LaunchMode) -> Result<(), ConfigError> {
+        if self.hosts.is_empty() && mode != LaunchMode::Srun {
+            return Err(ConfigError::NoHosts { mode });
+        }
+        Ok(())
+    }
+
+    /// The same config over a resolved host list (srun launch: the
+    /// allocation, or the configured subset of it). Revalidated, so the
+    /// result upholds every `validate` invariant, plus a non-empty fleet.
+    pub fn with_hosts(&self, hosts: Vec<HostConfig>) -> Result<Self, ConfigError> {
+        let mut config = self.clone();
+        config.hosts = hosts.into_iter().map(HostEntry::Full).collect();
+        if config.hosts.is_empty() {
+            return Err(ConfigError::NoHosts {
+                mode: config.launch.mode,
+            });
+        }
+        config.validate_for(LaunchMode::Srun)?;
+        Ok(config)
     }
 
     /// Hosts normalized to full `HostConfig` form.
@@ -231,6 +480,7 @@ impl FleetConfig {
             cpu: CpuTaskSpec {
                 correctness_secs_per_core: tests.cpu_correctness_secs_per_core,
                 gflops_secs: tests.cpu_gflops_secs,
+                sdc_hot_secs: tests.cpu_sdc_hot_secs,
             },
             mem: MemTaskSpec {
                 buffer_bytes_per_numa: tests.mem_buffer_mib_per_numa * 1024 * 1024,
@@ -245,7 +495,67 @@ impl FleetConfig {
                 gemm_dtypes: tests.gemm_dtypes.clone(),
                 gemm_dim: tests.gemm_dim,
                 bandwidth_bytes: tests.gpu_bandwidth_mib * 1024 * 1024,
+                sdc_check_secs: tests.gemm_sdc_check_secs,
             },
+            overlap: self.overlap_spec(),
+            // Counter passes are scheduled by the orchestrator as dedicated
+            // invocations; a plain phase spec never carries one.
+            counters: None,
+            nccl_intranode: self.intranode_sweep_spec(),
+        }
+    }
+
+    /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
+    /// NCCL_SOCKET_IFNAME). Every agent spawn carries it on its remote
+    /// command line (`HostSession`), and the results record it.
+    ///
+    /// Resolved once — by `validate`, which `load` always runs — and cached.
+    /// On a config that skipped validation the first call resolves; either
+    /// way every `NcclEnv` handed out passed `NcclConfig::resolve`, so an
+    /// invalid env can never be observed. After `load` this cannot fail.
+    pub fn nccl_env(&self) -> Result<&NcclEnv, ConfigError> {
+        self.nccl_levels().map(NcclLevelEnvs::global)
+    }
+
+    /// The resolved NCCL env of every level (`[nccl]` global env with each
+    /// `[nccl.levels.<level>]` override layered on top). The orchestrator
+    /// starts each NCCL-hosting agent process with its level's env.
+    ///
+    /// Same caching and validation guarantees as `nccl_env`: resolved once
+    /// (by `validate`), and only ever a value `resolve_levels` accepted.
+    pub fn nccl_levels(&self) -> Result<&NcclLevelEnvs, ConfigError> {
+        if let Some(envs) = self.resolved_nccl.get() {
+            return Ok(envs);
+        }
+        let envs = self.nccl.resolve_levels()?;
+        Ok(self.resolved_nccl.get_or_init(|| envs))
+    }
+
+    /// The intra-node sweep parameters, or `None` when the sweep is
+    /// disabled. Same sizes and iteration count as the fleet sweep, so the
+    /// hierarchy levels are directly comparable.
+    pub fn intranode_sweep_spec(&self) -> Option<NcclSweepSpec> {
+        let tests = &self.tests;
+        tests.nccl_intranode.then(|| NcclSweepSpec {
+            sizes: tests.nccl_sizes.clone(),
+            iters_per_size: tests.nccl_iters_per_size,
+        })
+    }
+
+    /// The overlap-step parameters, shared verbatim by the node-local
+    /// phase (`AgentTaskSpec.overlap`) and the fleet step
+    /// (`NcclWorkload::Overlap`): both measure the same contention, one
+    /// topology level apart. The compute leg reuses the phase-2 dimension
+    /// (so retention divides comparable numbers) and the *first* configured
+    /// dtype only — it measures contention, not dtype coverage.
+    pub fn overlap_spec(&self) -> OverlapSpec {
+        let tests = &self.tests;
+        OverlapSpec {
+            duration_secs: tests.overlap_secs,
+            baseline_secs: tests.overlap_baseline_secs,
+            gemm_dim: tests.gemm_dim,
+            gemm_dtype: tests.gemm_dtypes.first().copied().unwrap_or(GemmDtype::F32),
+            msg_bytes: tests.overlap_msg_mib * 1024 * 1024,
         }
     }
 
@@ -260,5 +570,77 @@ impl FleetConfig {
                 Phase::parse(name).ok_or_else(|| ConfigError::UnknownPhase { name: name.clone() })
             })
             .collect()
+    }
+
+    /// Resolve the network-phase step set: `--net-steps` strings when
+    /// given, else `tests.net_steps`; `tests.nccl_intranode = false` always
+    /// removes the intra-node step. Errors on unknown names and on an
+    /// empty result.
+    pub fn resolve_net_steps(&self, cli_steps: &[String]) -> Result<NetSteps, ConfigError> {
+        let mut steps = match parse_net_steps(cli_steps)? {
+            Some(cli) => cli,
+            None => self.tests.net_steps.iter().copied().collect(),
+        };
+        if !self.tests.nccl_intranode {
+            steps.remove(&NetStep::Intranode);
+        }
+        NetSteps::new(steps).ok_or(ConfigError::NoNetSteps)
+    }
+
+    /// Everything `gauntlet run` needs from config plus CLI, resolved in
+    /// one place: the phase list, and the network step set — resolved
+    /// (with the `--net-steps` override applied first) only when the
+    /// network phase is selected, so a run that skips it can never be
+    /// rejected over `net_steps`. `--net-steps` names are checked either
+    /// way, so a typo never passes silently.
+    pub fn run_plan(
+        &self,
+        cli_phases: &[String],
+        cli_net_steps: &[String],
+    ) -> Result<RunPlan, ConfigError> {
+        let phases = self.resolve_phases(cli_phases)?;
+        let net_steps = if phases.contains(&Phase::Network) {
+            Some(self.resolve_net_steps(cli_net_steps)?)
+        } else {
+            parse_net_steps(cli_net_steps)?;
+            None
+        };
+        Ok(RunPlan { phases, net_steps })
+    }
+}
+
+/// `--net-steps` strings as a set; `None` when the flag was not given.
+fn parse_net_steps(
+    cli_steps: &[String],
+) -> Result<Option<std::collections::BTreeSet<NetStep>>, ConfigError> {
+    if cli_steps.is_empty() {
+        return Ok(None);
+    }
+    cli_steps
+        .iter()
+        .map(|name| {
+            NetStep::parse(name).ok_or_else(|| ConfigError::UnknownNetStep { name: name.clone() })
+        })
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// The resolved schedule of one `gauntlet run`. Built only by
+/// `FleetConfig::run_plan`: `net_steps` is present exactly when `phases`
+/// contains `Phase::Network`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPlan {
+    phases: Vec<Phase>,
+    net_steps: Option<NetSteps>,
+}
+
+impl RunPlan {
+    pub fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    /// The network step set; `None` when the network phase is not run.
+    pub fn net_steps(&self) -> Option<&NetSteps> {
+        self.net_steps.as_ref()
     }
 }

@@ -10,6 +10,13 @@
 //! Throughput: per-core fused multiply-add loops over a small in-cache
 //! buffer, reported as `cpu_gflops.gflops` per `Scope::Core`, plus one
 //! all-cores-simultaneously run under `Scope::Node` (thermal/turbo reality).
+//!
+//! Hot SDC screen: SDC is strongly temperature- and voltage-dependent, so
+//! the correctness rounds are additionally interleaved with the power-heavy
+//! FMA workload on every core simultaneously — correctness exercised at max
+//! package power, after the all-core throughput run has already heated the
+//! package. Mismatches are counted per core (the worker keeps going, unlike
+//! the isolated screen) and any nonzero count is a hard `CpuSdcHot` failure.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -92,6 +99,9 @@ pub fn run(sink: &EventSink, spec: &CpuTaskSpec) -> Result<()> {
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     run_correctness(sink, spec, cores, &core_ids, golden_int, golden_float);
     run_throughput(sink, spec, cores, &core_ids);
+    // Last on purpose: the all-core throughput run has just pushed the
+    // package to its thermal steady state, which is where SDC shows.
+    run_hot_correctness(sink, spec, cores, &core_ids, golden_int, golden_float);
     Ok(())
 }
 
@@ -176,6 +186,164 @@ fn correctness_worker(budget: Duration, golden_int: u64, golden_float: u64) -> T
         rounds += 1;
         if start.elapsed() >= budget {
             return TestOutcome::Passed;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hot SDC screen
+// ---------------------------------------------------------------------------
+
+/// FMA burn between correctness rounds. Sized so the duty cycle is
+/// overwhelmingly the power-heavy vector workload (a correctness round is
+/// ~hundreds of microseconds) while checks still land every few
+/// milliseconds.
+const HOT_BURN: Duration = Duration::from_millis(5);
+
+/// One core's hot-screen tally. Unlike the isolated screen, the worker
+/// records mismatches and keeps going: the count (and how it grows with
+/// temperature) is diagnostic signal a first-failure abort would discard.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HotCoreReport {
+    /// Completed interleaved rounds (one int + one float check each).
+    pub rounds: u64,
+    pub mismatches: u64,
+    /// Description of the earliest mismatch, for the failure reason.
+    pub first_mismatch: Option<String>,
+}
+
+impl HotCoreReport {
+    pub fn outcome(&self) -> TestOutcome {
+        if self.mismatches == 0 {
+            TestOutcome::Passed
+        } else {
+            let first = self.first_mismatch.as_deref().unwrap_or("unrecorded");
+            TestOutcome::Failed {
+                reason: format!(
+                    "{} mismatch(es) over {} hot rounds under full-package load; first: {first}",
+                    self.mismatches, self.rounds
+                ),
+            }
+        }
+    }
+}
+
+/// Correctness under load: every core simultaneously alternates between the
+/// power-heavy FMA burn and the checksum workloads for `sdc_hot_secs` wall
+/// seconds. Emits per-core `cpu_sdc_hot.{mismatches,rounds}` metrics and a
+/// per-core outcome; mismatches are hard failures. Additional to — never a
+/// replacement for — the isolated screen in `run_correctness`.
+fn run_hot_correctness(
+    sink: &EventSink,
+    spec: &CpuTaskSpec,
+    cores: usize,
+    core_ids: &[CoreId],
+    golden_int: u64,
+    golden_float: u64,
+) {
+    if spec.sdc_hot_secs == 0 {
+        sink.outcome(
+            TestId::CpuSdcHot,
+            Scope::Node,
+            TestOutcome::Skipped {
+                reason: "hot SDC screen disabled (sdc_hot_secs = 0)".into(),
+            },
+        );
+        return;
+    }
+
+    let budget = Duration::from_secs(spec.sdc_hot_secs);
+    let verdicts: Vec<Result<HotCoreReport, TestOutcome>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..cores)
+            .map(|index| {
+                let core = core_ids.get(index).copied();
+                scope.spawn(move || match core {
+                    None => Err(TestOutcome::Skipped {
+                        reason: format!("core {index} not in this process's affinity mask"),
+                    }),
+                    Some(core) if !core_affinity::set_for_current(core) => {
+                        Err(TestOutcome::Skipped {
+                            reason: format!("failed to pin worker to cpu {}", core.id),
+                        })
+                    }
+                    Some(_) => Ok(hot_worker(budget, golden_int, golden_float)),
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle.join().unwrap_or_else(|_| {
+                    Err(TestOutcome::Failed {
+                        reason: "hot SDC worker panicked".to_string(),
+                    })
+                })
+            })
+            .collect()
+    });
+
+    for (index, verdict) in verdicts.into_iter().enumerate() {
+        let scope = Scope::Core { id: index as u32 };
+        match verdict {
+            Ok(report) => {
+                for (name, value) in [
+                    ("mismatches", report.mismatches as f64),
+                    ("rounds", report.rounds as f64),
+                ] {
+                    sink.metric(MetricRecord {
+                        test: TestId::CpuSdcHot,
+                        scope: scope.clone(),
+                        name: name.to_string(),
+                        value,
+                        unit: Unit::Count,
+                        repeat: 0,
+                    });
+                }
+                sink.outcome(TestId::CpuSdcHot, scope, report.outcome());
+            }
+            Err(outcome) => sink.outcome(TestId::CpuSdcHot, scope, outcome),
+        }
+    }
+}
+
+/// Alternate FMA burn and correctness rounds until the budget elapses. The
+/// burn keeps this core (and, with every core running this concurrently,
+/// the whole package) at maximum power draw while the checks run.
+fn hot_worker(budget: Duration, golden_int: u64, golden_float: u64) -> HotCoreReport {
+    let start = Instant::now();
+    let mut report = HotCoreReport {
+        rounds: 0,
+        mismatches: 0,
+        first_mismatch: None,
+    };
+    loop {
+        // The rate is irrelevant here; the burn exists for its power draw.
+        let _ = fma_gflops(HOT_BURN);
+        let integer = checksum_round(INT_SEED, CORRECTNESS_ITERS);
+        if integer != golden_int {
+            report.mismatches += 1;
+            report.first_mismatch.get_or_insert_with(|| {
+                format!(
+                    "integer checksum mismatch on round {}: got {integer:#018x}, \
+                     expected {golden_int:#018x}",
+                    report.rounds
+                )
+            });
+        }
+        let float = float_checksum_round(FLOAT_SEED, CORRECTNESS_ITERS);
+        if float != golden_float {
+            report.mismatches += 1;
+            report.first_mismatch.get_or_insert_with(|| {
+                format!(
+                    "float checksum mismatch on round {}: got {float:#018x}, \
+                     expected {golden_float:#018x}",
+                    report.rounds
+                )
+            });
+        }
+        report.rounds += 1;
+        if start.elapsed() >= budget {
+            return report;
         }
     }
 }

@@ -1,23 +1,34 @@
 //! Operator-side driver for `gauntlet run` and `gauntlet bootstrap`.
 //!
 //! Control flow of a run:
-//!   load config -> open sessions (bounded concurrency, then held open) ->
+//!   load config -> resolve the launcher (`transport::resolve_launch`: ssh,
+//!   or srun steps inside the current Slurm allocation, whose nodes then
+//!   are the fleet) -> open sessions (bounded concurrency, then held open) ->
 //!   ensure agent deployed (hash check) -> per-phase:
 //!     phases 0-2: spawn `agent run` on every host simultaneously, decode
 //!       event streams into the collector;
-//!     phase 3: tournament rounds of `agent peer` pairs, then the
-//!       hierarchical NCCL sweeps (per-node, pairs, full fleet) with the
-//!       uniqueId relayed from rank 0 by this process;
+//!     phase 3: the intra-node NCCL sweep (node-local fan-out, one rank per
+//!       local GPU), tournament rounds of `agent peer` pairs, then the
+//!       fleet NCCL sweep with the uniqueId relayed from rank 0 by this
+//!       process;
 //!   -> collector -> analysis -> report to disk + terminal, exit code.
 //!
 //! Per-host failures (unreachable, agent Fatal, phase timeout from
 //! `tests.phase_timeout_secs`) mark that host failed and the run continues;
 //! the failure lands in the report instead of aborting the fleet.
 
+mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+pub mod derive;
+mod fanout;
+mod intranode;
+mod nccl;
+mod nccl_shim;
+mod network_plan;
 pub mod session;
+pub mod transport;
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -31,16 +42,27 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
-use self::session::{HostSession, single_quote};
+use self::network_plan::NetworkPhasePlan;
+#[cfg(test)]
+use self::session::agent_kill_pattern;
+use self::session::{AgentEnv, HostSession};
+use self::transport::{AgentChild, Launcher, resolve_launch};
+use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
+use crate::launch::LaunchRecord;
+use crate::nccl_level::NcclLevelEnvs;
+use crate::net_steps::{NetStep, NetSteps, disabled_outcomes};
 use crate::proto::{
-    AgentEvent, InventorySnapshot, MetricRecord, NcclDirective, Phase, Scope, TestId, Unit,
+    AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
+    TestId, Unit,
 };
 use crate::report;
+use derive::{InventoryDerivation, derive_inventory_events};
 
 /// How long the orchestrator waits for a peer to acknowledge a graceful
 /// shutdown before falling back to killing it remotely.
@@ -51,6 +73,9 @@ const PAIR_TIMEOUT_SLACK: Duration = Duration::from_secs(60);
 const PEER_BIND_DELAY: Duration = Duration::from_millis(500);
 /// How often the collector publishes a partial snapshot of a run in flight.
 const PARTIAL_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(2);
+/// Upper bound on one error-counter pass (a handful of sysfs reads and
+/// bounded tool probes; nothing like a full phase).
+const COUNTER_PASS_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Observation plumbing
@@ -129,13 +154,13 @@ struct PartialWriter {
     run_id: String,
     config: FleetConfig,
     started_epoch_secs: u64,
+    launch: LaunchRecord,
 }
 
 impl PartialWriter {
-    /// Analyse and publish `observations` as they stand. Snapshots are a
-    /// convenience for onlookers: a failure here is logged and forgotten,
-    /// never propagated into the run.
-    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+    /// The in-flight document: the run id onlookers follow, and no
+    /// verdict (`RunResults::finalize` is for the final document only).
+    fn document(&self, observations: BTreeMap<String, HostObservations>) -> report::RunResults {
         let mut results = report::build(
             &self.config,
             observations,
@@ -143,6 +168,15 @@ impl PartialWriter {
             epoch_secs(),
         );
         results.run_id = self.run_id.clone();
+        results.launch = Some(self.launch);
+        results
+    }
+
+    /// Analyse and publish `observations` as they stand. Snapshots are a
+    /// convenience for onlookers: a failure here is logged and forgotten,
+    /// never propagated into the run.
+    fn write(&self, observations: BTreeMap<String, HostObservations>) {
+        let results = self.document(observations);
         let dir = Path::new(report::history::DEFAULT_DIR);
         match report::history::save_partial(&results, dir) {
             Ok(path) => {
@@ -158,9 +192,12 @@ impl PartialWriter {
 // ---------------------------------------------------------------------------
 
 pub async fn run(args: RunArgs) -> Result<()> {
-    let config = FleetConfig::load(&args.config)
+    let config = FleetConfig::load_for(&args.config, args.launch)
         .with_context(|| format!("loading {}", args.config.display()))?;
-    let phases = config.resolve_phases(&args.phases)?;
+    // srun mode: hosts come from (or are checked against) the allocation.
+    let (config, launcher) = resolve_launch(&config, args.launch).await?;
+    let plan = config.run_plan(&args.phases, &args.net_steps)?;
+    let phases = plan.phases();
     bootstrap::warn_if_debug_build();
     let started_epoch_secs = epoch_secs();
     // Fixed up front so the in-flight snapshots and the final document share
@@ -178,6 +215,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         run_id: run_id.clone(),
         config: config.clone(),
         started_epoch_secs,
+        launch: launcher.record(),
     });
     let collector = tokio::spawn(async move {
         let mut collector = Collector::new();
@@ -208,27 +246,49 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, &sink).await;
-    let sessions = deploy_fleet(&config, sessions, &sink).await;
+    let sessions = connect_fleet(&config, &launcher, config.nccl_levels()?, &sink).await;
+    let sessions = deploy_fleet(&config, &launcher, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
     }
     info!(
         hosts = sessions.len(),
         phases = ?phases,
+        net_steps = ?plan
+            .net_steps()
+            .map(|steps| steps.iter().map(NetStep::name).collect::<Vec<_>>()),
         "fleet ready"
     );
 
-    let mut inventories: BTreeMap<String, InventorySnapshot> = BTreeMap::new();
+    // The libnccl shim lives under remote_dir, which (node-local by
+    // default) can lose it on reboot while the agent is re-uploaded; runs
+    // that use NCCL rebuild it here instead of relying on a past bootstrap.
+    let mut inventories: BTreeMap<String, InventorySnapshot> = if nccl_shim::phases_use_nccl(phases)
+    {
+        nccl_shim::ensure_fleet_shims(&sessions, config.ssh.max_concurrent).await
+    } else {
+        BTreeMap::new()
+    };
+    // Error-counter baselines, taken once before the first load phase; the
+    // matching delta pass runs after the last load phase of the last repeat.
+    let mut counter_baselines: BTreeMap<String, CounterSnapshot> = BTreeMap::new();
+    let mut counters_started = false;
     for repeat in 0..args.repeat {
         let sink = sink.with_repeat(repeat);
         if args.repeat > 1 {
             info!(repeat, of = args.repeat, "repeat start");
         }
-        for phase in &phases {
+        for phase in phases {
             // The inventory is a census, not a measurement.
             if *phase == Phase::Inventory && repeat > 0 {
                 continue;
+            }
+            // Snapshot error counters after any leading inventory and
+            // before the first phase that puts the hardware under load.
+            if *phase != Phase::Inventory && !counters_started {
+                counters_started = true;
+                info!("counter baseline");
+                counter_baselines = counter_baseline_pass(&config, &sessions).await;
             }
             info!(?phase, "phase start");
             match phase {
@@ -236,11 +296,30 @@ pub async fn run(args: RunArgs) -> Result<()> {
                     let seen = node_phase(&config, &sessions, *phase, &sink).await;
                     inventories.extend(seen);
                 }
+                // The overlap phase is scheduled after gpu/network so its
+                // retention ratios divide isolated baselines from the same
+                // run. The node-local fan-out (single process, intra-node
+                // NCCL world) runs first; the fleet-wide combined-load step
+                // follows on the cross-node fabric.
+                Phase::Overlap => {
+                    let seen = node_phase(&config, &sessions, *phase, &sink).await;
+                    inventories.extend(seen);
+                    if config.tests.overlap_fleet {
+                        nccl::overlap_fleet_sweep(&config, &sessions, &mut inventories, &sink)
+                            .await;
+                    }
+                }
                 Phase::Network => {
+                    // `run_plan` resolves a step set whenever the phase
+                    // list contains Network.
+                    let Some(net_steps) = plan.net_steps() else {
+                        bail!("network phase scheduled without a resolved step set");
+                    };
                     network_phase(
                         &config,
                         &sessions,
                         &mut inventories,
+                        net_steps,
                         args.sample_pairs,
                         &sink,
                     )
@@ -249,6 +328,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
             }
             info!(?phase, "phase end");
         }
+    }
+    if !counter_baselines.is_empty() {
+        info!("counter delta pass");
+        counter_delta_pass(&config, &sessions, &counter_baselines, &sink).await;
     }
 
     drop(sink);
@@ -265,6 +348,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // document lands where onlookers were already watching.
     results.debug_build = cfg!(debug_assertions);
     results.run_id = run_id.clone();
+    results.launch = Some(launcher.record());
+    results.finalize();
     let path = match &args.out {
         Some(path) => {
             if let Some(parent) = path.parent()
@@ -311,22 +396,36 @@ fn epoch_secs() -> u64 {
 /// Open every session with `ssh.max_concurrent` establishments in flight.
 /// Established sessions are held for the whole run (the permit is only for
 /// the handshake). Order follows the config so host indices are stable.
-async fn connect_fleet(config: &FleetConfig, sink: &ObservationSink) -> Vec<Arc<HostSession>> {
+async fn connect_fleet(
+    config: &FleetConfig,
+    launcher: &Launcher,
+    nccl: &NcclLevelEnvs,
+    sink: &ObservationSink,
+) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
+    // Set on every agent spawn's command line, per the level the spawned
+    // process hosts: the one path by which NCCL tuning reaches every
+    // communicator (intra-node and fleet sweeps, barrier, both overlap
+    // steps) without the agent ever mutating its own environment.
+    let nccl_env = Arc::new(nccl.clone());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
         count += 1;
-        let ssh = config.ssh.clone();
+        let launcher = launcher.clone();
+        let nccl_env = Arc::clone(&nccl_env);
         let permits = Arc::clone(&permits);
         let sink = sink.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh).await {
+            match launcher.connect(host, nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
-                    sink.error(&addr, format!("ssh connect failed: {error:#}"));
+                    sink.error(
+                        &addr,
+                        format!("{} connect failed: {error:#}", launcher.mode()),
+                    );
                     (index, None)
                 }
             }
@@ -343,52 +442,33 @@ async fn connect_fleet(config: &FleetConfig, sink: &ObservationSink) -> Vec<Arc<
     slots.into_iter().flatten().collect()
 }
 
-/// Hash-compare and upload the agent everywhere, dropping hosts that cannot
-/// take it. Bounded by the same concurrency limit as connects: uploads are
-/// the heavy part of bootstrap.
+/// Hash-compare and install the agent everywhere (per host over ssh, one
+/// broadcast over srun), dropping hosts that cannot take it. Bounded by the
+/// same concurrency limit as connects: uploads are the heavy part of
+/// bootstrap.
 async fn deploy_fleet(
     config: &FleetConfig,
+    launcher: &Launcher,
     sessions: Vec<Arc<HostSession>>,
     sink: &ObservationSink,
 ) -> Vec<Arc<HostSession>> {
-    let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
-    let mut tasks = JoinSet::new();
-    let count = sessions.len();
-    for (index, session) in sessions.into_iter().enumerate() {
-        let permits = Arc::clone(&permits);
-        let sink = sink.clone();
-        tasks.spawn(async move {
-            let _permit = permits.acquire_owned().await.ok();
-            let addr = session.addr().to_string();
-            match tokio::time::timeout(timeout, deploy::ensure_agent(&session)).await {
-                Ok(Ok(uploaded)) => {
-                    debug!(host = %addr, uploaded, "agent ready");
-                    (index, Some(session))
-                }
-                Ok(Err(error)) => {
-                    sink.error(&addr, format!("agent deploy failed: {error:#}"));
-                    (index, None)
-                }
-                Err(_) => {
-                    sink.error(
-                        &addr,
-                        format!("agent deploy timed out after {}s", timeout.as_secs()),
-                    );
-                    (index, None)
-                }
+    let outcomes =
+        deploy::ensure_fleet(launcher, &sessions, config.ssh.max_concurrent, timeout).await;
+    sessions
+        .into_iter()
+        .zip(outcomes)
+        .filter_map(|(session, outcome)| match outcome {
+            Ok(outcome) => {
+                debug!(host = %session.addr(), %outcome, "agent ready");
+                Some(session)
             }
-        });
-    }
-
-    let mut slots: Vec<Option<Arc<HostSession>>> = vec![None; count];
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, session)) => slots[index] = session,
-            Err(error) => warn!(%error, "deploy task did not complete"),
-        }
-    }
-    slots.into_iter().flatten().collect()
+            Err(error) => {
+                sink.error(session.addr(), format!("agent deploy failed: {error:#}"));
+                None
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -412,22 +492,37 @@ async fn node_phase(
         }
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
+    let derivation = Arc::new(InventoryDerivation::from_config(config));
+    // One phase per spawn, so the process hosts at most one NCCL level
+    // (network: the intra-node sweep; overlap: the node-local overlap).
+    let env = phase.nccl_level().map_or(AgentEnv::Base, AgentEnv::Nccl);
 
     let mut tasks = JoinSet::new();
     for session in sessions {
         let session = Arc::clone(session);
         let sink = sink.clone();
         let document = document.clone();
+        let derivation = Arc::clone(&derivation);
         tasks.spawn(async move {
             let addr = session.addr().to_string();
             let mut inventory = None;
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["run"], Some(document), |event| {
-                    if let AgentEvent::Inventory { snapshot } = &event {
-                        inventory = Some(snapshot.clone());
-                    }
+                session.run_agent(env, &["run"], Some(document), |event| {
+                    // Inventory-derived tests (gpu_idle, nccl_nics) need
+                    // orchestrator config; they follow the snapshot they
+                    // judge through the same sink (`derive`).
+                    let derived = match &event {
+                        AgentEvent::Inventory { snapshot } => {
+                            inventory = Some(snapshot.clone());
+                            derive_inventory_events(snapshot, &derivation)
+                        }
+                        _ => Vec::new(),
+                    };
                     sink.event(&addr, event);
+                    for event in derived {
+                        sink.event(&addr, event);
+                    }
                 }),
             )
             .await;
@@ -461,6 +556,124 @@ async fn node_phase(
 }
 
 // ---------------------------------------------------------------------------
+// Error-counter passes (baseline before load, deltas after)
+// ---------------------------------------------------------------------------
+
+/// Snapshot error counters on every host. Baselines are held here, not sent
+/// to the collector: they only exist to be handed back for the delta pass.
+/// Failures are logged and the host simply has no baseline (and therefore
+/// no deltas) — counter collection never fails a host.
+async fn counter_baseline_pass(
+    config: &FleetConfig,
+    sessions: &[Arc<HostSession>],
+) -> BTreeMap<String, CounterSnapshot> {
+    let mut spec = config.task_spec(&[]);
+    spec.counters = Some(CounterRequest::Baseline);
+    let document = match serde_json::to_string(&spec) {
+        Ok(document) => document,
+        Err(error) => {
+            warn!(%error, "cannot serialize the counter baseline spec; skipping counters");
+            return BTreeMap::new();
+        }
+    };
+
+    let mut tasks = JoinSet::new();
+    for session in sessions {
+        let session = Arc::clone(session);
+        let document = document.clone();
+        tasks.spawn(async move {
+            let addr = session.addr().to_string();
+            let mut baseline = None;
+            let outcome = tokio::time::timeout(
+                COUNTER_PASS_TIMEOUT,
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
+                    if let AgentEvent::CounterBaseline { snapshot } = event {
+                        baseline = Some(*snapshot);
+                    }
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
+                    warn!(host = %addr, %status, "counter baseline exited abnormally")
+                }
+                Ok(Err(error)) => warn!(host = %addr, %error, "counter baseline failed"),
+                Err(_) => warn!(host = %addr, "counter baseline timed out"),
+            }
+            (addr, baseline)
+        });
+    }
+
+    let mut baselines = BTreeMap::new();
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((addr, Some(baseline))) => {
+                baselines.insert(addr, baseline);
+            }
+            Ok((_, None)) => {}
+            Err(error) => warn!(%error, "counter baseline task did not complete"),
+        }
+    }
+    baselines
+}
+
+/// Re-snapshot on every baselined host, diff on the agent, and feed the
+/// resulting `CounterDeltas` events into the collector.
+async fn counter_delta_pass(
+    config: &FleetConfig,
+    sessions: &[Arc<HostSession>],
+    baselines: &BTreeMap<String, CounterSnapshot>,
+    sink: &ObservationSink,
+) {
+    let mut tasks = JoinSet::new();
+    for session in sessions {
+        let Some(baseline) = baselines.get(session.addr()) else {
+            warn!(host = %session.addr(), "no counter baseline; skipping delta pass");
+            continue;
+        };
+        let mut spec = config.task_spec(&[]);
+        spec.counters = Some(CounterRequest::Delta {
+            baseline: baseline.clone(),
+        });
+        let document = match serde_json::to_string(&spec) {
+            Ok(document) => document,
+            Err(error) => {
+                warn!(host = %session.addr(), %error, "cannot serialize the counter delta spec");
+                continue;
+            }
+        };
+        let session = Arc::clone(session);
+        let sink = sink.clone();
+        tasks.spawn(async move {
+            let addr = session.addr().to_string();
+            let outcome = tokio::time::timeout(
+                COUNTER_PASS_TIMEOUT,
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
+                    if matches!(&event, AgentEvent::CounterDeltas { .. }) {
+                        sink.event(&addr, event);
+                    }
+                }),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => {
+                    warn!(host = %addr, %status, "counter delta pass exited abnormally")
+                }
+                Ok(Err(error)) => warn!(host = %addr, %error, "counter delta pass failed"),
+                Err(_) => warn!(host = %addr, "counter delta pass timed out"),
+            }
+        });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        if let Err(error) = joined {
+            warn!(%error, "counter delta task did not complete");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3: pairwise TCP, then the NCCL fleet sweep
 // ---------------------------------------------------------------------------
 
@@ -475,11 +688,60 @@ async fn network_phase(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
+    steps: &NetSteps,
     sample_pairs: Option<usize>,
     sink: &ObservationSink,
 ) {
-    pairwise_sweep(config, sessions, sample_pairs, sink).await;
-    nccl_sweep(config, sessions, inventories, sink).await;
+    // Deselected steps leave an explicit trace on every host, so a
+    // bandwidth-only run reads as "not run", never as "missing".
+    let disabled = disabled_outcomes(steps);
+    if !disabled.is_empty() {
+        info!(
+            skipped = ?disabled.iter().map(|(test, _)| *test).collect::<Vec<_>>(),
+            "network steps disabled by config"
+        );
+        for session in sessions {
+            for (test, outcome) in &disabled {
+                sink.event(
+                    session.addr(),
+                    AgentEvent::Outcome {
+                        test: *test,
+                        scope: Scope::Node,
+                        outcome: outcome.clone(),
+                    },
+                );
+            }
+        }
+    }
+    // The hierarchy, innermost level first: intra-node (NVLink/PCIe), then
+    // node pairs (TCP), then the full fleet (NCCL over the fabric).
+    // One pure decision (`NetworkPhasePlan`) covers the step selection and
+    // main's structure: the intra-node coverage the one-host fleet-sweep
+    // gate needs follows the very step that dispatches the intra-node
+    // sweep; deselecting `nccl` drops every world shape, rail and NCCL
+    // barrier; deselecting `barrier` suppresses both NCCL placements and
+    // the TCP barrier.
+    let plan = NetworkPhasePlan::new(steps);
+    if plan.intranode {
+        intranode::intranode_sweep(config, sessions, inventories, sink).await;
+    }
+    if plan.pairwise {
+        pairwise_sweep(config, sessions, sample_pairs, sink).await;
+    }
+    if let Some(nccl_step) = plan.nccl {
+        nccl::nccl_sweep(
+            config,
+            sessions,
+            inventories,
+            sink,
+            nccl_step.coverage,
+            nccl_step.barrier,
+        )
+        .await;
+    }
+    if plan.tcp_barrier {
+        tcp_barrier_sweep(config, sessions, sink).await;
+    }
 }
 
 /// Tournament rounds of disjoint pairs: within a round every pair runs
@@ -639,14 +901,17 @@ async fn probe_pair(
     Ok((latency, bandwidth))
 }
 
-/// Graceful shutdown frame first; a remote `pkill` as the backstop for
+/// Kill a remote agent running `agent <args...>` on `session`'s host,
+/// whatever the transport (`HostSession::kill_agent`: `pkill -f` over ssh,
+/// `scancel` of the matching step over srun). Every timeout that abandons
+/// an agent ends here. Best effort: a failed cleanup is logged, not raised.
+async fn kill_remote_agent(session: &HostSession, args: &str) {
+    session.kill_agent(args).await;
+}
+
+/// Graceful shutdown frame first; a remote kill as the backstop for
 /// fleets where the operator cannot reach the peer port directly.
-async fn stop_peer(
-    server: &HostSession,
-    target: &str,
-    port: u16,
-    child: openssh::Child<Arc<openssh::Session>>,
-) {
+async fn stop_peer(server: &HostSession, target: &str, port: u16, child: AgentChild) {
     match tokio::time::timeout(
         PEER_SHUTDOWN_TIMEOUT,
         crate::agent::net::shutdown_peer(target),
@@ -657,14 +922,7 @@ async fn stop_peer(
         Ok(Err(error)) => debug!(target, %error, "graceful peer shutdown failed"),
         Err(_) => debug!(target, "graceful peer shutdown timed out"),
     }
-    // The bracket keeps the pattern from matching the pkill invocation itself.
-    let pattern = format!("[g]auntlet-agent peer serve --port {port}");
-    if let Err(error) = server
-        .exec_capture(&format!("pkill -f {}", single_quote(&pattern)))
-        .await
-    {
-        debug!(host = %server.addr(), %error, "peer cleanup command failed");
-    }
+    kill_remote_agent(server, &format!("peer serve --port {port}")).await;
     if tokio::time::timeout(PEER_SHUTDOWN_TIMEOUT, child.wait())
         .await
         .is_err()
@@ -735,174 +993,154 @@ fn peer_endpoint(ssh_addr: &str) -> &str {
     host
 }
 
-/// Fleet-wide NCCL sweep: rank 0 mints the unique id, this process relays it
-/// to every rank, and rank 0's event stream carries the measurements.
-async fn nccl_sweep(
+/// TCP star-barrier sweep: the CPU-only barrier-skew probe, run across the
+/// whole fleet regardless of GPUs (on GPU fleets it complements the NCCL
+/// barrier with a fabric-independent view). Host 0 coordinates; every host
+/// — including host 0, as a separate process — joins with its fleet index
+/// as rank, so ranks map back to hosts stably.
+async fn tcp_barrier_sweep(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
-    inventories: &mut BTreeMap<String, InventorySnapshot>,
     sink: &ObservationSink,
 ) {
-    let gpu_hosts = gpu_bearing_hosts(sessions, inventories).await;
-    if gpu_hosts.is_empty() {
-        info!("no GPU-bearing hosts; skipping the NCCL sweep");
+    let iters = config.tests.barrier_iters;
+    if iters == 0 {
+        info!("barrier_iters is 0; skipping the TCP barrier");
         return;
     }
-    // The inventory dlopen probe knows whether libnccl actually loads. A
-    // fleet without the NCCL stack skips the sweep as a structural finding
-    // (visible in the inventory/consistency/bootstrap output) instead of
-    // manufacturing a host failure out of a loader panic. Hosts predating
-    // the probe (empty map) are given the benefit of the doubt.
-    let nccl_hosts: Vec<_> = gpu_hosts
-        .iter()
-        .filter(|session| {
-            inventories
-                .get(session.addr())
-                .map(|inv| inv.gpu_libs.get("nccl").copied().unwrap_or(true))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect();
-    if nccl_hosts.is_empty() {
-        warn!(
-            gpu_hosts = gpu_hosts.len(),
-            "libnccl is not loadable on any GPU-bearing host; skipping the NCCL sweep"
-        );
+    if sessions.len() < 2 {
+        info!("fewer than two hosts; skipping the TCP barrier");
         return;
     }
-    if nccl_hosts.len() < gpu_hosts.len() {
-        warn!(
-            with_nccl = nccl_hosts.len(),
-            without_nccl = gpu_hosts.len() - nccl_hosts.len(),
-            "some GPU-bearing hosts lack a loadable libnccl and are excluded from the sweep"
-        );
-    }
-    let gpu_hosts = nccl_hosts;
-    let rank0 = &gpu_hosts[0];
-    let world_size = gpu_hosts.len() as u32;
+    let world = sessions.len() as u32;
+    let server = Arc::clone(&sessions[0]);
+    let server_addr = server.addr().to_string();
+    // The pairwise sweep is over and its listeners are torn down, so the
+    // pairwise port base is free again.
+    let port = config.tests.net_port_base;
+    // Generous ceiling: connect window plus a worst-case per-iteration RTT
+    // allowance; a healthy fleet finishes orders of magnitude sooner.
+    let timeout =
+        Duration::from_secs(60) + Duration::from_millis(u64::from(iters).saturating_mul(50));
 
-    info!(world_size, rank0 = %rank0.addr(), "NCCL sweep");
+    info!(world, coordinator = %server_addr, iters, "TCP barrier sweep");
 
-    let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
-    let mut tasks = JoinSet::new();
-
-    // Rank 0 leads: it mints the rendezvous id in-process (the id's bootstrap
-    // listen socket must live in the process that serves as rank 0) and
-    // announces it as an NcclId event, which is intercepted here and relayed
-    // to the other ranks.
-    let lead = NcclDirective::Lead {
-        world_size,
-        sizes: config.tests.nccl_sizes.clone(),
-        iters_per_size: config.tests.nccl_iters_per_size,
-        socket_ifname: config.nccl.socket_ifname.clone(),
-    };
-    let document = match serde_json::to_string(&lead) {
-        Ok(document) => document,
-        Err(error) => {
-            warn!(%error, "cannot serialize the NCCL lead directive");
-            return;
+    let port_text = port.to_string();
+    let world_text = world.to_string();
+    let iters_text = iters.to_string();
+    let serve_task = tokio::spawn({
+        let server = Arc::clone(&server);
+        let args = [
+            "barrier",
+            "serve",
+            "--port",
+            &port_text,
+            "--world",
+            &world_text,
+            "--iters",
+            &iters_text,
+        ]
+        .map(String::from);
+        async move {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            server.run_agent_capture(&args, None).await
         }
-    };
-    let (id_tx, id_rx) = tokio::sync::oneshot::channel::<String>();
-    let id_slot = Arc::new(std::sync::Mutex::new(Some(id_tx)));
-    {
-        let session = Arc::clone(rank0);
-        let sink = sink.clone();
-        let id_slot = Arc::clone(&id_slot);
-        tasks.spawn(async move {
-            let addr = session.addr().to_string();
-            let outcome = tokio::time::timeout(
-                timeout,
-                session.run_agent(&["nccl"], Some(document), |event| {
-                    if let AgentEvent::NcclId { unique_id_b64 } = &event {
-                        if let Some(tx) = id_slot.lock().expect("id slot poisoned").take() {
-                            let _ = tx.send(unique_id_b64.clone());
-                        }
-                    } else {
-                        sink.event(&addr, event);
-                    }
-                }),
-            )
-            .await;
-            report_rank_outcome(&sink, &addr, 0, timeout, outcome);
-        });
-    }
+    });
+    tokio::time::sleep(PEER_BIND_DELAY).await;
 
-    let unique_id_b64 = match tokio::time::timeout(NCCL_ID_WAIT, id_rx).await {
-        Ok(Ok(id)) => id,
-        Ok(Err(_)) | Err(_) => {
-            // The lead task reports its own failure; just stop recruiting.
-            warn!(
-                rank0 = %rank0.addr(),
-                "NCCL lead produced no rendezvous id; aborting the sweep"
-            );
-            while let Some(joined) = tasks.join_next().await {
-                if let Err(error) = joined {
-                    warn!(%error, "nccl task did not complete");
-                }
-            }
-            return;
-        }
-    };
+    let endpoint = server
+        .host
+        .data_addr
+        .clone()
+        .unwrap_or_else(|| peer_endpoint(&server_addr).to_string());
+    let target = format!("{endpoint}:{port}");
 
-    for (rank, session) in gpu_hosts.iter().enumerate().skip(1) {
-        let directive = NcclDirective::Participate {
-            unique_id_b64: unique_id_b64.clone(),
-            rank: rank as u32,
-            world_size,
-            sizes: config.tests.nccl_sizes.clone(),
-            iters_per_size: config.tests.nccl_iters_per_size,
-            socket_ifname: config.nccl.socket_ifname.clone(),
-        };
-        let document = match serde_json::to_string(&directive) {
-            Ok(document) => document,
-            Err(error) => {
-                warn!(%error, rank, "cannot serialize the NCCL directive");
-                continue;
-            }
-        };
+    let mut joins = JoinSet::new();
+    for (rank, session) in sessions.iter().enumerate() {
         let session = Arc::clone(session);
         let sink = sink.clone();
-        tasks.spawn(async move {
+        let target = target.clone();
+        let iters_text = iters_text.clone();
+        joins.spawn(async move {
             let addr = session.addr().to_string();
+            let rank_text = rank.to_string();
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["nccl"], Some(document), |event| sink.event(&addr, event)),
+                session.run_agent_capture(
+                    &[
+                        "barrier",
+                        "join",
+                        &target,
+                        "--rank",
+                        &rank_text,
+                        "--iters",
+                        &iters_text,
+                    ],
+                    None,
+                ),
             )
             .await;
-            report_rank_outcome(&sink, &addr, rank, timeout, outcome);
+            match outcome {
+                Ok(Ok(output)) if output.success() => {}
+                Ok(Ok(output)) => sink.error(
+                    &addr,
+                    format!("barrier join rank {rank} failed: {}", output.detail()),
+                ),
+                Ok(Err(error)) => {
+                    sink.error(&addr, format!("barrier join rank {rank} failed: {error:#}"))
+                }
+                Err(_) => sink.error(
+                    &addr,
+                    format!(
+                        "barrier join rank {rank} timed out after {}s",
+                        timeout.as_secs()
+                    ),
+                ),
+            }
         });
     }
-    while let Some(joined) = tasks.join_next().await {
+    while let Some(joined) = joins.join_next().await {
         if let Err(error) = joined {
-            warn!(%error, "nccl task did not complete");
+            warn!(%error, "barrier join task did not complete");
         }
+    }
+
+    let report = match tokio::time::timeout(timeout, serve_task).await {
+        Ok(Ok(Ok(output))) => agent_json::<TcpBarrierReport>(output, "barrier serve"),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(anyhow::anyhow!("barrier serve task panicked: {error}")),
+        Err(_) => {
+            // The coordinator is wedged; kill it so the phase can move on.
+            kill_remote_agent(&server, &format!("barrier serve --port {port}")).await;
+            Err(anyhow::anyhow!(
+                "barrier serve timed out after {}s",
+                timeout.as_secs()
+            ))
+        }
+    };
+    match report {
+        Ok(report) => {
+            // One TCP rank per host (its fleet index): node-scope subjects.
+            let locate = |rank: u32| {
+                sessions.get(rank as usize).map(|session| RankSubject {
+                    host: session.addr().to_string(),
+                    scope: Scope::Node,
+                })
+            };
+            emit_barrier_metrics(
+                sink,
+                TestId::TcpBarrier,
+                &report.skew,
+                locate,
+                Some(&server_addr),
+            );
+        }
+        Err(error) => sink.error(&server_addr, format!("TCP barrier failed: {error:#}")),
     }
 }
 
 /// Hosts with at least one GPU, in fleet order. Inventories collected during
 /// phase 0 are reused; hosts without one (e.g. `--phases network`) are probed.
-/// How long the orchestrator waits for the lead rank's NcclId event.
-const NCCL_ID_WAIT: Duration = Duration::from_secs(30);
-
-fn report_rank_outcome(
-    sink: &ObservationSink,
-    addr: &str,
-    rank: usize,
-    timeout: Duration,
-    outcome: Result<anyhow::Result<std::process::ExitStatus>, tokio::time::error::Elapsed>,
-) {
-    match outcome {
-        Ok(Ok(status)) if status.success() => {}
-        Ok(Ok(status)) => sink.error(addr, format!("nccl rank {rank} exited with {status}")),
-        Ok(Err(error)) => sink.error(addr, format!("nccl rank {rank} failed: {error:#}")),
-        Err(_) => sink.error(
-            addr,
-            format!("nccl rank {rank} timed out after {}s", timeout.as_secs()),
-        ),
-    }
-}
-
 async fn gpu_bearing_hosts(
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
@@ -984,6 +1222,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_snapshots_carry_no_verdict() {
+        let config: FleetConfig = toml::from_str(r#"hosts = ["n1"]"#).expect("config");
+        let writer = PartialWriter {
+            run_id: "1-abcdef".into(),
+            config,
+            started_epoch_secs: 1,
+            launch: LaunchRecord::Ssh,
+        };
+        let mut observations = BTreeMap::new();
+        let mut obs = HostObservations::default();
+        obs.outcomes.push((
+            TestId::CpuCorrectness,
+            Scope::Node,
+            crate::proto::TestOutcome::Failed {
+                reason: "mismatch".into(),
+            },
+        ));
+        observations.insert("n1".to_string(), obs);
+        let partial = writer.document(observations);
+        assert_eq!(partial.run_id, "1-abcdef");
+        assert_eq!(partial.verdict, None);
+        let json = serde_json::to_value(&partial).expect("serialize");
+        assert!(json["verdict"].is_null(), "{json}");
+
+        let mut fin = partial.clone();
+        fin.finalize();
+        assert_eq!(fin.verdict, Some(report::Verdict::Failures));
+    }
+
+    #[test]
     fn peer_endpoints_drop_the_login_user_and_ssh_port() {
         assert_eq!(peer_endpoint("node1"), "node1");
         assert_eq!(peer_endpoint("root@node1"), "node1");
@@ -992,6 +1260,99 @@ mod tests {
         // Bare IPv6 literals keep every colon they came with.
         assert_eq!(peer_endpoint("fd00::1"), "fd00::1");
         assert_eq!(peer_endpoint("user@fd00::1"), "fd00::1");
+    }
+
+    #[test]
+    fn kill_patterns_match_the_remote_agent_command_line_but_not_pkill() {
+        let agent = format!("/scratch/gauntlet/{}", deploy::AGENT_RELPATH);
+        for args in [
+            "nccl",
+            "peer serve --port 29500",
+            "barrier serve --port 29500",
+        ] {
+            let pattern = agent_kill_pattern(args);
+            // `[g]` matches a literal `g` in the regex: the effective
+            // pattern is the plain text below.
+            let effective = pattern.replacen("[g]", "g", 1);
+            let cmdline = format!("{agent} agent {args}");
+            assert!(cmdline.contains(&effective), "{pattern} vs {cmdline}");
+            // The pkill command line carries the bracketed text, which the
+            // regex does not match.
+            let pkill = format!("pkill -f '{pattern}'");
+            assert!(!pkill.contains(&effective), "{pkill}");
+        }
+    }
+
+    /// The NCCL env words sit before the binary on the remote command line.
+    /// `env` execs the binary, so the agent's own argv (what `pkill -f`
+    /// matches against) is still `<path> agent <args>`; and while the shell
+    /// or `env` itself is alive, its command line contains the same
+    /// contiguous text. Either way the kill pattern matches.
+    #[test]
+    fn kill_patterns_match_spawns_that_carry_an_nccl_env() {
+        use crate::nccl_env::NcclEnv;
+        use crate::orchestrator::session::{agent_env_words, agent_spawn_args};
+
+        let raw = [
+            ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+            ("NCCL_DEBUG", "INFO"),
+            ("NCCL_ALGO", "Ring tree $HOME 'q'"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let env = NcclEnv::resolve(Some("bond0"), &raw).expect("valid env");
+        let remote_dir = "/scratch/gauntlet";
+        let agent = format!("{remote_dir}/{}", deploy::AGENT_RELPATH);
+        let words = agent_env_words(remote_dir, &env);
+
+        for args in [
+            vec!["nccl"],
+            vec!["run"],
+            vec!["peer", "serve", "--port", "29500"],
+            vec!["barrier", "serve", "--port", "29500"],
+        ] {
+            let joined = args.join(" ");
+            let effective = agent_kill_pattern(&joined).replacen("[g]", "g", 1);
+            let spawn = agent_spawn_args(&words, &agent, &args);
+            let remote = format!("env {}", spawn.join(" "));
+
+            // The remote shell parses the words; drop the leading
+            // assignments exactly as `env` does before exec.
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s\\n' {}", spawn.join(" ")))
+                .output()
+                .expect("run sh");
+            assert!(output.status.success(), "{remote}");
+            let argv: Vec<String> = String::from_utf8(output.stdout)
+                .expect("utf8")
+                .lines()
+                .map(str::to_string)
+                .skip_while(|word| word.contains('=') && !word.starts_with('/'))
+                .collect();
+            assert_eq!(argv[0], agent, "{remote}");
+            let agent_cmdline = argv.join(" ");
+            assert!(!agent_cmdline.contains("NCCL_"), "{agent_cmdline}");
+            assert!(
+                agent_cmdline.contains(&effective),
+                "{effective:?} vs agent argv {agent_cmdline:?}"
+            );
+            // The pre-exec `env` / shell command line matches too.
+            let shell_cmdline = String::from_utf8(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("printf '%s ' {}", spawn.join(" ")))
+                    .output()
+                    .expect("run sh")
+                    .stdout,
+            )
+            .expect("utf8");
+            assert!(
+                shell_cmdline.contains(&effective),
+                "{effective:?} vs {shell_cmdline:?}"
+            );
+        }
     }
 
     #[test]

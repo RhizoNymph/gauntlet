@@ -1,9 +1,18 @@
 pub mod agent;
 pub mod analysis;
+pub mod build_info;
 pub mod cli;
 pub mod config;
+pub mod launch;
+pub mod names;
+pub mod nccl_env;
+pub mod nccl_ib;
+pub mod nccl_level;
+pub mod nccl_transport;
+pub mod net_steps;
 pub mod orchestrator;
 pub mod proto;
+pub mod remote_dir;
 pub mod report;
 
 use tracing_subscriber::EnvFilter;

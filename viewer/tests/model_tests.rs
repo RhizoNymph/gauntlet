@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 
+use gauntlet::analysis::fit::FitBound;
 use gauntlet::config::FleetConfig;
 use gauntlet::orchestrator::collect::HostObservations;
 use gauntlet::proto::{InventorySnapshot, MetricRecord, Scope, TestId, TestOutcome, Unit};
@@ -66,8 +67,10 @@ fn inventory(hostname: &str, kernel: &str) -> InventorySnapshot {
         gpus: Vec::new(),
         nics: Vec::new(),
         ib_ports: Vec::new(),
+        ib_devices: Vec::new(),
         xid_errors: Vec::new(),
         gpu_libs: BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 
@@ -158,7 +161,7 @@ fn failed_node_scope_outcome_marks_node_bad() {
     ]);
     let vm = ViewModel::new(&results(&config, hosts));
 
-    assert_eq!(vm.verdict, Verdict::Stragglers);
+    assert_eq!(vm.verdict, Verdict::Failures);
     let n = node(&vm, "a");
     assert_eq!(n.severity, Severity::Bad);
     assert!(n.issues.iter().any(|(_, text)| {
@@ -215,7 +218,7 @@ fn slow_pair_flags_edge_warn_and_rows() {
     }
     let vm = ViewModel::new(&results(&config, hosts));
 
-    assert_eq!(vm.verdict, Verdict::Stragglers);
+    assert_eq!(vm.verdict, Verdict::Outliers);
     assert!(vm.nodes.iter().all(|n| n.severity == Severity::Ok));
     let e = edge(&vm, "c", "d");
     assert_eq!(e.severity, Severity::Warn);
@@ -326,10 +329,41 @@ fn sweep_series_are_excluded_from_rows_but_links_survive() {
     let link = vm
         .links
         .iter()
-        .find(|l| l.class == "nccl_allreduce_fleet")
+        .find(|l| l.class == "nccl_allreduce_rank_per_gpu")
         .expect("fleet fit present");
     assert!(link.gib_per_sec > 0.0);
     assert!(link.alpha_us >= 0.0);
+}
+
+#[test]
+fn bound_link_fits_carry_their_constraint() {
+    let config = config(r#"hosts = ["a"]"#);
+    let mut obs = HostObservations::default();
+    // Plain OLS puts the intercept below zero here.
+    for (bytes, us) in [(1_000.0, 1.0), (2_000.0, 50.0), (3_000.0, 100.0)] {
+        obs.metrics.push(metric(
+            TestId::NcclAllReduce,
+            Scope::Node,
+            "msg_bytes",
+            bytes,
+            Unit::Bytes,
+        ));
+        obs.metrics.push(metric(
+            TestId::NcclAllReduce,
+            Scope::Node,
+            "elapsed_us",
+            us,
+            Unit::Micros,
+        ));
+    }
+    let vm = ViewModel::new(&results(&config, BTreeMap::from([("a".to_string(), obs)])));
+    let link = vm
+        .links
+        .iter()
+        .find(|l| l.class == "nccl_allreduce_rank_per_gpu")
+        .expect("fleet fit present");
+    assert_eq!(link.alpha_us, 0.0);
+    assert_eq!(link.bound, Some(FitBound::AlphaZero));
 }
 
 #[test]
@@ -541,4 +575,30 @@ fn schema_v1_runs_without_aggregates_still_render_rows() {
     assert_eq!(row.value, 40.0);
     assert_eq!(row.n, 1);
     assert!(row.spread_mad.is_none());
+}
+
+#[test]
+fn view_model_carries_the_run_nccl_env() {
+    let tuned = config(
+        r#"
+        hosts = ["a", "b"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_DEBUG = "WARN" }
+        "#,
+    );
+    let vm = ViewModel::new(&results(&tuned, BTreeMap::new()));
+    let env = vm.nccl_env.expect("recorded");
+    assert_eq!(
+        env.get("NCCL_SOCKET_IFNAME").map(String::as_str),
+        Some("bond0")
+    );
+    assert_eq!(env.get("NCCL_DEBUG").map(String::as_str), Some("WARN"));
+
+    let untuned = config(r#"hosts = ["a", "b"]"#);
+    assert_eq!(
+        ViewModel::new(&results(&untuned, BTreeMap::new())).nccl_env,
+        Some(BTreeMap::new()),
+        "untuned is recorded as empty, not as unknown"
+    );
 }

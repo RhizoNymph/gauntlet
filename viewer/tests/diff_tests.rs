@@ -3,7 +3,7 @@
 
 use gauntlet::proto::Unit;
 use gauntlet::report::Verdict;
-use gauntlet_view::diff::{DiffView, higher_is_better};
+use gauntlet_view::diff::{Comparability, DiffView, higher_is_better};
 use gauntlet_view::model::{MetricRow, NodeView, Severity, ViewModel};
 
 fn row(group: &str, subject: &str, value: f64, unit: Unit) -> MetricRow {
@@ -38,6 +38,9 @@ fn vm(run_id: &str, hosts: &[&str], rows: Vec<MetricRow>) -> ViewModel {
         wall_secs: 60,
         verdict: Verdict::Clean,
         debug_build: false,
+        nccl_env: Default::default(),
+        nccl_level_env: Default::default(),
+        schema_version: gauntlet::report::SCHEMA_VERSION,
         nodes: hosts.iter().map(|h| node(h)).collect(),
         edges: Vec::new(),
         rows,
@@ -351,4 +354,129 @@ fn single_sample_sides_skip_the_noise_gate() {
         diff.rows[&("g.m".to_string(), "a".to_string())].severity,
         Severity::Warn
     );
+}
+
+fn with_env(mut model: ViewModel, entries: &[(&str, &str)]) -> ViewModel {
+    model.nccl_env = Some(
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+    );
+    model
+}
+
+#[test]
+fn nccl_env_drift_against_the_baseline_is_surfaced() {
+    use gauntlet::report::nccl_env::NcclEnvChange;
+    let baseline = with_env(
+        vm("base", &["a"], Vec::new()),
+        &[("NCCL_ALGO", "Ring"), ("NCCL_SOCKET_IFNAME", "bond0")],
+    );
+    let current = with_env(
+        vm("cur", &["a"], Vec::new()),
+        &[("NCCL_ALGO", "Tree"), ("NCCL_SOCKET_IFNAME", "bond0")],
+    );
+    let diff = DiffView::new(&current, &baseline);
+    assert_eq!(
+        diff.nccl_env_drift,
+        Some(vec![NcclEnvChange::Changed {
+            key: "NCCL_ALGO".into(),
+            from: "Ring".into(),
+            to: "Tree".into()
+        }])
+    );
+    // Drift is tuning context, never a per-node regression.
+    assert!(diff.node_severity.is_empty());
+}
+
+#[test]
+fn identical_tuning_has_no_nccl_env_drift() {
+    let env = [("NCCL_SOCKET_IFNAME", "bond0")];
+    let baseline = with_env(vm("base", &["a"], Vec::new()), &env);
+    let current = with_env(vm("cur", &["a"], Vec::new()), &env);
+    assert_eq!(
+        DiffView::new(&current, &baseline).nccl_env_drift,
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn an_unrecorded_baseline_env_shows_no_drift() {
+    // A pre-v10 baseline (nccl_env: None) must not produce invented
+    // "+NCCL_SOCKET_IFNAME" drift against a tuned current run.
+    let baseline = vm("base", &["a"], Vec::new());
+    let current = with_env(
+        vm("cur", &["a"], Vec::new()),
+        &[("NCCL_SOCKET_IFNAME", "bond0")],
+    );
+    assert_eq!(DiffView::new(&current, &baseline).nccl_env_drift, None);
+}
+
+#[test]
+fn same_schema_runs_are_comparable() {
+    let base = vm(
+        "base",
+        &["a"],
+        vec![row(
+            "gpu_gemm_perf.gflops_bf16",
+            "a:gpu0",
+            100.0,
+            Unit::Gflops,
+        )],
+    );
+    let cur = vm(
+        "cur",
+        &["a"],
+        vec![row(
+            "gpu_gemm_perf.gflops_bf16",
+            "a:gpu0",
+            100.0,
+            Unit::Gflops,
+        )],
+    );
+    let diff = DiffView::new(&cur, &base);
+    assert_eq!(diff.comparability, Comparability::Comparable);
+    assert_eq!(diff.comparability.note(), None);
+}
+
+#[test]
+fn a_baseline_from_another_schema_is_marked_not_directly_comparable() {
+    let mut base = vm(
+        "base",
+        &["a"],
+        vec![row(
+            "gpu_gemm_perf.gflops_bf16",
+            "a:gpu0",
+            100.0,
+            Unit::Gflops,
+        )],
+    );
+    base.schema_version = 7;
+    let mut cur = vm(
+        "cur",
+        &["a"],
+        vec![row(
+            "gpu_gemm_perf.gflops_bf16",
+            "a:gpu0",
+            80.0,
+            Unit::Gflops,
+        )],
+    );
+    cur.schema_version = 8;
+    let diff = DiffView::new(&cur, &base);
+    assert_eq!(
+        diff.comparability,
+        Comparability::SchemaMismatch {
+            current: 8,
+            baseline: 7
+        }
+    );
+    let note = diff.comparability.note().expect("a note");
+    assert!(note.contains("v7") && note.contains("v8"), "{note}");
+    // Deltas are still shown; the note qualifies them.
+    assert!(diff.rows.contains_key(&(
+        "gpu_gemm_perf.gflops_bf16".to_string(),
+        "a:gpu0".to_string()
+    )));
 }

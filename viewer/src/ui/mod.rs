@@ -49,11 +49,19 @@ pub fn severity_color(severity: Severity) -> u32 {
     }
 }
 
+/// Outliers are a performance finding (warn); failed tests and incomplete
+/// hosts are hard problems (bad).
+pub fn verdict_severity(verdict: Verdict) -> Severity {
+    match verdict {
+        Verdict::Clean => Severity::Ok,
+        Verdict::Outliers => Severity::Warn,
+        Verdict::Failures | Verdict::HostFailures => Severity::Bad,
+    }
+}
+
 pub fn verdict_color(verdict: Option<Verdict>) -> u32 {
     match verdict {
-        Some(Verdict::Clean) => OK,
-        Some(Verdict::Stragglers) => WARN,
-        Some(Verdict::HostFailures) => BAD,
+        Some(verdict) => severity_color(verdict_severity(verdict)),
         None => MUTED,
     }
 }
@@ -110,6 +118,8 @@ pub struct RootView {
     launched_run_id: Option<String>,
     /// Status line under the run button (spawn results, load errors).
     pub note: Option<(Severity, String)>,
+    /// `--repeat` passed to GUI-launched runs (1 = single shot).
+    pub repeat: u32,
     /// Jump to the next live run that appears (set when a run is launched).
     auto_follow: bool,
     /// Last bootstrap readiness report, shown in the center pane.
@@ -149,6 +159,7 @@ impl RootView {
             graph_bounds: None,
             child: None,
             launched_run_id: None,
+            repeat: 1,
             note: None,
             auto_follow: false,
             bootstrap_report: None,
@@ -346,6 +357,11 @@ impl RootView {
         self.child.as_ref().map(|(kind, _)| *kind)
     }
 
+    pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
+        self.repeat = crate::runs::cycle_repeat(self.repeat);
+        cx.notify();
+    }
+
     pub fn start_run(&mut self, cx: &mut Context<Self>) {
         if self.child.is_some() {
             return;
@@ -441,10 +457,12 @@ impl RootView {
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
         let log_err = log.try_clone().context("cloning log handle")?;
-        Command::new(&program)
-            .arg("run")
-            .arg("--config")
-            .arg(&self.config_path)
+        let mut command = Command::new(&program);
+        command.arg("run").arg("--config").arg(&self.config_path);
+        if self.repeat > 1 {
+            command.arg("--repeat").arg(self.repeat.to_string());
+        }
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
@@ -487,11 +505,13 @@ impl RootView {
                 match kind {
                     ChildKind::Run => {
                         self.launched_run_id = None;
-                        self.note = Some(match status.code() {
-                            Some(0) => (Severity::Ok, "run finished: clean".into()),
-                            Some(1) => (Severity::Warn, "run finished: stragglers".into()),
-                            Some(2) => (Severity::Bad, "run finished: host failures".into()),
-                            code => (
+                        let code = status.code();
+                        self.note = Some(match code.and_then(Verdict::from_exit_code) {
+                            Some(verdict) => (
+                                verdict_severity(verdict),
+                                format!("run finished: {verdict}"),
+                            ),
+                            None => (
                                 Severity::Bad,
                                 format!("run exited abnormally ({code:?}) — see {RUN_LOG_NAME}"),
                             ),
@@ -591,11 +611,8 @@ impl RootView {
         match &self.current {
             Some(run) => {
                 let vm = &run.vm;
-                let (verdict_text, color) = match vm.verdict {
-                    Verdict::Clean => ("clean", OK),
-                    Verdict::Stragglers => ("stragglers", WARN),
-                    Verdict::HostFailures => ("host failures", BAD),
-                };
+                let verdict_text = vm.verdict.label();
+                let color = verdict_color(Some(vm.verdict));
                 header = header
                     .child(
                         div()
@@ -668,6 +685,24 @@ impl RootView {
                 None => ("diff: no baseline".to_string(), WARN),
             }
         };
+        let comparability_note = self
+            .diff
+            .as_ref()
+            .filter(|_| self.diff_enabled)
+            .and_then(|diff| diff.comparability.note());
+        if let Some(note) = comparability_note {
+            header = header.child(
+                div()
+                    .px_2()
+                    .py(px(1.0))
+                    .rounded_md()
+                    .text_size(px(11.0))
+                    .text_color(rgb(WARN))
+                    .border_1()
+                    .border_color(rgb(WARN))
+                    .child(note),
+            );
+        }
         header.child(
             div()
                 .id("diff-toggle")

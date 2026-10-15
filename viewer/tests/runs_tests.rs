@@ -120,9 +120,14 @@ fn results(run_id: &str, started: u64) -> RunResults {
         run_id: run_id.into(),
         started_epoch_secs: started,
         debug_build: false,
+        gauntlet_version: None,
         aggregates: Default::default(),
         finished_epoch_secs: started + 60,
         hosts: BTreeMap::new(),
+        nccl_env: None,
+        launch: None,
+        verdict: None,
+        nccl_level_env: None,
         fleet: FleetAnalysis::default(),
         calibration: Calibration::default(),
     }
@@ -172,4 +177,15 @@ fn scan_reads_finals_and_partials_and_skips_junk() {
     assert!(scan(&dir.join("nope"), &mut cache).is_empty());
 
     std::fs::remove_dir_all(&dir).expect("cleanup");
+}
+
+#[test]
+fn repeat_cycle_walks_the_presets_and_wraps() {
+    use gauntlet_view::runs::cycle_repeat;
+    assert_eq!(cycle_repeat(1), 3);
+    assert_eq!(cycle_repeat(3), 5);
+    assert_eq!(cycle_repeat(5), 10);
+    assert_eq!(cycle_repeat(10), 1);
+    // Anything unexpected resets to a single shot.
+    assert_eq!(cycle_repeat(7), 1);
 }

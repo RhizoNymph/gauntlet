@@ -35,8 +35,10 @@ fn inventory(host: &str, kernel: &str) -> InventorySnapshot {
         gpus: vec![],
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
+        cuda_visible_gpus: None,
     }
 }
 
@@ -116,7 +118,7 @@ fn build_flags_stragglers_and_dissenters() {
     );
 
     assert!(results.fleet.failed_hosts.is_empty());
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 #[test]
@@ -174,7 +176,99 @@ fn absolute_thresholds_flag_independently_of_mad() {
         .get("mem_bandwidth.triad")
         .expect("violations recorded");
     assert_eq!(violators.len(), 6);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+}
+
+/// The `fleet()` observations with the straggler and dissenter healed, so a
+/// test can prove one added finding flips the verdict by itself.
+fn healed_fleet() -> (FleetConfig, BTreeMap<String, HostObservations>) {
+    let (config, mut observations) = fleet();
+    if let Some(obs) = observations.get_mut("n6") {
+        obs.metrics.clear();
+        obs.metrics.push(node_metric(
+            TestId::MemBandwidth,
+            "triad",
+            201.5,
+            Unit::GibPerSec,
+        ));
+    }
+    if let Some(obs) = observations.get_mut("n3") {
+        obs.inventory = Some(inventory("n3", "6.8.0"));
+    }
+    (config, observations)
+}
+
+#[test]
+fn sdc_failures_alone_are_hard_failures_and_rendered() {
+    let (config, mut observations) = healed_fleet();
+    let obs = observations.get_mut("n4").expect("n4");
+    obs.outcomes.push((
+        TestId::GpuGemmSdc,
+        Scope::Gpu { index: 1 },
+        TestOutcome::Failed {
+            reason: "bf16: check #3 deviated by 1.2e-1 at 1410 MHz / 84 C".into(),
+        },
+    ));
+    obs.outcomes.push((
+        TestId::CpuSdcHot,
+        Scope::Core { id: 7 },
+        TestOutcome::Failed {
+            reason: "2 mismatches over 811 hot rounds".into(),
+        },
+    ));
+    // Passing SDC outcomes elsewhere must not be reported as failures.
+    observations.get_mut("n1").expect("n1").outcomes.push((
+        TestId::GpuGemmSdc,
+        Scope::Gpu { index: 0 },
+        TestOutcome::Passed,
+    ));
+
+    let results = report::build(&config, observations, 1_700_000_000, 1_700_000_600);
+
+    let gpu = results
+        .fleet
+        .sdc_failures
+        .get("gpu_gemm_sdc")
+        .expect("gpu sdc group present");
+    assert_eq!(gpu.len(), 1);
+    assert!(gpu[0].contains("n4:gpu1"), "{gpu:?}");
+    assert!(gpu[0].contains("1410 MHz"), "{gpu:?}");
+
+    let cpu = results
+        .fleet
+        .sdc_failures
+        .get("cpu_sdc_hot")
+        .expect("cpu sdc group present");
+    assert_eq!(cpu.len(), 1);
+    assert!(cpu[0].contains("n4:core7"), "{cpu:?}");
+
+    // SDC is exit-code relevant even on an otherwise clean fleet.
+    assert_eq!(report::verdict(&results), Verdict::Failures);
+
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(text.contains("silent data corruption"), "{text}");
+    assert!(text.contains("n4:gpu1"), "{text}");
+    assert!(text.contains("1410 MHz"), "{text}");
+}
+
+#[test]
+fn clean_runs_report_no_sdc_failures() {
+    let (config, mut observations) = healed_fleet();
+    observations.get_mut("n1").expect("n1").outcomes.push((
+        TestId::CpuSdcHot,
+        Scope::Core { id: 0 },
+        TestOutcome::Passed,
+    ));
+    let results = report::build(&config, observations, 1_700_000_000, 1_700_000_600);
+    assert!(results.fleet.sdc_failures.is_empty());
+    assert_eq!(report::verdict(&results), Verdict::Clean);
+
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(!text.contains("silent data corruption"), "{text}");
 }
 
 #[test]
@@ -199,6 +293,8 @@ fn rooflines_take_the_worst_gpu() {
             pcie_width_max: Some(16),
             nvlinks_active: Some(18),
             persistence_mode: Some(true),
+            occupancy: Default::default(),
+            pci: None,
         }];
         obs.inventory = Some(inv);
         for (gpu, gflops) in [(0u32, 900_000.0), (1u32, 850_000.0)] {
@@ -576,6 +672,369 @@ fn absolute_thresholds_apply_to_the_median_of_repeats() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Overlap phase: retention ratios derived at build time
+// ---------------------------------------------------------------------------
+
+fn gpu_metric(test: TestId, gpu: u32, name: &str, value: f64, repeat: u32) -> MetricRecord {
+    MetricRecord {
+        test,
+        scope: Scope::Gpu { index: gpu },
+        name: name.into(),
+        value,
+        unit: Unit::Gflops,
+        repeat,
+    }
+}
+
+/// One host with phase-2 GEMM baselines, overlap GEMM numbers, and the
+/// overlap all-reduce pair (isolated + overlapped bus bandwidth).
+fn overlap_host(
+    baselines: &[(u32, f64)],
+    overlapped: &[(u32, f64)],
+    isolated_bus: f64,
+    overlap_bus: f64,
+) -> HostObservations {
+    let mut obs = HostObservations::default();
+    for (gpu, gflops) in baselines {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    for (gpu, gflops) in overlapped {
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapGemm,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "isolated_bus_gib_per_sec",
+        isolated_bus,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "overlap_bus_gib_per_sec",
+        overlap_bus,
+        Unit::GibPerSec,
+    ));
+    obs
+}
+
+#[test]
+fn overlap_retention_is_derived_per_gpu_and_per_node() {
+    let config = config_for(&["a"]);
+    let obs = overlap_host(
+        &[(0, 1000.0), (1, 800.0)],
+        &[(0, 900.0), (1, 400.0)],
+        100.0,
+        75.0,
+    );
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+
+    let derived: Vec<&MetricRecord> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .collect();
+    let ratio_of = |name: &str, scope: &Scope| -> f64 {
+        derived
+            .iter()
+            .find(|record| record.name == name && record.scope == *scope)
+            .unwrap_or_else(|| panic!("missing retention {name} for {scope:?}"))
+            .value
+    };
+    assert!((ratio_of("gemm_bf16", &Scope::Gpu { index: 0 }) - 0.9).abs() < 1e-12);
+    assert!((ratio_of("gemm_bf16", &Scope::Gpu { index: 1 }) - 0.5).abs() < 1e-12);
+    assert!((ratio_of("all_reduce", &Scope::Node) - 0.75).abs() < 1e-12);
+    for record in &derived {
+        assert_eq!(record.unit, Unit::Ratio);
+    }
+
+    // Retention feeds the aggregate machinery like any measured metric.
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.gemm_bf16")
+    );
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.all_reduce")
+    );
+}
+
+#[test]
+fn overlap_retention_feeds_mad_outliers() {
+    let names = ["n1", "n2", "n3", "n4", "n5"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        // Healthy nodes retain ~95% under combined load; n5 collapses to 50%.
+        let overlapped = if *name == "n5" {
+            500.0
+        } else {
+            940.0 + 10.0 * i as f64
+        };
+        observations.insert(
+            (*name).to_string(),
+            overlap_host(&[(0, 1000.0)], &[(0, overlapped)], 100.0, 95.0),
+        );
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let flagged = results
+        .fleet
+        .outliers
+        .get("overlap_retention.gemm_bf16")
+        .expect("retention outlier group");
+    assert_eq!(flagged.len(), 1, "{flagged:?}");
+    assert!(flagged[0].key.contains("n5"), "{flagged:?}");
+    assert!(flagged[0].deviation_mads < 0.0);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+}
+
+#[test]
+fn overlap_retention_skips_missing_or_degenerate_baselines() {
+    let config = config_for(&["a"]);
+    let mut obs = HostObservations::default();
+    // Overlap GEMM without a phase-2 baseline: no ratio can be formed.
+    obs.metrics
+        .push(gpu_metric(TestId::OverlapGemm, 0, "gflops_bf16", 900.0, 0));
+    // Zero isolated bus bandwidth: division would be non-finite.
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "isolated_bus_gib_per_sec",
+        0.0,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapAllReduce,
+        "overlap_bus_gib_per_sec",
+        75.0,
+        Unit::GibPerSec,
+    ));
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    assert!(
+        !results.hosts["a"]
+            .metrics
+            .iter()
+            .any(|record| record.test == TestId::OverlapRetention),
+        "no retention record may be derived without a positive finite baseline"
+    );
+}
+
+#[test]
+fn overlap_retention_joins_baselines_within_each_repeat() {
+    let config = config_for(&["a"]);
+    let mut obs = HostObservations::default();
+    for (repeat, baseline, overlapped) in [(0u32, 1000.0, 900.0), (1, 2000.0, 1000.0)] {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            0,
+            "gflops_bf16",
+            baseline,
+            repeat,
+        ));
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapGemm,
+            0,
+            "gflops_bf16",
+            overlapped,
+            repeat,
+        ));
+    }
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let mut ratios: Vec<(u32, f64)> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .map(|record| (record.repeat, record.value))
+        .collect();
+    ratios.sort_by_key(|(repeat, _)| *repeat);
+    assert_eq!(ratios.len(), 2, "{ratios:?}");
+    assert!((ratios[0].1 - 0.9).abs() < 1e-12, "{ratios:?}");
+    assert!((ratios[1].1 - 0.5).abs() < 1e-12, "{ratios:?}");
+    // The per-subject aggregate summarizes both repeats.
+    let aggregate = &results.aggregates["overlap_retention.gemm_bf16"]["a:gpu0"];
+    assert_eq!(aggregate.moments.n, 2);
+}
+
+#[test]
+fn overlap_retention_appears_in_the_rendered_table() {
+    let config = config_for(&["a"]);
+    let obs = overlap_host(&[(0, 1000.0)], &[(0, 870.0)], 100.0, 75.0);
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let text = String::from_utf8(rendered).expect("utf8 table");
+    assert!(text.contains("overlap ret"), "column present: {text}");
+    // The min across subjects: all-reduce retention 0.75 undercuts the
+    // GEMM's 0.87.
+    assert!(text.contains("0.75"), "worst retention rendered: {text}");
+}
+
+// ---------------------------------------------------------------------------
+// Fleet overlap: retention against the step's own baseline window
+// ---------------------------------------------------------------------------
+
+/// One host with phase-2 GEMM baselines, fleet-overlap GEMM numbers, and
+/// the fleet all-reduce pair (isolated + overlapped bus bandwidth).
+fn fleet_overlap_host(
+    baselines: &[(u32, f64)],
+    overlapped: &[(u32, f64)],
+    isolated_bus: f64,
+    overlap_bus: f64,
+) -> HostObservations {
+    let mut obs = HostObservations::default();
+    for (gpu, gflops) in baselines {
+        obs.metrics.push(gpu_metric(
+            TestId::GpuGemmPerf,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    for (gpu, gflops) in overlapped {
+        obs.metrics.push(gpu_metric(
+            TestId::OverlapFleetGemm,
+            *gpu,
+            "gflops_bf16",
+            *gflops,
+            0,
+        ));
+    }
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "isolated_bus_gib_per_sec",
+        isolated_bus,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "overlap_bus_gib_per_sec",
+        overlap_bus,
+        Unit::GibPerSec,
+    ));
+    obs
+}
+
+#[test]
+fn fleet_overlap_retention_is_derived_per_gpu_and_per_node() {
+    let config = config_for(&["a"]);
+    let obs = fleet_overlap_host(
+        &[(0, 1000.0), (1, 800.0)],
+        &[(0, 900.0), (1, 400.0)],
+        40.0,
+        30.0,
+    );
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+
+    let derived: Vec<&MetricRecord> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention)
+        .collect();
+    let ratio_of = |name: &str, scope: &Scope| -> f64 {
+        derived
+            .iter()
+            .find(|record| record.name == name && record.scope == *scope)
+            .unwrap_or_else(|| panic!("missing retention {name} for {scope:?}"))
+            .value
+    };
+    assert!((ratio_of("fleet_gemm_bf16", &Scope::Gpu { index: 0 }) - 0.9).abs() < 1e-12);
+    assert!((ratio_of("fleet_gemm_bf16", &Scope::Gpu { index: 1 }) - 0.5).abs() < 1e-12);
+    assert!((ratio_of("fleet_all_reduce", &Scope::Node) - 0.75).abs() < 1e-12);
+    for record in &derived {
+        assert_eq!(record.unit, Unit::Ratio);
+    }
+
+    // The derived groups ride the aggregate machinery like measured metrics.
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.fleet_gemm_bf16")
+    );
+    assert!(
+        results
+            .aggregates
+            .contains_key("overlap_retention.fleet_all_reduce")
+    );
+}
+
+#[test]
+fn fleet_and_intra_node_overlap_baselines_never_cross() {
+    // Both steps present, with different isolated baselines (they run on
+    // different communicators): each retention must divide its own.
+    let config = config_for(&["a"]);
+    let mut obs = overlap_host(&[(0, 1000.0)], &[(0, 900.0)], 100.0, 80.0);
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "isolated_bus_gib_per_sec",
+        40.0,
+        Unit::GibPerSec,
+    ));
+    obs.metrics.push(node_metric(
+        TestId::OverlapFleetAllReduce,
+        "overlap_bus_gib_per_sec",
+        30.0,
+        Unit::GibPerSec,
+    ));
+    let results = report::build(&config, BTreeMap::from([("a".to_string(), obs)]), 1, 2);
+    let retention: BTreeMap<&str, f64> = results.hosts["a"]
+        .metrics
+        .iter()
+        .filter(|record| record.test == TestId::OverlapRetention && record.scope == Scope::Node)
+        .map(|record| (record.name.as_str(), record.value))
+        .collect();
+    assert!(
+        (retention["all_reduce"] - 0.8).abs() < 1e-12,
+        "{retention:?}"
+    );
+    assert!(
+        (retention["fleet_all_reduce"] - 0.75).abs() < 1e-12,
+        "{retention:?}"
+    );
+}
+
+#[test]
+fn fleet_overlap_retention_feeds_mad_outliers() {
+    let names = ["n1", "n2", "n3", "n4", "n5"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        // Healthy nodes retain ~75% of the fleet all-reduce under combined
+        // load; n3's GPU<->NIC path collapses to 30%.
+        let overlapped = if *name == "n3" {
+            12.0
+        } else {
+            30.0 + 0.1 * i as f64
+        };
+        observations.insert(
+            (*name).to_string(),
+            fleet_overlap_host(&[(0, 1000.0)], &[(0, 950.0)], 40.0, overlapped),
+        );
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let flagged = results
+        .fleet
+        .outliers
+        .get("overlap_retention.fleet_all_reduce")
+        .expect("fleet retention outlier group");
+    assert_eq!(flagged.len(), 1, "{flagged:?}");
+    assert_eq!(flagged[0].key, "n3", "{flagged:?}");
+    assert!(flagged[0].deviation_mads < 0.0);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+}
+
 #[test]
 fn rooflines_reduce_over_per_subject_medians() {
     let mut obs = HostObservations::default();
@@ -596,4 +1055,288 @@ fn rooflines_reduce_over_per_subject_medians() {
         results.calibration.rooflines["a"].gpu_hbm_gib_per_sec,
         Some(3000.0)
     );
+}
+
+// ---------------------------------------------------------------------------
+// NCCL env in the results document (schema v10)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn results_record_the_resolved_nccl_env() {
+    let config = FleetConfig::from_toml_str(
+        r#"
+        hosts = ["a", "b"]
+        [nccl]
+        socket_ifname = "bond0"
+        env = { NCCL_IB_HCA = "mlx5_0,mlx5_1", NCCL_DEBUG = "WARN" }
+        "#,
+        std::path::Path::new("inline.toml"),
+    )
+    .expect("config");
+    let results = report::build(&config, BTreeMap::new(), 1, 2);
+    assert_eq!(results.schema_version, report::SCHEMA_VERSION);
+    let expected: BTreeMap<String, String> = [
+        ("NCCL_DEBUG", "WARN"),
+        ("NCCL_IB_HCA", "mlx5_0,mlx5_1"),
+        ("NCCL_SOCKET_IFNAME", "bond0"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect();
+    assert_eq!(results.nccl_env.as_ref(), Some(&expected));
+    assert_eq!(
+        results.nccl_env,
+        Some(config.nccl_env().expect("validated").to_string_map())
+    );
+
+    // The document round-trips, and the table names the tuning up front.
+    let json = serde_json::to_string(&results).expect("serialize");
+    let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(back.nccl_env, Some(expected));
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    let rendered = String::from_utf8(rendered).expect("utf8");
+    assert!(
+        rendered.contains(
+            "nccl env: NCCL_DEBUG=WARN NCCL_IB_HCA=mlx5_0,mlx5_1 NCCL_SOCKET_IFNAME=bond0"
+        ),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn untuned_runs_record_an_empty_env_and_pre_v8_documents_none() {
+    let results = report::build(&config_for(&["a"]), BTreeMap::new(), 1, 2);
+    assert_eq!(results.nccl_env, Some(BTreeMap::new()));
+    let mut rendered = Vec::new();
+    report::render_table(&results, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (none)")
+    );
+
+    // A v7 document has no nccl_env field at all.
+    let mut value = serde_json::to_value(&results).expect("to value");
+    value
+        .as_object_mut()
+        .expect("object")
+        .remove("nccl_env")
+        .expect("field present in v8");
+    let old: report::RunResults = serde_json::from_value(value).expect("pre-v10 decodes");
+    assert_eq!(old.nccl_env, None, "absent means not recorded, not untuned");
+    let mut rendered = Vec::new();
+    report::render_table(&old, &mut rendered).expect("render");
+    assert!(
+        String::from_utf8(rendered)
+            .expect("utf8")
+            .contains("nccl env: (not recorded)")
+    );
+}
+
+/// One node's completed intra-node sweep, as the agent emits it: per size
+/// elapsed/msg/bus for both collectives, then the per-collective headline
+/// and communicator size.
+fn intranode_sweep(obs: &mut HostObservations, gpus: u32, peak: f64) {
+    for test in [TestId::NcclIntraAllReduce, TestId::NcclIntraAllGather] {
+        for (bytes, us) in [
+            (1024.0, 12.0),
+            (1_048_576.0, 40.0),
+            (1_073_741_824.0, 9_000.0),
+        ] {
+            obs.metrics
+                .push(node_metric(test, "elapsed_us", us, Unit::Micros));
+            obs.metrics
+                .push(node_metric(test, "msg_bytes", bytes, Unit::Bytes));
+            obs.metrics.push(node_metric(
+                test,
+                "bus_gib_per_sec",
+                peak * bytes / 1_073_741_824.0,
+                Unit::GibPerSec,
+            ));
+        }
+        obs.metrics.push(node_metric(
+            test,
+            &gauntlet::proto::nccl_metric::bus_peak(gpus),
+            peak,
+            Unit::GibPerSec,
+        ));
+        obs.metrics
+            .push(node_metric(test, "ranks", f64::from(gpus), Unit::Count));
+        obs.outcomes.push((test, Scope::Node, TestOutcome::Passed));
+    }
+}
+
+#[test]
+fn intranode_headline_flags_a_degraded_node_but_the_series_never_does() {
+    let names = ["n1", "n2", "n3", "n4", "n5", "n6"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut obs = HostObservations::default();
+        // n4 has a downtrained link: a fraction of everyone else's peak.
+        let peak = if *name == "n4" {
+            60.0
+        } else {
+            180.0 + i as f64
+        };
+        intranode_sweep(&mut obs, 8, peak);
+        observations.insert((*name).to_string(), obs);
+    }
+    let results = report::build(&config, observations, 1, 2);
+
+    for group in [
+        "nccl_intra_all_reduce.bus_gib_per_sec_peak_8gpu",
+        "nccl_intra_all_gather.bus_gib_per_sec_peak_8gpu",
+    ] {
+        // The headline is one value per node: fleet-comparable.
+        assert_eq!(results.aggregates[group].len(), names.len(), "{group}");
+        let flagged = results.fleet.outliers.get(group).expect(group);
+        assert_eq!(flagged.len(), 1, "{group}: {flagged:?}");
+        assert_eq!(flagged[0].key, "n4");
+    }
+    // The per-size series repeat their sample key: never MAD-compared.
+    for series in ["elapsed_us", "msg_bytes", "bus_gib_per_sec"] {
+        for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+            let group = format!("{test}.{series}");
+            assert!(!results.aggregates.contains_key(&group), "{group}");
+            assert!(!results.fleet.outliers.contains_key(&group), "{group}");
+        }
+    }
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+}
+
+/// Mixed-topology fleet: `majority` 8-GPU NVLink nodes around 200 GiB/s
+/// plus `minority` 4-GPU PCIe nodes around 20 GiB/s. `degraded`, when set,
+/// is a 4-GPU node whose peak is a fraction of its 4-GPU peers.
+fn mixed_fleet(
+    majority: usize,
+    minority: usize,
+    degraded: Option<&str>,
+) -> (FleetConfig, BTreeMap<String, HostObservations>) {
+    let mut names = Vec::new();
+    let mut observations = BTreeMap::new();
+    for i in 0..majority {
+        let name = format!("big{i:02}");
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, 8, 200.0 + i as f64);
+        observations.insert(name.clone(), obs);
+        names.push(name);
+    }
+    for i in 0..minority {
+        let name = format!("small{i:02}");
+        let peak = if degraded == Some(name.as_str()) {
+            6.0
+        } else {
+            20.0 + 0.1 * i as f64
+        };
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, 4, peak);
+        observations.insert(name.clone(), obs);
+        names.push(name);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    (config_for(&refs), observations)
+}
+
+#[test]
+fn a_healthy_minority_topology_is_never_a_straggler() {
+    // 10x 8-GPU NVLink (~200 GiB/s) + 3x 4-GPU PCIe (~20 GiB/s): under one
+    // shared group every 4-GPU node would be a 10x low outlier.
+    let (config, observations) = mixed_fleet(10, 3, None);
+    let results = report::build(&config, observations, 1, 2);
+    for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+        let big = format!("{test}.bus_gib_per_sec_peak_8gpu");
+        let small = format!("{test}.bus_gib_per_sec_peak_4gpu");
+        // Each topology is its own comparison group...
+        assert_eq!(results.aggregates[&big].len(), 10, "{big}");
+        assert_eq!(results.aggregates[&small].len(), 3, "{small}");
+        assert!(
+            results.aggregates[&big]
+                .keys()
+                .all(|key| key.starts_with("big"))
+        );
+        // ...so nobody is flagged: the 8-GPU group is healthy, and three
+        // 4-GPU nodes are below flag_outliers' minimum sample count.
+        assert!(!results.fleet.outliers.contains_key(&big), "{big}");
+        assert!(!results.fleet.outliers.contains_key(&small), "{small}");
+        assert!(
+            !results
+                .aggregates
+                .contains_key(&format!("{test}.bus_gib_per_sec_peak"))
+        );
+    }
+    assert_eq!(report::verdict(&results), Verdict::Clean);
+}
+
+#[test]
+fn a_degraded_node_is_found_within_its_own_topology() {
+    // Enough 4-GPU nodes for a comparison: the degraded one stands out
+    // against its peers, and no healthy 4-GPU node is flagged.
+    let (config, observations) = mixed_fleet(10, 6, Some("small03"));
+    let results = report::build(&config, observations, 1, 2);
+    for test in ["nccl_intra_all_reduce", "nccl_intra_all_gather"] {
+        let small = format!("{test}.bus_gib_per_sec_peak_4gpu");
+        let flagged = results.fleet.outliers.get(&small).expect(&small);
+        let keys: Vec<&str> = flagged.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["small03"], "{small}");
+        assert!(flagged[0].deviation_mads < 0.0, "a low outlier");
+        let big = format!("{test}.bus_gib_per_sec_peak_8gpu");
+        assert!(!results.fleet.outliers.contains_key(&big), "{big}");
+    }
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
+}
+
+#[test]
+fn intranode_series_feed_link_classes_keyed_by_gpu_count() {
+    let names = ["n1", "n2", "n3"];
+    let config = config_for(&names);
+    let mut observations = BTreeMap::new();
+    for (name, gpus) in [("n1", 8), ("n2", 8), ("n3", 4)] {
+        let mut obs = HostObservations::default();
+        intranode_sweep(&mut obs, gpus, 180.0);
+        observations.insert(name.to_string(), obs);
+    }
+    let results = report::build(&config, observations, 1, 2);
+    let classes: Vec<&str> = results
+        .calibration
+        .links
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            "nccl_allgather_intranode_4gpu",
+            "nccl_allgather_intranode_8gpu",
+            "nccl_allreduce_intranode_4gpu",
+            "nccl_allreduce_intranode_8gpu",
+        ]
+    );
+    // Intra-node points never contaminate the fleet classes.
+    assert!(
+        !results
+            .calibration
+            .links
+            .contains_key("nccl_allreduce_fleet")
+    );
+
+    // The whole document survives a JSON round trip at the new schema.
+    let json = serde_json::to_string(&results).expect("serialize");
+    let back: report::RunResults = serde_json::from_str(&json).expect("deserialize");
+    // Keys exact; values to within float-text rounding.
+    assert_eq!(
+        back.calibration.links.keys().collect::<Vec<_>>(),
+        results.calibration.links.keys().collect::<Vec<_>>()
+    );
+    for (class, fit) in &results.calibration.links {
+        let decoded = back.calibration.links[class];
+        assert!((decoded.alpha_us - fit.alpha_us).abs() < 1e-9, "{class}");
+        assert!(
+            (decoded.beta_us_per_byte - fit.beta_us_per_byte).abs() < 1e-15,
+            "{class}"
+        );
+        assert!((decoded.r_squared - fit.r_squared).abs() < 1e-9, "{class}");
+    }
+    assert_eq!(back.schema_version, report::SCHEMA_VERSION);
 }

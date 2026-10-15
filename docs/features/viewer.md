@@ -11,7 +11,9 @@ connected fleet graph plus a quantitative metric table.
   (`<run_id>.partial.json`, written by `gauntlet run` every ~2s) reloads as
   it grows and swaps to the final JSON when the run completes.
 - Launch runs from the GUI: the ▶ button spawns the `gauntlet` binary
-  (sibling of the viewer binary, else $PATH) with `run --config <config>`,
+  (sibling of the viewer binary, else $PATH) with `run --config <config>`
+  (plus `--repeat N` when the repeat chip under the button is cycled past
+  "off": ×3/×5/×10),
   logs to `runs/gauntlet-run.log`, follows the new live run, and reports
   the exit verdict. ✕ cancel kills the child; a cancelled run's orphaned
   partial snapshot is deleted and the view falls back to the newest
@@ -47,6 +49,25 @@ connected fleet graph plus a quantitative metric table.
   aggregates are re-derived on load.
 - Diff mode is noise-aware: when both runs carry spreads (n >= 2), a delta
   must clear ~2x the pooled spread in addition to the 5%/15% floors.
+- Diff mode is schema-aware: a baseline whose `schema_version` differs
+  from the current run's is marked not directly comparable
+  (`diff::Comparability::SchemaMismatch`, a warn-colored header chip
+  "baseline schema vX ≠ vY: not directly comparable"). Deltas are still
+  shown — the chip qualifies them — because metric names can survive a
+  schema bump while their meaning changes (schema v8's rank-per-GPU NCCL
+  world).
+- NCCL tuning drift (schema v10 `nccl_env`): diff mode shows an "nccl env
+  drift" chip and one line per added/removed/changed NCCL_* key vs the
+  baseline (`DiffView.nccl_env_drift`, via
+  `gauntlet::report::nccl_env::nccl_env_drift`). The overview shows the
+  run's env. Drift is context for NCCL deltas, never a node regression.
+  If either run predates the field (`nccl_env: None`), no drift is shown.
+  Per-level drift (schema v13 `nccl_level_env`): `DiffView.
+  nccl_level_env_drift` lists, per NCCL level, the changes the global
+  drift does not already show, rendered as `[level] change` lines under
+  the same chip; `None` when either run predates v13. The overview adds
+  `nccl env [level]: ...` for every level whose env differs from the
+  global one (`ViewModel.nccl_level_env`).
 
 Non-scope: editing config, cancelling a launched run, run scheduling. No
 new absolute-mode analysis: the viewer projects the findings the report
@@ -73,7 +94,8 @@ runs/<run_id>.json
             ├─ rows:   metric groups keyed "<test>.<metric>"; groups with
             │          repeated sample keys (NCCL sweeps) are excluded and
             │          surface as calibration link fits instead.
-            └─ links:  calibration.links (alpha µs, GiB/s, r²).
+            └─ links:  calibration.links (alpha µs, GiB/s, r², and the
+                       bound label when a fit hit alpha/beta >= 0).
        └─ ui::RootView (gpui)
             ├─ graph pane: canvas paints edges (PathBuilder stroke); node
             │   chips are absolutely positioned clickable divs. The canvas
@@ -102,7 +124,11 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
 - `viewer/src/diff.rs` — pure run-to-run diff: `DiffView::new(current,
   baseline)` produces per-row `RowDelta` (Δ fraction, regression severity,
   improved flag) plus node/edge regression severities and capped issue
-  lists. `higher_is_better(unit)` is the direction-of-goodness oracle.
+  lists, a `Comparability` verdict (same schema or not, with the chip
+  text), `nccl_env_drift` (NCCL tuning differences vs the baseline) and
+  `nccl_level_env_drift` (per-level differences beyond the global ones).
+  `higher_is_better(unit)` is the direction-of-goodness oracle.
+  `ViewModel.schema_version` carries each run's schema.
 - `viewer/src/runs.rs` — run-list plumbing: `classify_file_name`
   (`.json` vs `.partial.json`), `order_and_dedupe` (newest first, finals
   shadow stale partials), `effective_baseline`, `scan` (directory scan
@@ -127,7 +153,7 @@ labels containing ':' (e.g. `disk:/tmp`) cannot misattribute.
   real `report::build` pipeline.
 - `viewer/tests/layout_tests.rs` — geometry and hit-testing.
 - `viewer/tests/diff_tests.rs` — regression directions, thresholds,
-  node/edge attribution, issue capping.
+  node/edge attribution, issue capping, schema comparability.
 - `viewer/tests/runs_tests.rs` — classification, ordering, baseline
   resolution, scanning, timestamp math.
 - `viewer/tests/bootstrap_tests.rs` — matrix projection and stalled-run

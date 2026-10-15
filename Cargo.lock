@@ -2129,7 +2129,6 @@ dependencies = [
  "libloading 0.9.0",
  "openssh",
  "openssh-sftp-client",
- "rayon",
  "serde",
  "serde_json",
  "sha2 0.11.0",

@@ -1,15 +1,33 @@
 //! Node-side mode. Invoked over ssh by the orchestrator; never run by hand.
 //!
-//! stdout carries the JSON-lines event protocol (see `crate::proto`), so
-//! nothing in agent mode may print to stdout except through `EventSink`.
+//! stdout carries the JSON-lines event protocol (see `crate::proto`).
+//! Invariant: only `channel::protocol_writer` (via `EventSink` or
+//! `channel::write_line`) reaches the orchestrator. `main` calls
+//! `channel::isolate_stdout` before any thread exists, which moves the
+//! protocol to a private dup of the original stdout and points fd 1 at
+//! stderr — so library output on fd 1 (NCCL_DEBUG, CUDA, a stray
+//! `println!`) lands in the stderr log instead of corrupting events.
 //! Logs go to stderr via `tracing`.
 
+pub mod barrier;
+pub mod channel;
+pub mod counters;
 pub mod cpu;
 pub mod disk;
+pub mod gpu_occupancy;
+pub mod ib;
+pub mod intranode;
 pub mod inventory;
 pub mod mem;
 pub mod nccl;
 pub mod net;
+pub mod pci;
+pub mod sweep;
+pub mod sysfs;
+// Its callers are gpu-gated; the pure parts are tested everywhere.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub mod transport;
+pub mod window;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
@@ -33,9 +51,11 @@ pub struct EventSink {
 }
 
 impl EventSink {
+    /// Sink on the protocol channel (the private stdout duplicate once
+    /// `channel::isolate_stdout` ran).
     pub fn stdout() -> Self {
         Self {
-            out: Mutex::new(Box::new(std::io::stdout())),
+            out: Mutex::new(channel::protocol_writer()),
         }
     }
 
@@ -106,9 +126,11 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             Phase::Inventory => inventory::run(&sink),
             Phase::CpuMem => cpu_mem_phase(&sink, &spec),
             Phase::Gpu => gpu_phase(&sink, &spec),
-            // Network tests are driven pairwise by the orchestrator through
-            // `agent peer` / `agent nccl`, not from the phase loop.
-            Phase::Network => Ok(()),
+            // Pairwise and fleet network tests are driven by the orchestrator
+            // through `agent peer` / `agent nccl`; the phase loop only runs
+            // the node-local level of the hierarchy, the intra-node sweep.
+            Phase::Network => network_phase(&sink, &spec),
+            Phase::Overlap => overlap_phase(&sink, &spec),
         };
         if let Err(error) = result {
             sink.emit(&AgentEvent::Fatal {
@@ -117,6 +139,11 @@ pub async fn run(args: AgentRunArgs) -> Result<()> {
             return Err(error);
         }
         sink.emit(&AgentEvent::PhaseEnd { phase: *phase });
+    }
+    // Counter passes run after any listed phases; the orchestrator sends
+    // them as dedicated invocations with an empty phase list.
+    if let Some(request) = &spec.counters {
+        counters::run(&sink, request);
     }
     Ok(())
 }
@@ -145,11 +172,48 @@ fn gpu_phase(sink: &EventSink, _spec: &AgentTaskSpec) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
+fn overlap_phase(sink: &EventSink, spec: &AgentTaskSpec) -> Result<()> {
+    gpu::overlap::run(sink, &spec.overlap)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn overlap_phase(sink: &EventSink, _spec: &AgentTaskSpec) -> Result<()> {
+    sink.outcome(
+        TestId::OverlapGemm,
+        Scope::Node,
+        TestOutcome::Skipped {
+            reason: "agent built without gpu feature".into(),
+        },
+    );
+    Ok(())
+}
+
+/// Node-local part of the network phase: the intra-node NCCL sweep, when
+/// the spec asks for it.
+fn network_phase(sink: &EventSink, spec: &AgentTaskSpec) -> Result<()> {
+    match &spec.nccl_intranode {
+        Some(sweep) => intranode_sweep(sink, sweep),
+        None => Ok(()),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn intranode_sweep(sink: &EventSink, sweep: &crate::proto::NcclSweepSpec) -> Result<()> {
+    gpu::intranode::run(sink, sweep)
+}
+
+#[cfg(not(feature = "gpu"))]
+fn intranode_sweep(sink: &EventSink, _sweep: &crate::proto::NcclSweepSpec) -> Result<()> {
+    intranode::skip_without_gpu(sink);
+    Ok(())
+}
+
 /// Entry point for `gauntlet agent probe`: print an `InventorySnapshot`
 /// JSON document on stdout (used by bootstrap for capability detection).
 pub fn probe() -> Result<()> {
     let snapshot = inventory::collect()?;
-    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    channel::write_line(&serde_json::to_string_pretty(&snapshot)?)?;
     Ok(())
 }
 
