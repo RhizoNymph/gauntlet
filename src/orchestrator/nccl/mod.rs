@@ -1,12 +1,15 @@
 //! Fleet-wide NCCL jobs: world selection, the rendezvous-relay driver, and
-//! the two workloads that ride it — the phase-3 collective sweep and the
-//! overlap phase's fleet step.
+//! the workloads that ride it — the phase-3 collective sweep (`sweep`,
+//! with the barrier-skew probe) and the overlap phase's fleet step.
 //!
-//! World: one NCCL rank per GPU (`layout::RankLayout`). Each NCCL-capable
-//! host contributes a contiguous rank block ordered by local GPU index,
-//! sized by the GPUs *CUDA* can open there (phase-0 inventory
+//! World: by default one NCCL rank per GPU (`layout::RankLayout`). Each
+//! NCCL-capable host contributes a contiguous rank block ordered by local
+//! GPU index, sized by the GPUs *CUDA* can open there (phase-0 inventory
 //! `cuda_visible_gpus`); one `agent nccl` process — one ssh session, one
-//! supervised task — per host drives its whole block.
+//! supervised task — per host drives its whole block. The sweep alone can
+//! run in a NIC-forcing world shape instead (`shape`, `[tests]
+//! nccl_world`): one rank per host, or one rail at a time. The barrier
+//! probe and the fleet overlap step always run rank-per-GPU.
 //!
 //! The host holding global rank 0 mints the rendezvous id in-process (the
 //! id's bootstrap listen socket must live in the process that serves as
@@ -26,7 +29,10 @@ mod attribution;
 mod barrier_job;
 mod layout;
 mod ownership;
+mod rails;
 mod records;
+mod shape;
+mod sweep;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -35,10 +41,13 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+pub(super) use self::shape::IntraNodeCoverage;
+pub(super) use self::sweep::nccl_sweep;
+
 use self::attribution::{
     AbortAction, AbortTracker, Attribution, FailureKind, HostFailure, attribute,
 };
-use self::barrier_job::{BarrierPlacement, BarrierTimings};
+
 use self::layout::RankLayout;
 use self::ownership::accept_owned;
 use self::records::{host_overlap_records, outcomes_with};
@@ -48,7 +57,7 @@ use super::{ObservationSink, gpu_bearing_hosts, kill_remote_agent};
 use crate::config::FleetConfig;
 use crate::proto::{
     AGENT_EXIT_CASCADE, AgentEvent, InventorySnapshot, NcclDirective, NcclWorkload,
-    OverlapFleetReport, RankAssignment, RankBlock, Scope, TestId, TestOutcome,
+    OverlapFleetReport, RankAssignment, RankBlock, Scope, TestOutcome,
 };
 
 /// How long the orchestrator waits for the lead rank's NcclId event.
@@ -75,23 +84,24 @@ pub(super) fn nccl_loadable(inventory: &InventorySnapshot) -> bool {
     inventory.gpu_libs.get("nccl").copied().unwrap_or(true)
 }
 
-/// Hosts eligible for a fleet-wide NCCL world, laid out one rank per GPU:
-/// GPU-bearing (probing hosts whose inventory is missing) with a loadable
-/// libnccl, each contributing its CUDA-visible GPU count.
+/// Hosts eligible for a fleet-wide NCCL world, in fleet order: GPU-bearing
+/// (probing hosts whose inventory is missing) with a loadable libnccl,
+/// each with its CUDA-visible GPU count (zero-GPU hosts are kept here and
+/// dropped by every layout).
 ///
 /// The inventory dlopen probe knows whether libnccl actually loads. A fleet
 /// without the NCCL stack skips fleet NCCL work as a structural finding
 /// (visible in the inventory/consistency/bootstrap output) instead of
 /// manufacturing a host failure out of a loader panic. Hosts predating the
 /// probe (empty map) are given the benefit of the doubt.
-async fn nccl_world(
+async fn nccl_hosts(
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
-) -> FleetWorld {
+) -> Vec<(Arc<HostSession>, u32)> {
     let gpu_hosts = gpu_bearing_hosts(sessions, inventories).await;
     if gpu_hosts.is_empty() {
         info!("no GPU-bearing hosts; skipping fleet NCCL work");
-        return RankLayout::empty();
+        return Vec::new();
     }
     let nccl_hosts: Vec<(Arc<HostSession>, u32)> = gpu_hosts
         .iter()
@@ -105,7 +115,7 @@ async fn nccl_world(
             gpu_hosts = gpu_hosts.len(),
             "libnccl is not loadable on any GPU-bearing host; skipping fleet NCCL work"
         );
-        return RankLayout::empty();
+        return Vec::new();
     }
     if nccl_hosts.len() < gpu_hosts.len() {
         warn!(
@@ -122,7 +132,13 @@ async fn nccl_world(
             );
         }
     }
-    match RankLayout::new(nccl_hosts) {
+    nccl_hosts
+}
+
+/// The rank-per-GPU fleet world over `hosts` (`nccl_hosts`); empty when it
+/// cannot be laid out.
+fn rank_per_gpu_world(hosts: Vec<(Arc<HostSession>, u32)>) -> FleetWorld {
+    match RankLayout::new(hosts) {
         Ok(layout) => layout,
         Err(error) => {
             warn!(%error, "cannot lay out the fleet NCCL world; skipping fleet NCCL work");
@@ -514,72 +530,6 @@ fn report_violations(sink: &ObservationSink, violations: Vec<ownership::Ownershi
     }
 }
 
-/// Fleet-wide NCCL sweep: the lead host's event stream carries the
-/// measurements (timed on global rank 0); every rank contributes barrier
-/// timings when the barrier-skew benchmark rides along.
-pub(super) async fn nccl_sweep(
-    config: &FleetConfig,
-    sessions: &[Arc<HostSession>],
-    inventories: &mut BTreeMap<String, InventorySnapshot>,
-    sink: &ObservationSink,
-) {
-    let world = nccl_world(sessions, inventories).await;
-    let world_size = world.world_size();
-    if let Some(skipped) = sweep_gate(world_size) {
-        info!(
-            world_size,
-            "fewer than two NCCL ranks; skipping the fleet sweep"
-        );
-        for (session, _) in world.members() {
-            emit_outcomes(sink, session.addr(), skipped.clone());
-        }
-        return;
-    }
-    let Some((lead, _)) = world.members().first() else {
-        return;
-    };
-    info!(
-        world_size,
-        hosts = world.member_count(),
-        lead = %lead.addr(),
-        "NCCL sweep"
-    );
-
-    // Barrier-skew microbenchmark (`barrier_job`): rides the sweep's
-    // communicator when the barrier and fleet levels share one NCCL env,
-    // otherwise runs afterwards in its own world under the barrier env.
-    let barrier = BarrierPlacement::plan(config, &world, lead);
-    let timings = BarrierTimings::default();
-    let job = NcclJob {
-        workload: NcclWorkload::Sweep {
-            sizes: config.tests.nccl_sizes.clone(),
-            iters_per_size: config.tests.nccl_iters_per_size,
-            barrier: barrier.and_then(BarrierPlacement::rides_sweep),
-        },
-    };
-    let sweep = drive_fleet_nccl(
-        config,
-        &world,
-        sink,
-        "nccl sweep",
-        &job,
-        NcclFailureMode::HostError,
-        timings.intercept(),
-    )
-    .await;
-    let analyze = match barrier {
-        None => false,
-        Some(BarrierPlacement::RidesSweep(_)) => true,
-        Some(BarrierPlacement::OwnWorld(spec)) => {
-            barrier_job::run_own_world(config, &world, sink, spec, timings.intercept(), &sweep)
-                .await
-        }
-    };
-    if analyze {
-        timings.analyze(sink, &world, lead.addr());
-    }
-}
-
 /// A global rank's results-document subject: its host, `Scope::Gpu` with
 /// the local GPU index.
 fn gpu_subject(world: &FleetWorld, rank: u32) -> Option<RankSubject> {
@@ -612,7 +562,7 @@ pub(super) async fn overlap_fleet_sweep(
     inventories: &mut BTreeMap<String, InventorySnapshot>,
     sink: &ObservationSink,
 ) {
-    let world = nccl_world(sessions, inventories).await;
+    let world = rank_per_gpu_world(nccl_hosts(sessions, inventories).await);
     if world.member_count() < 2 {
         info!(
             nccl_hosts = world.member_count(),
@@ -690,26 +640,6 @@ pub(super) async fn overlap_fleet_sweep(
     }
 }
 
-/// The fleet sweep needs a peer: with fewer than two ranks an "all-reduce"
-/// is a local copy, and its timings would feed the `_rank_per_gpu` link
-/// fits a link that does not exist. Returns the Skipped outcomes to record
-/// on every world member, or `None` when the sweep should run. The gate is
-/// on ranks, not hosts: one host with two GPUs is a real two-rank world.
-fn sweep_gate(world_size: u32) -> Option<Vec<records::OutcomeRecord>> {
-    (world_size < 2).then(|| {
-        let reason = format!("fleet nccl sweep needs at least 2 ranks, found {world_size}");
-        [TestId::NcclAllReduce, TestId::NcclAllGather]
-            .into_iter()
-            .map(|test| {
-                let outcome = TestOutcome::Skipped {
-                    reason: reason.clone(),
-                };
-                (test, Scope::Node, outcome)
-            })
-            .collect()
-    })
-}
-
 fn emit_outcomes(sink: &ObservationSink, host: &str, outcomes: Vec<records::OutcomeRecord>) {
     for (test, scope, outcome) in outcomes {
         sink.event(
@@ -753,6 +683,7 @@ mod tests {
                 sizes: vec![1024],
                 iters_per_size: 1,
                 barrier: Some(BarrierSpec { iters: 1, bytes: 8 }),
+                series: crate::proto::SweepSeries::RankPerGpu,
             },
         };
         // The barrier riding the sweep shares the fleet communicator.
@@ -764,29 +695,26 @@ mod tests {
     }
 
     #[test]
-    fn a_single_rank_world_skips_the_sweep() {
-        // One rank has no peer: an "all-reduce" is a local copy, so its
-        // timings would calibrate a link that does not exist.
-        for world_size in [0, 1] {
-            let outcomes = sweep_gate(world_size).expect("must skip");
-            let tests: Vec<TestId> = outcomes.iter().map(|(test, _, _)| *test).collect();
-            assert_eq!(tests, [TestId::NcclAllReduce, TestId::NcclAllGather]);
-            for (_, scope, outcome) in &outcomes {
-                assert_eq!(*scope, Scope::Node);
-                let TestOutcome::Skipped { reason } = outcome else {
-                    panic!("expected Skipped, got {outcome:?}");
-                };
-                assert!(reason.contains("at least 2 ranks"), "{reason}");
-                assert!(reason.contains(&format!("found {world_size}")), "{reason}");
-            }
+    fn inter_node_sweeps_spawn_under_the_fleet_level() {
+        // rank_per_node and every rail ride the same fabric with the same
+        // fleet-level knobs: no level of their own.
+        use crate::nccl_level::NcclLevel;
+        use crate::proto::SweepSeries;
+        for series in [SweepSeries::RankPerNode, SweepSeries::Rail { rail: 3 }] {
+            let sweep = NcclJob {
+                workload: NcclWorkload::Sweep {
+                    sizes: vec![1024],
+                    iters_per_size: 1,
+                    barrier: None,
+                    series,
+                },
+            };
+            assert_eq!(
+                sweep.spawn_env(),
+                AgentEnv::Nccl(NcclLevel::Fleet),
+                "{series}"
+            );
         }
-    }
-
-    #[test]
-    fn two_ranks_run_the_sweep_even_on_one_host() {
-        // A single host with two GPUs is a real two-rank world.
-        assert!(sweep_gate(2).is_none());
-        assert!(sweep_gate(16).is_none());
     }
 
     #[test]

@@ -80,7 +80,11 @@ Non-scope:
      nothing. Level from `NcclWorkload::level()`, span
      `CommSpan::from_world(block count, world size)` (one host owns one
      contiguous block, so the world spans hosts exactly when it is larger
-     than the block).
+     than the block). The NIC-forcing sweep shapes (`tests.nccl_world`,
+     proto v12) are `fleet` level too: a rank-per-node world and every
+     rail is a block of one rank in a multi-host world, so each reports
+     `MultiHost` — one report per rail, per host, since rails run as
+     separate jobs.
    - `agent run` network phase (intra-node sweep): `ncclCommInitAll`
      through the sweep loop; `Intranode`, single host.
    - `agent run` overlap phase: `ncclCommInitAll` through the warmup

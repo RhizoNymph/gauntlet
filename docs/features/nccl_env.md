@@ -121,8 +121,12 @@ with different envs:
   whatever env it was started with; the orchestrator never does that.
 - `agent nccl`: the barrier probe historically rides the fleet sweep's
   communicator (`NcclWorkload::Sweep { barrier }`). When the barrier and
-  fleet effective envs are identical (`barrier_shares_fleet_comm`) it
-  still does. When they differ, the orchestrator splits the spawn: the
+  fleet effective envs are identical (`barrier_shares_fleet_comm`) and
+  the sweep runs the rank-per-GPU world shape it still does. When they
+  differ (or, proto v12, the sweep runs a NIC-forcing world shape —
+  docs/features/phase3_network.md "World shapes"; the barrier then runs
+  on the rank-per-GPU world without hosts the sweep blamed), the
+  orchestrator splits the spawn: the
   sweep runs without the probe, then a second fleet job runs
   `NcclWorkload::Barrier(spec)` on its own communicator (same rank
   layout) under the barrier env (`BarrierPlacement` in
@@ -307,8 +311,11 @@ baseline diff compares it.
   ssh, Arc<NcclLevelEnvs>)`, `spawn_env_words`, `agent_env_words`,
   `nccl_env_words`, the three spawn paths (`run_agent` takes an
   `AgentEnv`; `run_agent_capture` and `spawn_agent` are always `Base`).
-- `src/orchestrator/nccl/mod.rs` — `NcclJob::spawn_env`,
-  `BarrierPlacement` (barrier on the sweep communicator vs its own world).
+- `src/orchestrator/nccl/mod.rs` — `NcclJob::spawn_env` (every sweep
+  shape, inter-node included, is the `fleet` level).
+- `src/orchestrator/nccl/barrier_job.rs` — `BarrierPlacement` (barrier
+  on the sweep communicator vs its own world: env rule `new` plus
+  shape rule `in_shape`).
 - `src/proto/mod.rs` — `Phase::nccl_level`, `NcclWorkload::{Barrier,
   level}`; PROTO_VERSION 11.
 - `src/agent/nccl/` — runs `NcclWorkload::Barrier` (`sweep::run_barrier`).

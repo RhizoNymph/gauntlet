@@ -257,6 +257,7 @@ fn every_nccl_call_site_maps_to_one_level() {
         sizes: vec![1024],
         iters_per_size: 1,
         barrier: Some(barrier),
+        series: gauntlet::proto::SweepSeries::RankPerGpu,
     };
     assert_eq!(sweep.level(), NcclLevel::Fleet);
     assert_eq!(NcclWorkload::Barrier(barrier).level(), NcclLevel::Barrier);

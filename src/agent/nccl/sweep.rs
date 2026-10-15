@@ -7,9 +7,14 @@
 //! (grouped, once per local rank) and its timer (global rank 0's stream).
 //! Sweep timing comes from global rank 0 only: the host holding it times
 //! each size until *its* stream (local rank 0 = global rank 0) completes
-//! and emits the measurements; every other host runs silently. The
+//! and emits the measurements (per size as measured, then the fleet-level
+//! headline, `super::headline`); every other host runs silently. The
+//! workload's `SweepSeries` decides the test ids and headline name. The
 //! barrier probe times every local rank separately and reports one
-//! `NcclBarrierTimings` per rank.
+//! `NcclBarrierTimings` per rank; it rides the sweep, or runs alone on its
+//! own rank-per-GPU communicator (`run_barrier`, `NcclWorkload::Barrier`)
+//! when the orchestrator's `BarrierPlacement` says so (a different barrier
+//! env, or a sweep in a NIC-forcing world shape).
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -20,12 +25,21 @@ use cudarc::driver::{CudaSlice, CudaStream};
 use cudarc::nccl::ReduceOp;
 
 use super::F32_BYTES;
+use super::headline::{fleet_headline, series_opener};
 use super::local::{LocalRanks, PreparedRanks};
 use crate::agent::EventSink;
 use crate::agent::sweep::{
     self, Collective, SweepCollectives, SweepLevel, SweepPlan, SweepStep, point_records, run_plan,
 };
-use crate::proto::{AgentEvent, BarrierSpec};
+use crate::proto::{AgentEvent, BarrierSpec, SweepSeries};
+
+/// One sweep workload's parameters, as the directive carried them.
+pub(super) struct SweepRun<'a> {
+    pub sizes: &'a [u64],
+    pub iters_per_size: u32,
+    pub barrier: Option<BarrierSpec>,
+    pub series: SweepSeries,
+}
 
 /// Untimed iterations before the barrier probe and the fleet overlap
 /// windows, so channel setup and algorithm selection stay out of the
@@ -132,13 +146,18 @@ pub(super) fn run_sweep(
     sink: &EventSink,
     ranks: &LocalRanks,
     buffers: SweepBuffers,
-    sizes: &[u64],
-    iters_per_size: u32,
-    barrier: Option<BarrierSpec>,
+    run: SweepRun<'_>,
 ) -> Result<()> {
+    let SweepRun {
+        sizes,
+        iters_per_size,
+        barrier,
+        series,
+    } = run;
     let emit_sweep = ranks.assignment().block().holds_lead();
     let world_size = ranks.world_size();
     let world = NonZeroU32::new(world_size).context("fleet world size must be at least 1")?;
+    let level = SweepLevel::fleet(series);
     let plan = SweepPlan::new(sizes, world);
     let SweepBuffers {
         mut buffers,
@@ -152,6 +171,12 @@ pub(super) fn run_sweep(
 
     // Only the host holding global rank 0 emits; every other host runs the
     // same collectives silently.
+    if emit_sweep {
+        for record in series_opener(series, world_size) {
+            sink.metric(record);
+        }
+    }
+    let mut points = Vec::with_capacity(plan.steps().len());
     run_plan(
         &mut RankBlockCollectives {
             ranks,
@@ -161,12 +186,16 @@ pub(super) fn run_sweep(
         iters_per_size,
         |point| {
             if emit_sweep {
-                for record in point_records(SweepLevel::Fleet, point, world_size) {
+                for record in point_records(level, point, world_size) {
                     sink.metric(record);
                 }
+                points.push(*point);
             }
         },
     )?;
+    for record in fleet_headline(&points, series, world_size) {
+        sink.metric(record);
+    }
 
     if let Some(spec) = barrier {
         barrier_probe(sink, ranks, &mut buffers, max_elements, spec)?;
