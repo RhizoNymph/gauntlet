@@ -118,9 +118,12 @@ Non-scope:
    decision. It yields one `SocketFallback { level, ifaces }` per (host,
    level), however many repeats saw it, when all of these hold:
    - the report is `MultiHost` and its captured network is `Socket`;
-   - the host's phase-0 inventory shows at least one IB/RoCE port in state
-     ACTIVE (`IbAvailability::of` == `ActivePort`). Without one, sockets
-     are the only transport the host has, not a fallback;
+   - the host's phase-0 inventory shows at least one usable IB/RoCE port
+     (`IbAvailability::of` == `ActivePort`): logical state ACTIVE with an
+     InfiniBand or Ethernet link layer, `IbPortInventory::nccl_usable`, the
+     same predicate the predicted view (`nccl_nics`,
+     docs/features/nccl_nics.md) uses. Without one, sockets are the only
+     transport the host has, not a fallback;
    - the level's recorded effective env does not make sockets deliberate
      (`socket_is_deliberate`: NCCL_IB_DISABLE a non-zero integer, or
      NCCL_NET=Socket, case-insensitive).

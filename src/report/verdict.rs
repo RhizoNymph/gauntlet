@@ -135,6 +135,12 @@ pub const fn failed_outcome_tier(test: TestId) -> EvidenceTier {
         | TestId::OverlapFleetGemm
         | TestId::OverlapFleetAllReduce
         | TestId::OverlapRetention => EvidenceTier::Hard,
+        // A predicted socket fallback: the host has IB/RoCE ports but
+        // NCCL's IB scan would select none of them under the fleet-level
+        // env. Hard, consistent with the observed fallback
+        // (`fleet.socket_fallbacks`). Skipped (no ports, NCCL_NET=Socket,
+        // NCCL_IB_DISABLE) never reaches this.
+        TestId::NcclNics => EvidenceTier::Hard,
     }
 }
 

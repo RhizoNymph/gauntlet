@@ -120,6 +120,7 @@ mod tests {
             gpus: vec![],
             nics: vec![],
             ib_ports: vec![],
+            ib_devices: Vec::new(),
             xid_errors: vec![],
             gpu_libs: libs
                 .iter()

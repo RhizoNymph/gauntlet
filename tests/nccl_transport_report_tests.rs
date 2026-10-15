@@ -73,7 +73,8 @@ fn inventory_with_active_ib() -> gauntlet::proto::InventorySnapshot {
         "clock_offset_ms": null, "nvidia_driver": null, "cuda_version": null,
         "gpus": [], "nics": [], "xid_errors": [],
         "ib_ports": [{"device": "mlx5_0", "port": 1, "state": "ACTIVE",
-                      "rate_gbps": 200.0, "link_downed_count": 0}]
+                      "rate_gbps": 200.0, "link_downed_count": 0,
+                      "link_layer": {"kind": "infiniband"}}]
     }))
     .expect("inventory")
 }

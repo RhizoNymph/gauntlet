@@ -261,7 +261,7 @@ fn pre_v15_documents_decode_without_a_verdict() {
 
 #[test]
 fn schema_version_is_bumped_for_the_verdict_field() {
-    const { assert!(report::SCHEMA_VERSION == 15) };
+    const { assert!(report::SCHEMA_VERSION >= 15) };
 }
 
 #[test]

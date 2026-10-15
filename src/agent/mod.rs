@@ -15,12 +15,15 @@ pub mod counters;
 pub mod cpu;
 pub mod disk;
 pub mod gpu_occupancy;
+pub mod ib;
 pub mod intranode;
 pub mod inventory;
 pub mod mem;
 pub mod nccl;
 pub mod net;
+pub mod pci;
 pub mod sweep;
+pub mod sysfs;
 // Its callers are gpu-gated; the pure parts are tested everywhere.
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 pub mod transport;

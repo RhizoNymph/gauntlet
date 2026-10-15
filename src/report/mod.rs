@@ -5,11 +5,13 @@
 //! bump SCHEMA_VERSION. The terminal table is a projection of it, never a
 //! second source of truth.
 
+mod consistency;
 mod fleet_nccl;
 pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
 pub mod nccl_env;
+pub mod nccl_nics;
 pub mod nccl_transport;
 mod verdict;
 
@@ -31,9 +33,12 @@ use crate::nccl_env::NcclEnv;
 use crate::nccl_level::NcclLevelEnvs;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
-    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
-    consistency_fields, nccl_metric, overlap_metric,
+    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit, nccl_metric,
+    overlap_metric,
 };
+// The majority vote's unit tests live with the rest of this module's tests.
+#[cfg(test)]
+use consistency::majority;
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
@@ -113,7 +118,21 @@ use crate::proto::{
 // `gauntlet_version` (crate version plus build-time git revision of the
 // producing binary). Both serde-defaulted: pre-v15 documents decode with
 // them null, and `report::verdict` classifies them.
-pub const SCHEMA_VERSION: u32 = 15;
+// v16: InfiniBand inventory and the NCCL NIC ceiling — inventory IB ports
+// carry a typed `rate` (known / unparseable with its error / unreadable;
+// replaces `rate_gbps`), `link_layer`, `phys_state` and `netdevs`;
+// inventories list `ib_devices` (PCI placement) and GPUs their `pci`
+// placement. `hosts.*.nccl_nics` records, per host, the IB/RoCE ports NCCL
+// would use under the run's fleet-level NCCL_NET / NCCL_IB_DISABLE /
+// NCCL_IB_HCA (selected and excluded ports with the reason, plus those env
+// inputs); hosts gain a node-scope `nccl_nics` outcome (Failed — a
+// predicted socket fallback, hard evidence like `fleet.socket_fallbacks` —
+// when IB/RoCE ports exist but none is selected) and the
+// `nccl_nics.ceiling_gib_per_sec` metric; consistency gains
+// nccl_ib_ports / nccl_ib_link_layer / nccl_ib_ceiling_gbps.
+// Serde-defaulted: pre-v16 documents decode with no summaries and a bare
+// `rate_gbps` lifted into `rate`.
+pub const SCHEMA_VERSION: u32 = 16;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -315,6 +334,7 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::OverlapFleetGemm => "overlap_fleet_gemm",
         TestId::OverlapFleetAllReduce => "overlap_fleet_all_reduce",
         TestId::OverlapRetention => "overlap_retention",
+        TestId::NcclNics => "nccl_nics",
     }
 }
 
@@ -449,7 +469,7 @@ pub fn build(
     let fleet = FleetAnalysis {
         outliers,
         threshold_violations,
-        consistency: consistency_findings(&observations),
+        consistency: consistency::findings(&observations),
         failed_hosts,
         jitter_outliers,
         sdc_failures: sdc_failures(&observations),
@@ -814,61 +834,6 @@ fn violates(bound: &Bound, value: f64) -> bool {
     bound.min.is_some_and(|min| value < min) || bound.max.is_some_and(|max| value > max)
 }
 
-/// Majority vote over `proto::consistency_fields`; only fields with at least
-/// one dissenter are reported.
-fn consistency_findings(
-    observations: &BTreeMap<String, HostObservations>,
-) -> BTreeMap<String, ConsistencyFinding> {
-    let mut by_field: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (host, obs) in observations {
-        let Some(inventory) = &obs.inventory else {
-            continue;
-        };
-        for (field, value) in consistency_fields(inventory) {
-            by_field
-                .entry(field)
-                .or_default()
-                .insert(host.clone(), value);
-        }
-    }
-
-    let mut findings = BTreeMap::new();
-    for (field, values) in by_field {
-        let Some(majority_value) = majority(&values) else {
-            continue;
-        };
-        let dissenters: BTreeMap<String, String> = values
-            .into_iter()
-            .filter(|(_, value)| *value != majority_value)
-            .collect();
-        if !dissenters.is_empty() {
-            findings.insert(
-                field,
-                ConsistencyFinding {
-                    majority_value,
-                    dissenters,
-                },
-            );
-        }
-    }
-    findings
-}
-
-/// Most common value; ties broken by the lexicographically smallest value so
-/// the result never depends on map iteration luck.
-fn majority(values: &BTreeMap<String, String>) -> Option<String> {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for value in values.values() {
-        *counts.entry(value.as_str()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .min_by(|(a_value, a_count), (b_value, b_count)| {
-            b_count.cmp(a_count).then_with(|| a_value.cmp(b_value))
-        })
-        .map(|(value, _)| value.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Calibration
 // ---------------------------------------------------------------------------
@@ -1107,6 +1072,7 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     render_hosts(results, out)?;
     render_sdc(results, out)?;
     gpu_idle::render(results, out)?;
+    nccl_nics::render(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
     render_barrier_stragglers(results, out)?;

@@ -67,6 +67,7 @@ fn inventory(hostname: &str, kernel: &str) -> InventorySnapshot {
         gpus: Vec::new(),
         nics: Vec::new(),
         ib_ports: Vec::new(),
+        ib_devices: Vec::new(),
         xid_errors: Vec::new(),
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: None,

@@ -67,7 +67,16 @@ Overview:
     the config does not set; after its workload the agent parses that
     NCCL INFO log and emits an `nccl_transport` event (network transport,
     plugin, HCAs, peer channels) -> hosts.*.nccl_transports ->
-    fleet.socket_fallbacks.
+    fleet.socket_fallbacks (the observed fallback). The fleet level's env
+    also decides, orchestrator-side, which inventoried IB/RoCE ports NCCL
+    would use (the predicted view): every arriving inventory goes through
+    orchestrator::derive::derive_inventory_events (gpu_idle outcomes;
+    nccl_nics outcome + ceiling metric + NcclNics summary), which the
+    collector records like agent events (hosts.*.nccl_nics).
+    report::build only reads those results (consistency fields, the "nccl
+    nics" section) and never re-derives. Both views share one definition
+    of a usable port (IbPortInventory::nccl_usable). Agents report sysfs
+    facts only.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -94,9 +103,13 @@ Features Index:
       Inventory and sanity: kernel/driver/CUDA/NIC-firmware/MTU/governor/NUMA
       inventory; fleet consistency check (flag nodes differing from majority);
       GPU health counters (ECC, row remaps, dmesg Xid, PCIe link gen/width,
-      NVLink status/errors); IB port state; clock sync offset; per-GPU
-      occupancy (memory used/total, compute processes by bus id).
-    entry_points: [agent/inventory.rs, agent/gpu_occupancy.rs]
+      NVLink status/errors); IB devices and ports (state, phys state,
+      typed rate (known / unparseable with its error / unreadable), link
+      layer + RoCE versions, bound netdevs (GID-table ndevs for RoCE),
+      PCI address/NUMA node/upstream bridges from the innermost host
+      bridge; proto v13) and GPU PCI placement; clock sync offset;
+      per-GPU occupancy (memory used/total, compute processes by bus id).
+    entry_points: [agent/inventory.rs, agent/ib.rs, agent/pci.rs, agent/sysfs.rs, agent/gpu_occupancy.rs]
     depends_on: []
     doc: docs/features/phase0_inventory.md
   gpu_idle:
@@ -248,6 +261,36 @@ Features Index:
     entry_points: [nccl_env.rs, nccl_level.rs, config.rs, orchestrator/session.rs, orchestrator/nccl/mod.rs, report/nccl_env.rs]
     depends_on: [phase3_network, overlap_phase]
     doc: docs/features/nccl_env.md
+  nccl_nics:
+    description: >
+      Which IB/RoCE ports NCCL would use (proto v13 / schema v16). It is
+      a pure replay of NCCL's IB device scan over a host's inventory
+      under the run's fleet-level resolved env (the multi-host
+      communicator's), applied in order:
+      - NCCL_NET (Socket forces sockets; a plugin is recorded but not
+        modelled);
+      - NCCL_IB_DISABLE (C strtoll base 0, as ncclLoadParam reads it);
+      - ACTIVE state and an IB/Ethernet link layer;
+      - NCCL_IB_HCA (`^` exclude, `=` exact, comma list, dev:port,
+        prefix match by default; HcaFilter).
+      The single inventory-derivation hook
+      (orchestrator::derive::derive_inventory_events, shared with
+      gpu_idle) records three things per host:
+      - a Node-scope `nccl_nics` outcome, Failed when usable ports exist
+        but none is selected (a predicted socket fallback; hard evidence,
+        verdict Failures, like the observed `fleet.socket_fallbacks`,
+        with which it shares IbPortInventory::nccl_usable);
+      - the fleet-comparable `nccl_nics.ceiling_gib_per_sec` metric, the
+        summed encoding-corrected line rate of the selected ports;
+      - the NcclNicSummary in `hosts.*.nccl_nics`: env inputs,
+        selected/excluded ports, typed rates (unparseable ones carry
+        their error), and GPU<->NIC PCI locality.
+      The report reads these and adds the nccl_ib_ports,
+      nccl_ib_link_layer and nccl_ib_ceiling_gbps consistency fields
+      (report/consistency.rs) and a "nccl nics" section.
+    entry_points: [nccl_ib/mod.rs, nccl_ib/hca.rs, proto/nccl_nics.rs, proto/ib.rs, orchestrator/derive.rs, report/consistency.rs, report/nccl_nics.rs]
+    depends_on: [phase0_inventory, nccl_env]
+    doc: docs/features/nccl_nics.md
   nccl_transport:
     description: >
       Transport capture (proto v11 / schema v13): NCCL-hosting processes
@@ -319,8 +362,8 @@ Features Index:
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport]
+    entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, report/consistency.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport, nccl_nics]
     doc: docs/features/reporting.md
   viewer:
     description: >

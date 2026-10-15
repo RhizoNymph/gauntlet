@@ -61,6 +61,7 @@ mod tests {
             nvlinks_active: None,
             persistence_mode: Some(true),
             occupancy,
+            pci: None,
         }
     }
 
@@ -87,6 +88,7 @@ mod tests {
             gpus,
             nics: Vec::new(),
             ib_ports: Vec::new(),
+            ib_devices: Vec::new(),
             xid_errors: Vec::new(),
             gpu_libs: BTreeMap::new(),
             cuda_visible_gpus: None,

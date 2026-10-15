@@ -19,6 +19,7 @@ mod barrier;
 pub mod bootstrap;
 pub mod collect;
 pub mod deploy;
+pub mod derive;
 mod intranode;
 mod nccl;
 mod nccl_shim;
@@ -50,9 +51,10 @@ use crate::nccl_level::NcclLevelEnvs;
 use crate::net_steps::{NetStep, NetSteps, disabled_outcomes};
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
-    TestId, Unit, gpu_idle_outcomes,
+    TestId, Unit,
 };
 use crate::report;
+use derive::{InventoryDerivation, derive_inventory_events};
 
 /// How long the orchestrator waits for a peer to acknowledge a graceful
 /// shutdown before falling back to killing it remotely.
@@ -491,7 +493,7 @@ async fn node_phase(
         }
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
-    let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
+    let derivation = Arc::new(InventoryDerivation::from_config(config));
     // One phase per spawn, so the process hosts at most one NCCL level
     // (network: the intra-node sweep; overlap: the node-local overlap).
     let env = phase.nccl_level().map_or(AgentEnv::Base, AgentEnv::Nccl);
@@ -501,33 +503,26 @@ async fn node_phase(
         let session = Arc::clone(session);
         let sink = sink.clone();
         let document = document.clone();
+        let derivation = Arc::clone(&derivation);
         tasks.spawn(async move {
             let addr = session.addr().to_string();
             let mut inventory = None;
             let outcome = tokio::time::timeout(
                 timeout,
                 session.run_agent(env, &["run"], Some(document), |event| {
-                    // gpu_idle is derived here, as the snapshot arrives: the
-                    // threshold is orchestrator config, the agent reports
-                    // facts only. One outcome per GPU, right behind the
-                    // inventory it judges.
-                    let gpu_idle = match &event {
+                    // Inventory-derived tests (gpu_idle, nccl_nics) need
+                    // orchestrator config; they follow the snapshot they
+                    // judge through the same sink (`derive`).
+                    let derived = match &event {
                         AgentEvent::Inventory { snapshot } => {
                             inventory = Some(snapshot.clone());
-                            gpu_idle_outcomes(snapshot, gpu_idle_max_used_mib)
+                            derive_inventory_events(snapshot, &derivation)
                         }
                         _ => Vec::new(),
                     };
                     sink.event(&addr, event);
-                    for (scope, outcome) in gpu_idle {
-                        sink.event(
-                            &addr,
-                            AgentEvent::Outcome {
-                                test: TestId::GpuIdle,
-                                scope,
-                                outcome,
-                            },
-                        );
+                    for event in derived {
+                        sink.event(&addr, event);
                     }
                 }),
             )

@@ -22,6 +22,7 @@ use crate::nccl_transport::{
     socket_is_deliberate,
 };
 use crate::orchestrator::collect::HostObservations;
+use crate::proto::IbPortInventory;
 
 /// A multi-host communicator at `level` that fell back to TCP sockets on a
 /// host whose level env did not disable IB.
@@ -58,9 +59,11 @@ impl SocketFallback {
 /// *fallback* on a host that had a usable port to fall back from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IbAvailability {
-    /// At least one port reported state ACTIVE.
+    /// At least one port NCCL's IB transport can use: state ACTIVE with an
+    /// InfiniBand or Ethernet (RoCE) link layer
+    /// (`IbPortInventory::nccl_usable`).
     ActivePort,
-    /// Ports absent, or none ACTIVE: sockets are the only transport.
+    /// Ports absent, or none usable: sockets are the only transport.
     NoActivePort,
     /// No inventory, but NCCL itself logged `NET/IB : No device found` while
     /// the level's env did not restrict NCCL_IB_HCA: no IB device exists.
@@ -91,12 +94,10 @@ impl IbAvailability {
                 IbAvailability::NoDeviceSeenByNccl
             }
             None => IbAvailability::Unknown,
-            Some(inventory)
-                if inventory
-                    .ib_ports
-                    .iter()
-                    .any(|port| port.state.trim().eq_ignore_ascii_case("ACTIVE")) =>
-            {
+            // The same "usable port" the NIC-selection model uses (ACTIVE,
+            // InfiniBand or Ethernet link layer), so the observed fallback
+            // and the predicted one (`nccl_nics`) cannot disagree.
+            Some(inventory) if inventory.ib_ports.iter().any(IbPortInventory::nccl_usable) => {
                 IbAvailability::ActivePort
             }
             Some(_) => IbAvailability::NoActivePort,
@@ -271,8 +272,15 @@ mod tests {
                 device: format!("mlx5_{index}"),
                 port: 1,
                 state: state.to_string(),
-                rate_gbps: Some(200.0),
+                rate: crate::proto::PortRate::Known {
+                    gbps: 200.0,
+                    lanes: None,
+                    speed: None,
+                },
                 link_downed_count: None,
+                link_layer: crate::proto::LinkLayer::Infiniband,
+                phys_state: Default::default(),
+                netdevs: Vec::new(),
             })
             .collect();
         inventory
