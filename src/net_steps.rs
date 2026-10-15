@@ -24,7 +24,8 @@ pub enum NetStep {
     Intranode,
     /// Pairwise TCP latency + bandwidth mesh (tournament rounds).
     Pairwise,
-    /// Fleet-wide NCCL sweep (one rank per GPU across hosts).
+    /// Fleet-wide NCCL sweep in every configured world shape
+    /// (`tests.nccl_world`: rank-per-GPU, rank-per-node, per-rail).
     Nccl,
     /// Barrier-skew probes: the NCCL barrier (rides the fleet NCCL sweep's
     /// communicator, so it also needs `Nccl`) and the TCP star barrier.
@@ -73,7 +74,14 @@ impl NetStep {
         match self {
             NetStep::Intranode => &[TestId::NcclIntraAllReduce, TestId::NcclIntraAllGather],
             NetStep::Pairwise => &[TestId::NetLatency, TestId::NetBandwidth],
-            NetStep::Nccl => &[TestId::NcclAllReduce, TestId::NcclAllGather],
+            // Every world shape's series (`SweepSeries::all_fleet_tests`):
+            // the step covers rank-per-GPU, rank-per-node and per-rail.
+            NetStep::Nccl => &[
+                TestId::NcclAllReduce,
+                TestId::NcclAllGather,
+                TestId::NcclInterAllReduce,
+                TestId::NcclInterAllGather,
+            ],
             NetStep::Barrier => &[TestId::NcclBarrier, TestId::TcpBarrier],
         }
     }
@@ -159,6 +167,14 @@ mod tests {
                     .any(|(alias, target)| *alias == step.name() && *target == step)
             );
         }
+    }
+
+    #[test]
+    fn the_nccl_step_covers_every_world_shape() {
+        assert_eq!(
+            NetStep::Nccl.tests(),
+            crate::proto::SweepSeries::all_fleet_tests().as_slice()
+        );
     }
 
     #[test]

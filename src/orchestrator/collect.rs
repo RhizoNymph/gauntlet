@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use tracing::{debug, error, info, warn};
 
+use crate::nccl_transport::NcclTransportReport;
 use crate::proto::{
     AgentEvent, CounterDeltas, InventorySnapshot, LogLevel, MetricRecord, Scope, TestId,
     TestOutcome,
@@ -27,6 +28,11 @@ pub struct HostObservations {
     /// Absent when the run had no load phases or the delta pass failed.
     #[serde(default)]
     pub counter_deltas: Option<CounterDeltas>,
+    /// The transports each NCCL-hosting agent process's communicator used
+    /// (one per process: level, span, capture), in arrival order across
+    /// repeats.
+    #[serde(default)]
+    pub nccl_transports: Vec<NcclTransportReport>,
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +103,9 @@ impl Collector {
             }
             AgentEvent::CounterDeltas { deltas } => {
                 host.counter_deltas = Some(*deltas);
+            }
+            AgentEvent::NcclTransport { report } => {
+                host.nccl_transports.push(*report);
             }
             AgentEvent::Fatal { message } => {
                 error!(host = host_addr, message, "agent fatal");

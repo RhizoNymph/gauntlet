@@ -4,6 +4,7 @@
 //! tested against a real `sh`.
 
 use super::{shell_path, single_quote};
+use crate::nccl_transport::debug::LOG_DIR;
 use crate::remote_dir::{RemoteDir, RemoteDirPart};
 
 /// Upload file mode, applied before the rename so the destination is
@@ -85,6 +86,9 @@ pub(super) fn remote_dir_word(remote_dir: &RemoteDir) -> String {
 ///   so the directory must be owned by the login user (`[ -O . ]` after
 ///   `cd`), and when the last component is a symlink, the link itself must
 ///   be the user's too (`find -user` does not follow it).
+/// - `LOG_DIR` (`nccl-logs`, the NCCL INFO logs transport capture parses)
+///   is created inside the checked directory: NCCL cannot create
+///   directories, so it must exist before any spawn.
 /// - The path printed — and later used for every upload and exec — is
 ///   `pwd -P`, the directory that was checked, not a logical path whose
 ///   symlinks could be repointed afterwards.
@@ -98,7 +102,9 @@ pub(super) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
          echo \"remote_dir $d is a symlink not owned by $(id -un)\" >&2; exit 1; fi; \
          cd \"$d\" || exit 1; \
          [ -O . ] || {{ echo \"remote_dir $(pwd -P) is not owned by $(id -un)\" >&2; exit 1; }}; \
-         pwd -P"
+         mkdir -p {log_dir} || exit 1; \
+         pwd -P",
+        log_dir = single_quote(LOG_DIR),
     )
 }
 
@@ -211,6 +217,8 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        // The NCCL log directory exists before any agent spawn.
+        assert!(expected.join(LOG_DIR).is_dir());
         // Idempotent: a second resolve of the existing, owned dir succeeds.
         assert!(sh(&remote_dir_script(&dir), &base).status.success());
         std::fs::remove_dir_all(&base).expect("cleanup");
@@ -252,6 +260,30 @@ mod tests {
                 "{spelled}"
             );
         }
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn nccl_debug_logs_land_in_the_checked_physical_directory() {
+        // HostSession builds every level's NCCL_DEBUG_FILE from the path
+        // this script prints: through a symlinked remote_dir it must point
+        // into the physical directory, whose nccl-logs/ already exists.
+        let base = scratch("nccllogs");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("real");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let dir = RemoteDir::parse(link.to_str().expect("utf8")).expect("valid");
+        let output = sh(&remote_dir_script(&dir), &base);
+        assert!(output.status.success(), "{output:?}");
+        let resolved = String::from_utf8(output.stdout).expect("utf8");
+        let log = crate::nccl_transport::debug::managed_log_path(
+            resolved.trim(),
+            crate::nccl_level::NcclLevel::Fleet,
+        );
+        let log_dir = std::path::Path::new(&log).parent().expect("parent");
+        assert!(log_dir.is_dir(), "{log}");
+        assert!(log.starts_with(real.canonicalize().expect("real").to_str().expect("utf8")));
         std::fs::remove_dir_all(&base).expect("cleanup");
     }
 

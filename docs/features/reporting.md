@@ -25,7 +25,8 @@ started, finished)`:
 5. Rooflines per host (min across the host's GPUs for GPU metrics; the
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()` classifies the document (see "Verdict and exit codes");
-   `build` records it as `RunResults.verdict`.
+   `RunResults::finalize` records it as `RunResults.verdict` on the final
+   document only.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
 over a timestamp and the host set (deterministic, no rand dep). Two seeds
@@ -63,6 +64,21 @@ value per node, so they *are* fleet comparisons — the peak is the
 intra-node straggler headline. Its name carries the GPU count, so nodes
 are only compared within their own topology (the same keying as the
 `_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
+
+Fleet-level groups (schema v14) are the opposite case: one value per
+*run*, attributed to a lead host at node scope —
+`nccl_all_{reduce,gather}.bus_gib_per_sec_peak`,
+`nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak` (rank-per-node),
+`..._peak_rail<r>` and `..._peak_min_rail` (per-rail: per rail, and the
+worst rail's peak), the inter-node `ranks`, and the barrier probes'
+`{nccl,tcp}_barrier.fleet_span_*`. One place in `report::fleet_nccl`
+(`fleet_level_families`: test + metric-name prefix, the sweep test ids
+derived from `SweepSeries`) lists them all. They have no fleet peers, so
+`is_fleet_level` excludes
+them from the outlier and jitter passes by rule (a one-subject MAD group
+is degenerate: MAD 0, the subject is its own median). They still
+aggregate — moments across `--repeat` are the run-to-run jitter of the
+fleet number — and absolute thresholds check their median.
 
 ## Statistics contracts (stats.rs)
 - `median`: ignores non-finite; None on empty (after filtering).
@@ -116,6 +132,17 @@ Per-host `NodeRoofline`:
   (distinct mount points are not comparable, so the best is the headline).
 
 `calibration.links`:
+- `nccl_allreduce_inter_node_<n>rank` / `nccl_allgather_inter_node_<n>rank`
+  (schema v14): the `nccl_inter_all_*` series of the NIC-forcing world
+  shapes (`tests.nccl_world = "rank_per_node" | "per_rail"`), keyed by
+  world size like the intra-node `_<n>gpu` classes — rails of a
+  heterogeneous fleet differ in size, and a fit pooled across sizes
+  describes no real link. Each series is opened by the lead's `ranks`
+  record; walking a host's records in emission order, every opener
+  starts a new series of that size (several rails per lead per repeat
+  stay apart), and `msg_bytes`/`elapsed_us` pair by order within it
+  (`report::fleet_nccl::link_fits`, which also owns the rank-per-GPU
+  classes).
 - `nccl_allreduce_rank_per_gpu` / `nccl_allgather_rank_per_gpu` (named
   `nccl_*_fleet` before schema v8; renamed because the world changed
   meaning, see below): within each host's
@@ -190,7 +217,9 @@ tail progress:
 
 ## Files
 `src/analysis/{stats,fit,schedule}.rs`,
-`src/report/{mod,history,intranode,nccl_env,gpu_idle}.rs`,
+`src/report/{mod,history,intranode,nccl_env,nccl_transport,gpu_idle,fleet_nccl}.rs`
+(`fleet_nccl`: `is_fleet_level`, fleet/inter-node `link_fits`; `mod`:
+`mad_groups`),
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
 `src/orchestrator/collect.rs` (`Collector::snapshot`),
 `src/report/verdict.rs` (`Verdict`, `EXIT_ERROR`, `EvidenceTier`,
@@ -218,8 +247,11 @@ tail progress:
   result away from OLS.
 - Outlier grouping never compares across different units, and never
   compares a per-host series against itself.
+- Fleet-level groups (sweep headlines, barrier `fleet_span_*`) never
+  enter the outlier or jitter passes; they always aggregate and always
+  face absolute thresholds.
 
-## Verdict and exit codes (schema v13)
+## Verdict and exit codes (schema v15)
 
 `report::Verdict` (`src/report/verdict.rs`) is a typed enum, serialized
 snake_case in `RunResults.verdict` and mapped one-to-one onto the
@@ -245,7 +277,7 @@ usage error, no usable host, I/O — exits `report::EXIT_ERROR` = 4
 
 `RunResults.verdict` is written only by `RunResults::finalize` on the
 final document. `null` means *no final verdict*: a partial snapshot of a
-run still in flight (`*.partial.json`), or a pre-v13 document (serde
+run still in flight (`*.partial.json`), or a pre-v15 document (serde
 default); `report::verdict` gives a provisional classification of either.
 
 Evidence tiers. Failed outcomes are classified per test by
@@ -260,6 +292,7 @@ input to `verdict()`:
 | Failed outcome of a hard-tier test (correctness, SDC screens, NCCL, intra-node, overlap, inventory visibility, ...) | hard (3) |
 | `fleet.sdc_failures` (derived from Failed outcomes; checked directly too) | hard (3) |
 | `fleet.counter_findings` (error counters that went up under load) | hard (3) |
+| `fleet.socket_fallbacks` (multi-host NCCL communicator on TCP sockets while IB was not disabled) | hard (3) |
 | `fleet.failed_hosts` (Fatal, transport, timeout, deploy) | host failure (2) |
 | Failed `gpu_idle` outcome                          | soft (1)        |
 | `fleet.outliers` (MAD)                             | soft (1)        |
@@ -270,14 +303,19 @@ input to `verdict()`:
 | `Skipped` outcomes                                 | informational   |
 
 Absolute thresholds count as soft: a value under a configured floor is a
-performance finding, not proof that a component is broken. Soft-tier
+performance finding, not proof that a component is broken. A socket
+fallback counts as hard: the fabric NCCL was meant to use is broken or
+invisible on that host (the Bitdeer `NCCL_IB_HCA` failure mode, about
+10x slower), which is a misconfigured or failed node rather than a
+statistical deviation, and it invalidates every NCCL number from that
+communicator. Soft-tier
 findings stay fully visible — the "gpus in use" section and the outcomes
 in the JSON are unchanged; only the exit code tier differs. The terminal
 header prints `verdict: <label> (exit <code>)` (labels: clean, outliers,
 host failures, test failures); the viewer colors outliers warn and both
 failure classes bad.
 
-## Build info (schema v13)
+## Build info (schema v15)
 
 `RunResults.gauntlet_version` records the producing binary — which is
 also the deployed agent (self-deploy, sha256-matched) — as
@@ -366,6 +404,38 @@ loading. `Some(empty)` means an untuned run. The terminal table prints
 `report::nccl_env::nccl_env_drift` lists the keys added, removed or
 changed between two runs, and returns `None` if either run did not record
 its env. The viewer's diff mode uses it.
+
+## Per-level NCCL env and transports (schema v13)
+
+- `RunResults.nccl_level_env: Option<BTreeMap<NcclLevel, BTreeMap<String,
+  String>>>` records the effective env of every NCCL level (`intranode`,
+  `fleet`, `barrier`, `overlap_intranode`, `overlap_fleet`): the global
+  `[nccl]` env with that level's `[nccl.levels.<level>]` override layered
+  on top. `nccl_env` stays the global map. Serde-defaulted; `None` = not
+  recorded (pre-v13). The table prints `nccl env [<level>]: ...` for
+  every level whose env differs from the global one
+  (`nccl_env::format_level_overrides`), and
+  `nccl_env::nccl_level_env_drift` gives the viewer per-level drift
+  beyond the global drift.
+- `hosts.*.nccl_transports: Vec<NcclTransportReport>` — one record per
+  NCCL-hosting process (level, single/multi host, and the parsed
+  transport or why unknown). Serde-defaulted.
+- `fleet.socket_fallbacks: BTreeMap<host, Vec<SocketFallback { level,
+  ifaces }>>` — `report::nccl_transport::socket_fallbacks`: a multi-host
+  communicator whose captured network transport is TCP sockets, on a host
+  whose phase-0 inventory shows at least one ACTIVE IB/RoCE port
+  (`ib_ports`), at a level whose recorded env neither sets
+  NCCL_IB_DISABLE to a non-zero integer nor NCCL_NET=Socket. A host with
+  no IB ports, only inactive ones, or no inventory is never flagged:
+  sockets are then its only transport, not a fallback (an Ethernet-only
+  fleet stays Clean). One entry per (host, level) across repeats;
+  unknown captures never count; the transport record is kept regardless.
+  Any entry is hard evidence: verdict `failures` (exit 3; see "Verdict
+  and exit codes" for why). Serde-defaulted.
+- Terminal: a "nccl transports" section (latest record per host and
+  level: span, network summary or "unknown: <reason>", peer channel
+  counts, NCCL version) and, when any, a "nccl socket fallback" section
+  with one line per finding. See docs/features/nccl_transport.md.
 
 ## Barrier stragglers (schema v6)
 

@@ -126,6 +126,8 @@ pub const fn failed_outcome_tier(test: TestId) -> EvidenceTier {
         | TestId::NcclAllGather
         | TestId::NcclIntraAllReduce
         | TestId::NcclIntraAllGather
+        | TestId::NcclInterAllReduce
+        | TestId::NcclInterAllGather
         | TestId::NcclBarrier
         | TestId::TcpBarrier
         | TestId::OverlapGemm
@@ -143,6 +145,7 @@ pub const fn failed_outcome_tier(test: TestId) -> EvidenceTier {
 /// | Failed outcome, hard-tier test         | hard            |
 /// | `fleet.sdc_failures`                   | hard            |
 /// | `fleet.counter_findings`               | hard            |
+/// | `fleet.socket_fallbacks`               | hard            |
 /// | `fleet.failed_hosts`                   | host failure    |
 /// | Failed outcome, soft-tier test (gpu_idle) | soft         |
 /// | `fleet.outliers` (MAD)                 | soft            |
@@ -173,13 +176,23 @@ fn has_failed_outcome(results: &RunResults, tier: EvidenceTier) -> bool {
     })
 }
 
-/// SDC findings and counter increments. SDC findings are derived from hard
-/// Failed outcomes and checked directly too, so a document is classified
-/// the same way from either view.
+/// SDC findings, counter increments and NCCL socket fallbacks. SDC
+/// findings are derived from hard Failed outcomes and checked directly too,
+/// so a document is classified the same way from either view. A socket
+/// fallback is hard evidence: a multi-host communicator ran on TCP sockets
+/// while the level's env did not disable IB, i.e. the fabric NCCL was
+/// meant to use is broken or invisible on that host (the Bitdeer
+/// `NCCL_IB_HCA` failure mode, ~10x slower) — a misconfigured or failed
+/// node, not a statistical deviation, and it invalidates every NCCL number
+/// from that communicator.
 fn has_hard_findings(fleet: &FleetAnalysis) -> bool {
     fleet.sdc_failures.values().any(|found| !found.is_empty())
         || fleet
             .counter_findings
+            .values()
+            .any(|found| !found.is_empty())
+        || fleet
+            .socket_fallbacks
             .values()
             .any(|found| !found.is_empty())
 }

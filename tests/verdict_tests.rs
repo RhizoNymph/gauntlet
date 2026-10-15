@@ -250,7 +250,7 @@ fn verdict_serializes_as_a_snake_case_string() {
 }
 
 #[test]
-fn pre_v13_documents_decode_without_a_verdict() {
+fn pre_v15_documents_decode_without_a_verdict() {
     let mut json = serde_json::to_value(clean()).expect("serialize");
     json.as_object_mut().expect("object").remove("verdict");
     let back: RunResults = serde_json::from_value(json).expect("decode");
@@ -261,7 +261,7 @@ fn pre_v13_documents_decode_without_a_verdict() {
 
 #[test]
 fn schema_version_is_bumped_for_the_verdict_field() {
-    const { assert!(report::SCHEMA_VERSION == 13) };
+    const { assert!(report::SCHEMA_VERSION == 15) };
 }
 
 #[test]

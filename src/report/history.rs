@@ -134,6 +134,7 @@ mod tests {
             hosts: BTreeMap::new(),
             nccl_env: None,
             verdict: None,
+            nccl_level_env: None,
             fleet: FleetAnalysis::default(),
             calibration: Calibration::default(),
         }

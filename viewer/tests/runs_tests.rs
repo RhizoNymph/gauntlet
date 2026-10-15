@@ -126,6 +126,7 @@ fn results(run_id: &str, started: u64) -> RunResults {
         hosts: BTreeMap::new(),
         nccl_env: None,
         verdict: None,
+        nccl_level_env: None,
         fleet: FleetAnalysis::default(),
         calibration: Calibration::default(),
     }

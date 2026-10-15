@@ -61,7 +61,13 @@ Overview:
     The resolved `[nccl]` env (validated NCCL_* map) is set on the remote
     `env ... gauntlet agent ...` command line of every agent spawn — never
     on the wire, never via set_var in the agent — and recorded run-level
-    in RunResults.nccl_env.
+    in RunResults.nccl_env. A process hosting an NCCL communicator gets
+    its level's effective env instead (global <- `[nccl.levels.<level>]`,
+    recorded in RunResults.nccl_level_env) plus NCCL debug-log variables
+    the config does not set; after its workload the agent parses that
+    NCCL INFO log and emits an `nccl_transport` event (network transport,
+    plugin, HCAs, peer channels) -> hosts.*.nccl_transports ->
+    fleet.socket_fallbacks.
     Shared serde types in a proto module are the contract between orchestrator
     and agent; protocol is versioned and the agent announces its version first.
     The collector task also ticks on a 2s interval, rebuilding the results
@@ -169,18 +175,41 @@ Features Index:
       rest of the world (remote kill), only the culprit is Failed, hosts
       it aborted are Skipped/warned; abandoned agents are always killed
       remotely; per-rank reports are accepted only from the owning host.
+      World shapes (proto v12 / schema v14, tests.nccl_world): the fleet
+      sweep alone can run rank_per_node (one rank per host on GPU 0, every
+      peer on another node: pure inter-node) or per_rail (rail r = GPU r of
+      every host that has one, rails run sequentially), laid out by the
+      pure orchestrator/nccl/shape.rs into RankLayouts whose RankBlocks
+      carry the first local GPU; series land under nccl_inter_all_* and fit
+      nccl_{allreduce,allgather}_inter_node_<n>rank (keyed by world size).
+      Per-rail: a host to blame for one rail is excluded from later rails
+      and the barrier (orchestrator/nccl/rails.rs), and every host records
+      one outcome per test for the whole sweep. The sweep runs only on
+      worlds with >= 2 ranks, and >= 2 hosts while the intra-node sweep
+      runs (Skipped naming the failed condition). Every fleet sweep's lead
+      emits a fleet-level headline: bus_gib_per_sec_peak (rank-per-GPU,
+      rank-per-node), per rail _rail<r> plus the worst-rail
+      bus_gib_per_sec_peak_min_rail — aggregated across repeats and
+      threshold-checked but never MAD-compared (one value per run, no
+      fleet peers; the barrier fleet_span_* follow the same rule).
+      Barrier probe and fleet overlap always stay rank-per-GPU.
       Steps are a typed selection (tests.net_steps / --net-steps:
       intranode, pairwise, nccl, barrier); deselected steps record
       Skipped "disabled by config", so `--net-steps nccl` is a quick
-      NCCL-only check.
-    entry_points: [net_steps.rs, agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs]
+      NCCL-only check. Deselecting nccl drops every world shape, rail
+      and NCCL barrier; deselecting barrier suppresses both NCCL
+      barrier placements and the TCP barrier; the intra-node
+      coverage the one-host gate needs follows the intranode step
+      (orchestrator/network_plan.rs).
+    entry_points: [net_steps.rs, agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/network_plan.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
     depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
   barrier_skew:
     description: >
       Straggler microbenchmark: ~2000 iterations of a tiny collective with
       per-rank timing. NCCL path (tiny all-reduce on the sweep's fleet
-      communicator, one rank per GPU; straggler = min local elapsed, the
+      communicator, one rank per GPU — its own rank-per-GPU job when the
+      sweep runs a NIC-forcing world shape; straggler = min local elapsed, the
       wait-time inversion; a host's ranks share one arrival and are
       tallied as one arrival group, results keyed host:gpuN) plus a
       pure-TCP star-barrier fallback for CPU-only fleets (straggler = max
@@ -206,9 +235,39 @@ Features Index:
       without the multi-threaded agent mutating its environment. Recorded
       run-level in `RunResults.nccl_env`; the viewer's diff mode lists
       drift against the baseline.
-    entry_points: [nccl_env.rs, config.rs, orchestrator/session.rs, report/nccl_env.rs]
+      Per-level overrides (proto v11 / schema v13): `[nccl.levels.<level>]
+      env` layers onto the global map for one NCCL call site (NcclLevel:
+      intranode, fleet, barrier, overlap_intranode, overlap_fleet; mapped
+      from Phase::nccl_level / NcclWorkload::level). Each level has its own
+      agent process (one phase per `agent run`; the barrier probe moves to
+      its own communicator when its env differs from the fleet's or the
+      sweep runs a NIC-forcing world shape), so the
+      orchestrator starts each with its level's env (`AgentEnv::Nccl`).
+      Effective envs recorded in `RunResults.nccl_level_env`; per-level
+      drift in the viewer.
+    entry_points: [nccl_env.rs, nccl_level.rs, config.rs, orchestrator/session.rs, orchestrator/nccl/mod.rs, report/nccl_env.rs]
     depends_on: [phase3_network, overlap_phase]
     doc: docs/features/nccl_env.md
+  nccl_transport:
+    description: >
+      Transport capture (proto v11 / schema v13): NCCL-hosting processes
+      are started with NCCL_DEBUG=INFO, NCCL_DEBUG_SUBSYS=INIT,NET and a
+      per-host/level NCCL_DEBUG_FILE (never overriding config values; a
+      config NCCL_DEBUG below INFO, or a subsys mask without INIT, adds
+      nothing and records "unknown"). The agent clears the log path before
+      NCCL starts and, on every exit after its first NCCL call (init
+      failures included), parses the log (pure parser, NCCL 2.18-2.30
+      fixtures) into one `nccl_transport` event: network transport
+      (IB/RoCE ports, socket interfaces, net plugin), peer channel counts
+      (P2P/SHM/NET/GDR/COLLNET), NCCL version. A multi-host communicator on
+      TCP sockets, on a host whose inventory shows an ACTIVE IB/RoCE port,
+      without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env, is a
+      `fleet.socket_fallbacks` finding (hard evidence: verdict Failures); Ethernet-only
+      hosts are never flagged. The table shows a "nccl transports"
+      section.
+    entry_points: [nccl_transport/, agent/transport.rs, orchestrator/session.rs, report/nccl_transport.rs]
+    depends_on: [nccl_env, phase3_network, overlap_phase]
+    doc: docs/features/nccl_transport.md
   overlap_phase:
     description: >
       Combined-load straggler tests, run last. Node-local step: sustained
@@ -251,7 +310,7 @@ Features Index:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
       overlay, run history, terminal table, typed verdict + exit codes
-      (schema v13, monotonic in severity: 0 clean, 1 outliers/soft
+      (schema v15, monotonic in severity: 0 clean, 1 outliers/soft
       incl. gpu_idle, 2 host failures, 3 hard evidence; 4 = error before
       any verdict, CLI usage errors included; null verdict = run in
       flight), run-level gauntlet_version (build.rs git
@@ -260,8 +319,8 @@ Features Index:
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, build_info.rs, report/history.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
-    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env]
+    entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport]
     doc: docs/features/reporting.md
   viewer:
     description: >
