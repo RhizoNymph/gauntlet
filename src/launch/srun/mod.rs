@@ -25,7 +25,8 @@ mod flags;
 mod steps;
 
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+
+use crate::remote_dir::RemoteDir;
 
 pub use self::command::{
     agent_step_command, carrier_step_args, env_to_strip, sbcast_args, sbcast_staging_path,
@@ -56,93 +57,14 @@ pub fn default_flags() -> Vec<SrunFlag> {
         .collect()
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum SrunDirError {
-    #[error(
-        "[launch.srun] dir {dir:?} must be an absolute path (it is used verbatim on every \
-         node and as the sbcast destination; `~` is not expanded)"
-    )]
-    NotAbsolute { dir: String },
-    #[error("[launch.srun] dir {dir:?} must not contain control characters")]
-    ControlCharacter { dir: String },
-    #[error("cannot derive the default [launch.srun] dir: neither USER nor LOGNAME is set")]
-    NoUser,
-}
-
-/// Agent directory on every node in srun mode: an absolute path used
-/// verbatim on each node (no `~`: there is no login shell to expand it,
-/// and an sbcast destination must be literal). No trailing slash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct SrunDir(String);
-
-impl SrunDir {
-    pub fn parse(dir: &str) -> Result<Self, SrunDirError> {
-        if dir.chars().any(char::is_control) {
-            return Err(SrunDirError::ControlCharacter {
-                dir: dir.to_string(),
-            });
-        }
-        let trimmed = dir.trim_end_matches('/');
-        if !dir.starts_with('/') || trimmed.is_empty() {
-            return Err(SrunDirError::NotAbsolute {
-                dir: dir.to_string(),
-            });
-        }
-        Ok(Self(trimmed.to_string()))
-    }
-
-    /// `/tmp/gauntlet-<user>`: node-local, so every node writes its own
-    /// copy (no shared-home write race between nodes) and two users never
-    /// share one.
-    pub fn default_for(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, SrunDirError> {
-        let user = ["USER", "LOGNAME"]
-            .into_iter()
-            .filter_map(&lookup)
-            .find(|user| !user.trim().is_empty())
-            .ok_or(SrunDirError::NoUser)?;
-        // A user name never contains '/', but the path must not be steered
-        // elsewhere if the environment says otherwise.
-        let user: String = user
-            .chars()
-            .map(|ch| {
-                if ch == '/' || ch.is_control() {
-                    '_'
-                } else {
-                    ch
-                }
-            })
-            .collect();
-        Self::parse(&format!("/tmp/gauntlet-{user}"))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for SrunDir {
-    type Error = SrunDirError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::parse(&value)
-    }
-}
-
-impl From<SrunDir> for String {
-    fn from(dir: SrunDir) -> Self {
-        dir.0
-    }
-}
-
 /// How the agent binary reaches the nodes when there is no sftp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SrunDeploy {
     /// `sbcast` (Slurm's tree broadcast), scoped by a carrier step to the
-    /// stale nodes only, to a staging file next to `dir`; then a per-node
-    /// atomic install into `dir/bin`. The default: works with node-local
-    /// `dir`.
+    /// stale nodes only, to a staging file inside the resolved `dir`; then
+    /// a per-node atomic install into `dir/bin`. The default: works with
+    /// node-local `dir`.
     #[default]
     Sbcast,
     /// `dir` is a shared filesystem visible from every node and from the
@@ -160,8 +82,10 @@ pub struct SrunConfig {
     /// Appended after `flags` (e.g. `--gres=gpu:8` for an exclusive
     /// allocation that did not request GPUs).
     pub extra_flags: Vec<SrunFlag>,
-    /// Agent directory on every node; default `/tmp/gauntlet-$USER`.
-    pub dir: Option<SrunDir>,
+    /// Agent directory on every node, a `remote_dir` template (`~` and
+    /// `$USER` expanded on the node; created mode 700, owner-checked,
+    /// resolved to its physical path). Default `/tmp/gauntlet-$USER`.
+    pub dir: Option<RemoteDir>,
     pub deploy: SrunDeploy,
 }
 
@@ -222,44 +146,19 @@ mod tests {
     }
 
     #[test]
-    fn dirs_are_absolute_literals() {
-        assert_eq!(
-            SrunDir::parse("/tmp/gauntlet-u/").expect("dir").as_str(),
-            "/tmp/gauntlet-u"
-        );
-        assert_eq!(
-            SrunDir::parse("/scratch/a b").expect("dir").as_str(),
-            "/scratch/a b"
-        );
-        for bad in ["~/.gauntlet", "relative/dir", "", "/", "//"] {
-            assert!(
-                matches!(SrunDir::parse(bad), Err(SrunDirError::NotAbsolute { .. })),
-                "{bad:?}"
-            );
+    fn the_dir_is_a_remote_dir_template() {
+        #[derive(Debug, Deserialize)]
+        struct Doc {
+            srun: SrunConfig,
         }
-        assert!(matches!(
-            SrunDir::parse("/tmp/x\ny"),
-            Err(SrunDirError::ControlCharacter { .. })
-        ));
-    }
-
-    #[test]
-    fn default_dir_is_node_local_and_per_user() {
-        let lookup = |key: &str| (key == "USER").then(|| "alice".to_string());
+        let doc: Doc =
+            toml::from_str("[srun]\ndir = \"/scratch/gauntlet-$USER\"\n").expect("template dir");
         assert_eq!(
-            SrunDir::default_for(lookup).expect("dir").as_str(),
-            "/tmp/gauntlet-alice"
+            doc.srun.dir.as_ref().map(RemoteDir::as_str),
+            Some("/scratch/gauntlet-$USER")
         );
-        let logname = |key: &str| (key == "LOGNAME").then(|| "bob".to_string());
-        assert_eq!(
-            SrunDir::default_for(logname).expect("dir").as_str(),
-            "/tmp/gauntlet-bob"
-        );
-        let hostile = |key: &str| (key == "USER").then(|| "../../etc".to_string());
-        assert_eq!(
-            SrunDir::default_for(hostile).expect("dir").as_str(),
-            "/tmp/gauntlet-.._.._etc"
-        );
-        assert_eq!(SrunDir::default_for(|_| None), Err(SrunDirError::NoUser));
+        // Same validation as `ssh.remote_dir`: no other `$` expansion.
+        assert!(toml::from_str::<Doc>("[srun]\ndir = \"/scratch/$HOME\"\n").is_err());
+        assert_eq!(SrunConfig::default().dir, None);
     }
 }

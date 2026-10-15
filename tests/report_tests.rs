@@ -35,6 +35,7 @@ fn inventory(host: &str, kernel: &str) -> InventorySnapshot {
         gpus: vec![],
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: None,
@@ -117,7 +118,7 @@ fn build_flags_stragglers_and_dissenters() {
     );
 
     assert!(results.fleet.failed_hosts.is_empty());
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 #[test]
@@ -175,7 +176,7 @@ fn absolute_thresholds_flag_independently_of_mad() {
         .get("mem_bandwidth.triad")
         .expect("violations recorded");
     assert_eq!(violators.len(), 6);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 /// The `fleet()` observations with the straggler and dissenter healed, so a
@@ -242,7 +243,7 @@ fn sdc_failures_alone_are_hard_failures_and_rendered() {
     assert!(cpu[0].contains("n4:core7"), "{cpu:?}");
 
     // SDC is exit-code relevant even on an otherwise clean fleet.
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Failures);
 
     let mut rendered = Vec::new();
     report::render_table(&results, &mut rendered).expect("render");
@@ -293,6 +294,7 @@ fn rooflines_take_the_worst_gpu() {
             nvlinks_active: Some(18),
             persistence_mode: Some(true),
             occupancy: Default::default(),
+            pci: None,
         }];
         obs.inventory = Some(inv);
         for (gpu, gflops) in [(0u32, 900_000.0), (1u32, 850_000.0)] {
@@ -796,7 +798,7 @@ fn overlap_retention_feeds_mad_outliers() {
     assert_eq!(flagged.len(), 1, "{flagged:?}");
     assert!(flagged[0].key.contains("n5"), "{flagged:?}");
     assert!(flagged[0].deviation_mads < 0.0);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 #[test]
@@ -1030,7 +1032,7 @@ fn fleet_overlap_retention_feeds_mad_outliers() {
     assert_eq!(flagged.len(), 1, "{flagged:?}");
     assert_eq!(flagged[0].key, "n3", "{flagged:?}");
     assert!(flagged[0].deviation_mads < 0.0);
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 #[test]
@@ -1201,7 +1203,7 @@ fn intranode_headline_flags_a_degraded_node_but_the_series_never_does() {
             assert!(!results.fleet.outliers.contains_key(&group), "{group}");
         }
     }
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 /// Mixed-topology fleet: `majority` 8-GPU NVLink nodes around 200 GiB/s
@@ -1282,7 +1284,7 @@ fn a_degraded_node_is_found_within_its_own_topology() {
         let big = format!("{test}.bus_gib_per_sec_peak_8gpu");
         assert!(!results.fleet.outliers.contains_key(&big), "{big}");
     }
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 }
 
 #[test]

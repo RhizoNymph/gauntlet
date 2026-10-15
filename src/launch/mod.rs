@@ -14,7 +14,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use self::slurm::{SlurmAllocation, SlurmError, SlurmJobId};
-pub use self::srun::{SrunConfig, SrunDeploy, SrunDir, SrunFlag};
+pub use self::srun::{SrunConfig, SrunDeploy, SrunFlag};
 
 /// `[launch] mode`, overridable with `--launch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]

@@ -34,6 +34,7 @@ fn gpu(index: u32, occupancy: GpuOccupancy) -> GpuInventory {
         nvlinks_active: None,
         persistence_mode: Some(true),
         occupancy,
+        pci: None,
     }
 }
 
@@ -74,6 +75,7 @@ fn inventory(host: &str, gpus: Vec<GpuInventory>) -> InventorySnapshot {
         gpus,
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: Some(1),
@@ -181,7 +183,7 @@ fn threshold_boundary_on_the_derived_outcome() {
 fn a_busy_gpu_is_a_straggler_finding_not_a_host_failure() {
     let results = report::build(&config(""), fleet(vllm_busy()), 100, 110);
     assert!(results.fleet.failed_hosts.is_empty());
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Outliers);
 
     let idle_results = report::build(&config(""), fleet(idle()), 100, 110);
     assert_eq!(report::verdict(&idle_results), Verdict::Clean);

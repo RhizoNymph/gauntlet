@@ -13,18 +13,19 @@
 //! of abandoned steps — is exercised without Slurm.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gauntlet::config::HostConfig;
-use gauntlet::launch::{LaunchRecord, SlurmJobId, SrunConfig, SrunDir};
-use gauntlet::nccl_env::NcclEnv;
+use gauntlet::launch::{LaunchRecord, SlurmJobId, SrunConfig};
+use gauntlet::nccl_level::NcclLevelEnvs;
 use gauntlet::orchestrator::bootstrap::{BootstrapReport, CheckStatus, HostReadiness};
 use gauntlet::orchestrator::session::HostSession;
 use gauntlet::orchestrator::transport::{Launcher, SlurmTools, SrunLauncher};
+use gauntlet::proto::TestId;
+use gauntlet::remote_dir::RemoteDir;
 use gauntlet::report::{RunResults, SCHEMA_VERSION};
 
 const JOB_ID: u64 = 4242;
@@ -74,10 +75,20 @@ impl FakeSlurm {
         std::fs::create_dir_all(root.join("bin")).expect("bin dir");
         std::fs::create_dir_all(root.join("state/steps")).expect("state dir");
         for (name, body) in SHIMS {
+            // Written by an external `install`, never through a writable fd
+            // of this process: another test thread forking meanwhile would
+            // inherit that fd and make exec of the shim fail with ETXTBSY.
+            let source = root.join(format!("{name}.src"));
+            std::fs::write(&source, body).expect("write shim source");
             let path = root.join("bin").join(name);
-            std::fs::write(&path, body).expect("write shim");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod shim");
+            let installed = Command::new("install")
+                .arg("-m")
+                .arg("755")
+                .arg(&source)
+                .arg(&path)
+                .status()
+                .expect("run install");
+            assert!(installed.success(), "install {name}");
         }
         std::fs::write(root.join("job_id"), JOB_ID.to_string()).expect("job id");
         let names: String = nodes.iter().map(|(name, _)| format!("{name}\n")).collect();
@@ -183,7 +194,7 @@ impl FakeSlurm {
         let srun = SrunLauncher::new(
             SlurmJobId::new(JOB_ID),
             SrunConfig::default(),
-            SrunDir::parse(self.node_dir().to_str().expect("utf8")).expect("dir"),
+            RemoteDir::parse(self.node_dir().to_str().expect("utf8")).expect("dir"),
             Vec::new(),
             None,
             SlurmTools::in_dir(&self.bin()),
@@ -191,10 +202,22 @@ impl FakeSlurm {
         Launcher::Srun(Arc::new(srun))
     }
 
+    /// Put the agent where sessions run it from: the physical node dir
+    /// (sessions resolve it with `pwd -P`; call after a connect made it).
     fn install_agent(&self) {
-        let bin = self.node_dir().join("bin");
+        let bin = std::fs::canonicalize(self.node_dir())
+            .expect("node dir")
+            .join("bin");
         std::fs::create_dir_all(&bin).expect("bin");
-        std::fs::copy(env!("CARGO_BIN_EXE_gauntlet"), bin.join("gauntlet-agent")).expect("copy");
+        // External `install`, for the same ETXTBSY reason as the shims.
+        let installed = Command::new("install")
+            .arg("-m")
+            .arg("755")
+            .arg(env!("CARGO_BIN_EXE_gauntlet"))
+            .arg(bin.join("gauntlet-agent"))
+            .status()
+            .expect("run install");
+        assert!(installed.success(), "install agent");
     }
 }
 
@@ -351,17 +374,23 @@ dir = {dir}
 extra_flags = ["--mpi=none"]
 
 [tests]
-phases = ["inventory", "network"]
+phases = ["inventory", "network", "overlap"]
 phase_timeout_secs = 120
 net_latency_secs = 1
 net_bandwidth_secs = 1
 net_port_base = {port}
 nccl_intranode = false
 barrier_iters = 20
+overlap_secs = 1
+overlap_baseline_secs = 1
+overlap_fleet = false
 
 [nccl]
 socket_ifname = "lo"
-env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
+env = {{ NCCL_TEST_VALUE = {value} }}
+
+[nccl.levels.overlap_intranode]
+env = {{ NCCL_ALGO = "Ring" }}
 "#,
         dir = toml_string(dir.to_str().expect("utf8")),
         port = port_base(0),
@@ -381,10 +410,12 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
         Duration::from_secs(300),
         &slurm,
     );
-    // 0 = clean, 1 = stragglers (three "nodes" sharing one machine may
-    // well disagree); 2 would be host failures.
+    // 0 = clean, 1 = outliers (three "nodes" sharing one machine may well
+    // disagree), 3 = test failures: on a machine without a CUDA driver the
+    // overlap phase reports its two tests Failed (checked below). 2 (host
+    // failures) or 4 (error) would be launch problems.
     assert!(
-        matches!(output.status.code(), Some(0) | Some(1)),
+        matches!(output.status.code(), Some(0) | Some(1) | Some(3)),
         "{}",
         show(&output)
     );
@@ -417,6 +448,17 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
             show(&output)
         );
         assert!(observations.inventory.is_some(), "{host}: no inventory");
+        // The only failures allowed are the overlap tests on a host whose
+        // agent could not open a CUDA driver; everything srun carried
+        // (inventory, pairwise, barrier) must have worked.
+        for (test, scope, outcome) in &observations.outcomes {
+            if let gauntlet::proto::TestOutcome::Failed { reason } = outcome {
+                assert!(
+                    matches!(test, TestId::OverlapGemm | TestId::OverlapAllReduce),
+                    "{host}: {test:?} {scope:?} failed: {reason}"
+                );
+            }
+        }
         assert!(
             observations
                 .metrics
@@ -447,8 +489,32 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
 
     let calls = slurm.srun_calls();
     let envs = slurm.srun_envs();
-    let agent = format!("{}/bin/gauntlet-agent", dir.display());
+    // Every node resolved the template to its physical path (`pwd -P`),
+    // created the NCCL log directory inside it, and runs the agent from it.
+    let physical = std::fs::canonicalize(&dir).expect("node dir exists");
+    assert!(physical.join("nccl-logs").is_dir(), "nccl-logs not created");
+    let agent = format!("{}/bin/gauntlet-agent", physical.display());
+    let base_env = vec![
+        format!("LD_LIBRARY_PATH={ORCHESTRATOR_LD_PATH}"),
+        "NCCL_SOCKET_IFNAME=lo".to_string(),
+        format!("NCCL_TEST_VALUE={ADVERSARIAL}"),
+    ];
+    // The overlap phase's processes host the overlap_intranode level: its
+    // override plus the transport-capture variables.
+    let overlap_env = vec![
+        format!("LD_LIBRARY_PATH={ORCHESTRATOR_LD_PATH}"),
+        "NCCL_ALGO=Ring".to_string(),
+        "NCCL_DEBUG=INFO".to_string(),
+        format!(
+            "NCCL_DEBUG_FILE={}/nccl-logs/overlap_intranode.%h.log",
+            physical.display()
+        ),
+        "NCCL_DEBUG_SUBSYS=INIT,NET".to_string(),
+        "NCCL_SOCKET_IFNAME=lo".to_string(),
+        format!("NCCL_TEST_VALUE={ADVERSARIAL}"),
+    ];
     let mut agent_steps = 0;
+    let mut level_steps = 0;
     for (step, args) in &calls {
         for flag in [
             "--overlap",
@@ -487,25 +553,23 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
                     "env".to_string(),
                     format!(
                         "LD_LIBRARY_PATH={}/lib:{ORCHESTRATOR_LD_PATH}",
-                        dir.display()
+                        physical.display()
                     ),
                     agent.clone(),
                     "agent".to_string(),
                 ],
                 "{args:?}"
             );
-            // srun's own environment: the orchestrator's library path, the
-            // resolved NCCL env byte for byte, and nothing stray.
-            assert_eq!(
-                env,
-                &vec![
-                    format!("LD_LIBRARY_PATH={ORCHESTRATOR_LD_PATH}"),
-                    "NCCL_DEBUG=WARN".to_string(),
-                    "NCCL_SOCKET_IFNAME=lo".to_string(),
-                    format!("NCCL_TEST_VALUE={ADVERSARIAL}"),
-                ],
-                "step {step}"
-            );
+            // srun's own environment: the orchestrator's library path and
+            // the resolved env of the step's level byte for byte (global
+            // NCCL env, or the level's override plus capture variables),
+            // and nothing stray.
+            if env.iter().any(|entry| entry.starts_with("NCCL_ALGO=")) {
+                level_steps += 1;
+                assert_eq!(env, &overlap_env, "step {step}");
+            } else {
+                assert_eq!(env, &base_env, "step {step}");
+            }
         } else {
             assert_eq!(name, format!("gauntlet:{nodes}:exec"));
             assert_eq!(&args[command..command + 2], ["sh", "-c"], "{args:?}");
@@ -517,6 +581,8 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
     }
     // inventory + counters + pairs + barrier on every node, at least.
     assert!(agent_steps >= 9, "{agent_steps}");
+    // One overlap process per node.
+    assert_eq!(level_steps, NODES.len(), "overlap steps");
 
     // One sbcast, scoped to the carrier step, to a job-unique staging file
     // that is cleaned up after the per-node installs.
@@ -527,7 +593,8 @@ env = {{ NCCL_DEBUG = "WARN", NCCL_TEST_VALUE = {value} }}
         lines[0].starts_with(&format!("--force --jobid={JOB_ID}.")),
         "{sbcast}"
     );
-    let staging_prefix = format!("{}.sbcast-{JOB_ID}-", dir.display());
+    // Staged inside the owner-checked agent directory, never beside it.
+    let staging_prefix = format!("{}/.sbcast-{JOB_ID}-", physical.display());
     assert!(lines[0].contains(&staging_prefix), "{sbcast}");
     assert!(staging_files(&slurm).is_empty(), "staging file left behind");
     assert!(Path::new(&agent).exists());
@@ -678,14 +745,16 @@ fn one_bad_fleet_node_fails_only_its_own_deploy() {
     assert!(staging_files(&slurm).is_empty(), "staging left behind");
 }
 
-/// sbcast staging files (siblings of the agent dir) currently on disk.
+/// sbcast staging files (`.sbcast-*` inside the agent dir) on disk.
 fn staging_files(slurm: &FakeSlurm) -> Vec<PathBuf> {
-    let prefix = format!("{}.sbcast-", slurm.node_dir().display());
-    std::fs::read_dir(&slurm.root)
-        .expect("root")
+    std::fs::read_dir(slurm.node_dir())
+        .expect("node dir")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.to_string_lossy().starts_with(prefix.as_str()))
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".sbcast-"))
+        })
         .collect()
 }
 
@@ -700,7 +769,8 @@ fn srun_mode_outside_an_allocation_is_a_clear_error() {
         Duration::from_secs(60),
         &slurm,
     );
-    assert!(!output.status.success(), "{}", show(&output));
+    // A pre-verdict error: EXIT_ERROR (4), never a verdict code.
+    assert_eq!(output.status.code(), Some(4), "{}", show(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("SLURM_JOB_ID is not set"), "{stderr}");
     assert!(stderr.contains("salloc"), "{stderr}");
@@ -722,7 +792,8 @@ fn configured_hosts_outside_the_allocation_are_rejected() {
         Duration::from_secs(60),
         &slurm,
     );
-    assert!(!output.status.success(), "{}", show(&output));
+    // A pre-verdict error: EXIT_ERROR (4), never a verdict code.
+    assert_eq!(output.status.code(), Some(4), "{}", show(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("elsewhere"), "{stderr}");
     assert!(stderr.contains("not part of Slurm job 4242"), "{stderr}");
@@ -745,7 +816,7 @@ fn ssh_mode_still_requires_hosts() {
         Duration::from_secs(60),
         &slurm,
     );
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(4), "{}", show(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no hosts configured"), "{stderr}");
 }
@@ -757,7 +828,7 @@ fn ssh_mode_still_requires_hosts() {
 async fn connect(launcher: &Launcher, addr: &str) -> Arc<HostSession> {
     Arc::new(
         launcher
-            .connect(host(addr), &NcclEnv::default())
+            .connect(host(addr), Arc::new(NcclLevelEnvs::default()))
             .await
             .unwrap_or_else(|error| panic!("connect {addr}: {error:#}")),
     )

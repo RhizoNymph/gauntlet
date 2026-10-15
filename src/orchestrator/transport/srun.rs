@@ -27,11 +27,13 @@ use tracing::debug;
 use super::{AgentCommand, Pipe, SpawnStdio};
 use crate::launch::SlurmJobId;
 use crate::launch::srun::{
-    SrunConfig, SrunDeploy, SrunDir, StepEntry, StepId, StepName, StepTarget, agent_step_command,
+    SrunConfig, SrunDeploy, StepEntry, StepId, StepName, StepTarget, agent_step_command,
     carrier_step_args, find_step, parse_steps, sbcast_args, scancel_args, squeue_args, step_args,
     steps_to_kill,
 };
+use crate::nccl_env::NcclEnv;
 use crate::orchestrator::session::RemoteOutput;
+use crate::remote_dir::RemoteDir;
 
 /// Typed failures of the srun transport, so callers (deploy in
 /// particular) can tell a broadcast failure from a timeout or a missing
@@ -127,7 +129,7 @@ static CARRIER_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct SrunLauncher {
     job_id: SlurmJobId,
     config: SrunConfig,
-    dir: SrunDir,
+    dir: RemoteDir,
     /// Orchestrator env vars removed from every step (`env_to_strip`).
     strip_env: Vec<String>,
     /// The orchestrator's own LD_LIBRARY_PATH, which `--export=ALL` hands
@@ -144,7 +146,7 @@ impl SrunLauncher {
     pub fn new(
         job_id: SlurmJobId,
         config: SrunConfig,
-        dir: SrunDir,
+        dir: RemoteDir,
         strip_env: Vec<String>,
         inherited_ld_library_path: Option<String>,
         tools: SlurmTools,
@@ -166,7 +168,7 @@ impl SrunLauncher {
         self.job_id
     }
 
-    pub fn dir(&self) -> &SrunDir {
+    pub fn dir(&self) -> &RemoteDir {
         &self.dir
     }
 
@@ -182,13 +184,13 @@ impl SrunLauncher {
     /// variables removed and `env` (the NCCL env) added. The local srun
     /// process's environment is what `--export=ALL` hands the task; srun
     /// itself keeps everything else, LD_LIBRARY_PATH included.
-    fn srun(&self, args: Vec<String>, env: &[(String, String)]) -> tokio::process::Command {
+    fn srun(&self, args: Vec<String>, env: &NcclEnv) -> tokio::process::Command {
         let mut srun = tokio::process::Command::new(&self.tools.srun);
         srun.args(args);
         for key in &self.strip_env {
             srun.env_remove(key);
         }
-        srun.envs(env.iter().map(|(key, value)| (key, value)));
+        srun.envs(env.iter());
         srun
     }
 
@@ -225,7 +227,7 @@ impl SrunLauncher {
             &command,
         );
         let child = self.spawn_guarded(
-            self.srun(args, &[]),
+            self.srun(args, &NcclEnv::default()),
             SpawnStdio {
                 stdin: Pipe::Null,
                 stdout: Pipe::Piped,
@@ -249,12 +251,12 @@ impl SrunLauncher {
         let argv = agent_step_command(
             command.agent_path,
             command.args,
-            &command.env.lib_dir,
+            command.lib_dir,
             self.inherited_ld_library_path.as_deref(),
         );
         let name = StepName::agent(command.host, command.args);
         let args = step_args(self.config.all_flags(), command.host, &name, &argv);
-        self.spawn_guarded(self.srun(args, &command.env.nccl), pipes)
+        self.spawn_guarded(self.srun(args, command.nccl), pipes)
     }
 
     /// Cancel every step any of `requests` (host, target) selects. Requests
@@ -321,7 +323,7 @@ impl SrunLauncher {
         let lifetime = timeout.as_secs().saturating_mul(2).max(60);
         let args = carrier_step_args(self.config.all_flags(), hosts, &name, lifetime);
         let mut carrier = self.spawn_guarded(
-            self.srun(args, &[]),
+            self.srun(args, &NcclEnv::default()),
             SpawnStdio {
                 stdin: Pipe::Null,
                 stdout: Pipe::Null,

@@ -49,11 +49,19 @@ pub fn severity_color(severity: Severity) -> u32 {
     }
 }
 
+/// Outliers are a performance finding (warn); failed tests and incomplete
+/// hosts are hard problems (bad).
+pub fn verdict_severity(verdict: Verdict) -> Severity {
+    match verdict {
+        Verdict::Clean => Severity::Ok,
+        Verdict::Outliers => Severity::Warn,
+        Verdict::Failures | Verdict::HostFailures => Severity::Bad,
+    }
+}
+
 pub fn verdict_color(verdict: Option<Verdict>) -> u32 {
     match verdict {
-        Some(Verdict::Clean) => OK,
-        Some(Verdict::Stragglers) => WARN,
-        Some(Verdict::HostFailures) => BAD,
+        Some(verdict) => severity_color(verdict_severity(verdict)),
         None => MUTED,
     }
 }
@@ -497,11 +505,13 @@ impl RootView {
                 match kind {
                     ChildKind::Run => {
                         self.launched_run_id = None;
-                        self.note = Some(match status.code() {
-                            Some(0) => (Severity::Ok, "run finished: clean".into()),
-                            Some(1) => (Severity::Warn, "run finished: stragglers".into()),
-                            Some(2) => (Severity::Bad, "run finished: host failures".into()),
-                            code => (
+                        let code = status.code();
+                        self.note = Some(match code.and_then(Verdict::from_exit_code) {
+                            Some(verdict) => (
+                                verdict_severity(verdict),
+                                format!("run finished: {verdict}"),
+                            ),
+                            None => (
                                 Severity::Bad,
                                 format!("run exited abnormally ({code:?}) — see {RUN_LOG_NAME}"),
                             ),
@@ -601,11 +611,8 @@ impl RootView {
         match &self.current {
             Some(run) => {
                 let vm = &run.vm;
-                let (verdict_text, color) = match vm.verdict {
-                    Verdict::Clean => ("clean", OK),
-                    Verdict::Stragglers => ("stragglers", WARN),
-                    Verdict::HostFailures => ("host failures", BAD),
-                };
+                let verdict_text = vm.verdict.label();
+                let color = verdict_color(Some(vm.verdict));
                 header = header
                     .child(
                         div()

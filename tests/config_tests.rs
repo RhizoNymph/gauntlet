@@ -523,6 +523,47 @@ fn the_example_config_enables_the_intranode_sweep() {
     assert!(config.tests.nccl_intranode);
 }
 
+#[test]
+fn the_nccl_world_shape_defaults_to_rank_per_gpu() {
+    use gauntlet::config::NcclWorldShape;
+    let config = parse(r#"hosts = ["10.0.0.1"]"#).expect("config");
+    assert_eq!(config.tests.nccl_world, NcclWorldShape::RankPerGpu);
+    for (wire, shape) in [
+        ("rank_per_gpu", NcclWorldShape::RankPerGpu),
+        ("rank_per_node", NcclWorldShape::RankPerNode),
+        ("per_rail", NcclWorldShape::PerRail),
+    ] {
+        let config = parse(&format!(
+            "hosts = [\"10.0.0.1\"]\n[tests]\nnccl_world = \"{wire}\"\n"
+        ))
+        .expect("world shape");
+        assert_eq!(config.tests.nccl_world, shape, "{wire}");
+    }
+}
+
+#[test]
+fn an_unknown_nccl_world_shape_is_rejected() {
+    let error = parse(
+        r#"
+        hosts = ["10.0.0.1"]
+        [tests]
+        nccl_world = "ranks_per_node"
+        "#,
+    )
+    .expect_err("unknown shape");
+    assert!(error.contains("ranks_per_node"), "{error}");
+}
+
+#[test]
+fn the_example_config_spells_out_the_nccl_world_shape() {
+    use gauntlet::config::NcclWorldShape;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("gauntlet.example.toml");
+    let text = std::fs::read_to_string(&path).expect("example config");
+    assert!(text.contains("nccl_world = \"rank_per_gpu\""), "{text}");
+    let config = FleetConfig::load(&path).expect("example config must stay valid");
+    assert_eq!(config.tests.nccl_world, NcclWorldShape::RankPerGpu);
+}
+
 // ---------------------------------------------------------------------------
 // [launch]
 // ---------------------------------------------------------------------------
@@ -566,7 +607,7 @@ fn srun_mode_may_omit_hosts() {
     assert_eq!(all, ["--overlap", "--gres=gpu:8", "--mem=0"]);
     assert_eq!(
         config.launch.srun.dir.as_ref().map(|dir| dir.as_str()),
-        Some("/scratch/gauntlet-alice")
+        Some("/scratch/gauntlet-alice/")
     );
     assert_eq!(config.launch.srun.deploy, SrunDeploy::Shared);
 }
@@ -597,8 +638,9 @@ fn invalid_srun_settings_are_rejected_at_parse_time() {
         ("extra_flags = [\"-N2\"]", "managed by gauntlet"),
         ("extra_flags = [\"--gres gpu:8\"]", "single word"),
         ("extra_flags = [\"overlap\"]", "must start with '-'"),
-        ("dir = \"~/.gauntlet\"", "absolute path"),
-        ("dir = \"relative\"", "absolute path"),
+        // The same `RemoteDir` template validation as ssh.remote_dir.
+        ("dir = \"/scratch/$HOME\"", "unsupported `$`"),
+        ("dir = \"\"", "remote_dir is empty"),
         ("deploy = \"scp\"", "unknown variant"),
         ("flagz = []", "flagz"),
     ] {

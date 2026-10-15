@@ -13,6 +13,9 @@ use tracing::debug;
 
 use super::{AgentCommand, Pipe, SpawnStdio};
 use crate::config::SshConfig;
+use crate::orchestrator::session::remote_fs::{
+    FileMode, install_command, staging_path, sweep_stale_staging_command, upload_nonce,
+};
 use crate::orchestrator::session::{
     RemoteOutput, agent_kill_pattern, agent_spawn_args, single_quote,
 };
@@ -82,10 +85,13 @@ pub(super) async fn spawn(
     command: &AgentCommand<'_>,
     pipes: SpawnStdio,
 ) -> Result<openssh::Child<Arc<Session>>> {
-    let words = command.env.ssh_words();
     let mut remote = Arc::clone(session).arc_command("env");
     remote
-        .raw_args(agent_spawn_args(&words, command.agent_path, command.args))
+        .raw_args(agent_spawn_args(
+            command.ssh_words,
+            command.agent_path,
+            command.args,
+        ))
         .stdin(stdio(pipes.stdin))
         .stdout(stdio(pipes.stdout))
         .stderr(stdio(pipes.stderr));
@@ -111,9 +117,18 @@ pub(super) async fn kill_agent(session: &Session, addr: &str, args: &str) -> Res
 /// Upload a local file to `remote_path` (sftp), creating parent dirs,
 /// setting the executable bit when `executable`.
 ///
-/// The bytes land in a sibling temp file that is then renamed into place,
-/// so a concurrently running copy of the old binary cannot make the write
-/// fail with `ETXTBSY` and readers never observe a half-written file.
+/// The bytes land in a sibling temp file with a per-upload random suffix
+/// (`staging_path`) that is then renamed into place (`install_command`),
+/// so a concurrently running copy of the old binary cannot make the
+/// write fail with `ETXTBSY`, readers never observe a half-written file,
+/// and concurrent uploads to one shared path (several nodes on one NFS
+/// `remote_dir`) never write into the same temp file: each renames a
+/// complete file, the last rename wins. A failed upload removes its temp
+/// file (best effort); a killed one leaves only an unreferenced
+/// `*.tmp.*` sibling, never a torn destination, and the next upload
+/// sweeps such siblings once they are older than
+/// `remote_fs::STALE_STAGING_MINUTES` (younger ones may be another
+/// node's upload in flight).
 pub(crate) async fn upload(
     session: &Arc<Session>,
     addr: &str,
@@ -135,26 +150,39 @@ pub(crate) async fn upload(
     )
     .with_context(|| format!("creating remote directory {parent}"))?;
 
-    let staging = format!("{remote_path}.staging");
-    sftp_write(session, &staging, &bytes)
-        .await
-        .with_context(|| format!("uploading {} to {}", local.display(), staging))?;
+    // Leftovers of killed uploads; best effort, never fails the upload.
+    match exec_capture(session, addr, &sweep_stale_staging_command(remote_path)).await {
+        Ok(output) if output.success() => {}
+        Ok(output) => debug!(host = %addr, detail = %output.detail(), "stale staging sweep failed"),
+        Err(error) => debug!(host = %addr, %error, "stale staging sweep failed"),
+    }
 
-    let mode = if executable { "755" } else { "644" };
-    checked(
-        exec_capture(
-            session,
+    let staging = staging_path(remote_path, upload_nonce());
+    let mode = if executable {
+        FileMode::Executable
+    } else {
+        FileMode::Regular
+    };
+    let installed = async {
+        sftp_write(session, &staging, &bytes)
+            .await
+            .with_context(|| format!("uploading {} to {}", local.display(), staging))?;
+        checked(
+            exec_capture(session, addr, &install_command(&staging, remote_path, mode)).await,
             addr,
-            &format!(
-                "chmod {mode} {staging} && mv -f {staging} {dest}",
-                staging = single_quote(&staging),
-                dest = single_quote(remote_path),
-            ),
         )
-        .await,
-        addr,
-    )
-    .with_context(|| format!("installing {remote_path}"))?;
+        .with_context(|| format!("installing {remote_path}"))?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = installed {
+        if let Err(cleanup) =
+            exec_capture(session, addr, &format!("rm -f {}", single_quote(&staging))).await
+        {
+            debug!(host = %addr, staging, %cleanup, "staging cleanup failed");
+        }
+        return Err(error);
+    }
     debug!(host = %addr, remote_path, bytes = bytes.len(), "uploaded file");
     Ok(())
 }

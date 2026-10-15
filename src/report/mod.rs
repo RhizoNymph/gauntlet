@@ -5,10 +5,15 @@
 //! bump SCHEMA_VERSION. The terminal table is a projection of it, never a
 //! second source of truth.
 
+mod consistency;
+mod fleet_nccl;
 pub mod gpu_idle;
 pub mod history;
 pub mod intranode;
 pub mod nccl_env;
+pub mod nccl_nics;
+pub mod nccl_transport;
+mod verdict;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -17,18 +22,24 @@ use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::fit::{AlphaBetaFit, FitBound, fit_alpha_beta};
+pub use self::verdict::{EXIT_ERROR, EvidenceTier, Verdict, failed_outcome_tier, verdict};
+use crate::analysis::fit::{AlphaBetaFit, FitBound};
 use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
+use crate::build_info::BuildInfo;
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::launch::LaunchRecord;
 use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
-    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit,
-    consistency_fields, nccl_metric, overlap_metric,
+    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit, nccl_metric,
+    overlap_metric,
 };
+// The majority vote's unit tests live with the rest of this module's tests.
+#[cfg(test)]
+use consistency::majority;
 
 // v2: metric `aggregates` (per-subject Moments), `fleet.jitter_outliers`,
 // and `repeat` on raw metric records.
@@ -66,7 +77,8 @@ use crate::proto::{
 // which suppresses drift display.
 // v11: GPU occupancy — inventory GPUs carry `occupancy` (memory used/total,
 // foreign compute processes, stale gauntlet agents) and hosts gain one
-// `gpu_idle` outcome per GPU (Failed feeds the verdict as Stragglers).
+// `gpu_idle` outcome per GPU (Failed fed the verdict as Stragglers; soft
+// `outliers` since v15).
 // Serde-defaulted: pre-v11 documents decode with occupancy unknown and no
 // gpu_idle outcomes.
 // v12: link fits are least squares constrained to alpha >= 0, beta >= 0
@@ -74,10 +86,57 @@ use crate::proto::{
 // the origin), and `calibration.links.*.bound` records which constraint
 // was active (`alpha_zero` / `beta_zero` / `both_zero`, null when the fit
 // is plain OLS). Serde-defaulted: pre-v12 documents decode with it null.
-// v13: run-level `launch` — how the agents were started: `{"mode":"ssh"}`
+// v13: per-level NCCL env and transport capture — run-level
+// `nccl_level_env` (the effective env of every NCCL level, global <-
+// `[nccl.levels.<level>]`; `nccl_env` stays the global map),
+// `hosts.*.nccl_transports` (the network/peer transports each NCCL-hosting
+// process's communicator used, parsed from NCCL's INFO log, or why
+// unknown) and `fleet.socket_fallbacks` (a multi-host communicator on TCP
+// sockets without IB disabled; part of the verdict — Stragglers then,
+// hard evidence (Failures) since v15).
+// Serde-defaulted: pre-v13 documents decode with no level envs ("not
+// recorded", which suppresses level drift), no transports and no
+// findings.
+// v14: fleet-level NCCL sweep headlines and world shapes. The fleet sweep's
+// lead emits `nccl_all_{reduce,gather}.bus_gib_per_sec_peak` (max across
+// sizes, one value per run, kept out of MAD and jitter — see
+// `fleet_nccl`); `[tests] nccl_world = "rank_per_node" | "per_rail"` adds
+// the nccl_inter_all_reduce / nccl_inter_all_gather groups (per-size
+// series opened by a `ranks` record; `bus_gib_per_sec_peak` for
+// rank-per-node; per-rail `bus_gib_per_sec_peak_rail<r>` plus the
+// worst-rail `bus_gib_per_sec_peak_min_rail`; one outcome per host per
+// test for a per-rail sweep) and the calibration.links classes
+// nccl_{allreduce,allgather}_inter_node_<n>rank, keyed by world size. The
+// barrier probes' `fleet_span_*` groups follow the same fleet-level rule
+// (aggregated, never MAD/jitter-compared). A one-host fleet no longer
+// runs the fleet sweep while the intra-node sweep runs (Skipped
+// outcomes). No field changed shape.
+// v15: run-level `verdict` — "clean" / "outliers" / "host_failures" /
+// "failures", the classification behind the exit code (0 / 1 / 2 / 3,
+// monotonic in severity; failed tests, counter findings and socket
+// fallbacks no longer share exit 1 with statistical outliers; set only on
+// the finished document, null in partial snapshots) — and run-level
+// `gauntlet_version` (crate version plus build-time git revision of the
+// producing binary). Both serde-defaulted: pre-v15 documents decode with
+// them null, and `report::verdict` classifies them.
+// v16: InfiniBand inventory and the NCCL NIC ceiling — inventory IB ports
+// carry a typed `rate` (known / unparseable with its error / unreadable;
+// replaces `rate_gbps`), `link_layer`, `phys_state` and `netdevs`;
+// inventories list `ib_devices` (PCI placement) and GPUs their `pci`
+// placement. `hosts.*.nccl_nics` records, per host, the IB/RoCE ports NCCL
+// would use under the run's fleet-level NCCL_NET / NCCL_IB_DISABLE /
+// NCCL_IB_HCA (selected and excluded ports with the reason, plus those env
+// inputs); hosts gain a node-scope `nccl_nics` outcome (Failed — a
+// predicted socket fallback, hard evidence like `fleet.socket_fallbacks` —
+// when IB/RoCE ports exist but none is selected) and the
+// `nccl_nics.ceiling_gib_per_sec` metric; consistency gains
+// nccl_ib_ports / nccl_ib_link_layer / nccl_ib_ceiling_gbps.
+// Serde-defaulted: pre-v16 documents decode with no summaries and a bare
+// `rate_gbps` lifted into `rate`.
+// v17: run-level `launch` — how the agents were started: `{"mode":"ssh"}`
 // or `{"mode":"srun","job_id":N}` (srun steps inside Slurm job N).
-// Serde-defaulted: pre-v13 documents decode with it null ("not recorded").
-pub const SCHEMA_VERSION: u32 = 13;
+// Serde-defaulted: pre-v17 documents decode with it null ("not recorded").
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -111,6 +170,11 @@ pub struct RunResults {
     /// built without optimizations; such numbers are not comparable.
     #[serde(default)]
     pub debug_build: bool,
+    /// Crate version and git revision of the orchestrator binary — which
+    /// is also the deployed agent (self-deploy, sha256-matched). `None` =
+    /// not recorded (pre-v13 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub hosts: BTreeMap<String, HostObservations>,
     /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
     /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
@@ -123,10 +187,23 @@ pub struct RunResults {
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
     /// How the agents were launched (ssh, or srun inside a named Slurm
-    /// job). `None` = not recorded (pre-v13 documents, or a document built
+    /// job). `None` = not recorded (pre-v17 documents, or a document built
     /// outside `gauntlet run`).
     #[serde(default)]
     pub launch: Option<LaunchRecord>,
+    /// `verdict(self)` of the finished run (`finalize`): the same
+    /// classification the exit code reports, so consumers never parse the
+    /// exit status. `None` = no final verdict: a partial snapshot of a run
+    /// still in flight (`*.partial.json`), or a pre-v13 document (serde
+    /// default); call `verdict` for a provisional classification.
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
+    /// The effective NCCL env of every level (`[nccl] env` with that
+    /// level's `[nccl.levels.<level>]` override layered on top): what each
+    /// NCCL-hosting process was started with, minus the debug-log
+    /// variables transport capture adds. `None` = not recorded (pre-v13).
+    #[serde(default)]
+    pub nccl_level_env: Option<nccl_env::LevelEnvMap>,
     pub fleet: FleetAnalysis,
     /// Per-subject distributions; n == 1 everywhere unless the run used
     /// `--repeat`.
@@ -155,7 +232,7 @@ pub struct FleetAnalysis {
     /// correctness screens (isolated and hot), grouped by test display
     /// name; entries are "host[:scope]: reason". Hard failures — these are
     /// absolute findings on a node, never fleet-relative outliers, and any
-    /// entry makes the verdict at least `Stragglers`.
+    /// entry makes the verdict at least `Failures`.
     #[serde(default)]
     pub sdc_failures: BTreeMap<String, Vec<String>>,
     /// Error counters that incremented across the load phases, per host.
@@ -170,6 +247,11 @@ pub struct FleetAnalysis {
     /// margin-passing iterations. Part of the verdict.
     #[serde(default)]
     pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
+    /// Hosts whose multi-host NCCL communicator fell back to TCP sockets
+    /// while IB was not disabled by the level's env, per level. Hard
+    /// evidence in the verdict (`Failures`, see `report::verdict`).
+    #[serde(default)]
+    pub socket_fallbacks: BTreeMap<String, Vec<nccl_transport::SocketFallback>>,
 }
 
 /// One flagged subject from the barrier-skew slowest-rank tally.
@@ -227,27 +309,6 @@ pub struct NodeRoofline {
     pub disk_write_gib_per_sec: Option<f64>,
 }
 
-/// Exit code contract for `gauntlet run`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// 0: all hosts completed, no outliers, no violations.
-    Clean,
-    /// 1: completed with failed tests, outliers, or threshold violations.
-    Stragglers,
-    /// 2: at least one host failed to complete.
-    HostFailures,
-}
-
-impl Verdict {
-    pub fn exit_code(self) -> i32 {
-        match self {
-            Verdict::Clean => 0,
-            Verdict::Stragglers => 1,
-            Verdict::HostFailures => 2,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Keys: the naming contract shared with the orchestrator
 // ---------------------------------------------------------------------------
@@ -273,6 +334,8 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::NcclAllGather => "nccl_all_gather",
         TestId::NcclIntraAllReduce => "nccl_intra_all_reduce",
         TestId::NcclIntraAllGather => "nccl_intra_all_gather",
+        TestId::NcclInterAllReduce => "nccl_inter_all_reduce",
+        TestId::NcclInterAllGather => "nccl_inter_all_gather",
         TestId::NcclBarrier => "nccl_barrier",
         TestId::TcpBarrier => "tcp_barrier",
         TestId::OverlapGemm => "overlap_gemm",
@@ -280,6 +343,7 @@ pub fn test_display_name(test: TestId) -> &'static str {
         TestId::OverlapFleetGemm => "overlap_fleet_gemm",
         TestId::OverlapFleetAllReduce => "overlap_fleet_all_reduce",
         TestId::OverlapRetention => "overlap_retention",
+        TestId::NcclNics => "nccl_nics",
     }
 }
 
@@ -337,8 +401,11 @@ pub fn build(
 
     // Fleet-relative straggler detection over per-subject medians, so
     // run-to-run noise inside one subject cannot masquerade as slowness.
+    // Fleet-level groups (sweep headlines, barrier fleet span: one value
+    // per run, on the lead host) have no fleet peers: they skip both MAD
+    // passes (`fleet_nccl`).
     let mut outliers = BTreeMap::new();
-    for (group, subjects) in &aggregates {
+    for (group, subjects) in mad_groups(&aggregates) {
         let samples: Vec<Sample> = subjects
             .iter()
             .map(|(key, aggregate)| Sample {
@@ -355,7 +422,7 @@ pub fn build(
     // Jitter: a subject whose spread is a high-side fleet outlier. Only
     // meaningful with repeats (n >= 2).
     let mut jitter_outliers = BTreeMap::new();
-    for (group, subjects) in &aggregates {
+    for (group, subjects) in mad_groups(&aggregates) {
         let spreads: Vec<Sample> = subjects
             .iter()
             .filter(|(_, aggregate)| aggregate.moments.n >= 2)
@@ -397,6 +464,11 @@ pub fn build(
         }
     }
 
+    // `None` only for a config whose `[nccl]` never validated, which
+    // `FleetConfig::load` rules out; recorded as "not recorded" rather than
+    // guessed.
+    let nccl_level_env = config.nccl_levels().ok().map(NcclLevelEnvs::to_record);
+
     let failed_hosts: BTreeMap<String, Vec<String>> = observations
         .iter()
         .filter(|(_, obs)| !obs.errors.is_empty())
@@ -406,12 +478,13 @@ pub fn build(
     let fleet = FleetAnalysis {
         outliers,
         threshold_violations,
-        consistency: consistency_findings(&observations),
+        consistency: consistency::findings(&observations),
         failed_hosts,
         jitter_outliers,
         sdc_failures: sdc_failures(&observations),
         counter_findings: counter_findings(&observations),
         barrier_stragglers: barrier_straggler_flags(&aggregates, &config.thresholds),
+        socket_fallbacks: nccl_transport::socket_fallbacks(&observations, nccl_level_env.as_ref()),
     };
     let calibration = Calibration {
         rooflines: rooflines(&observations),
@@ -428,6 +501,7 @@ pub fn build(
         started_epoch_secs,
         finished_epoch_secs,
         debug_build: false,
+        gauntlet_version: Some(BuildInfo::current()),
         hosts: observations,
         // `None` only for a config whose `[nccl]` never validated, which
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
@@ -436,10 +510,34 @@ pub fn build(
         // Known only to the orchestrator (`--launch` override, allocation
         // env); `gauntlet run` stamps it after building.
         launch: None,
+        verdict: None,
+        nccl_level_env,
         fleet,
         aggregates,
         calibration,
     }
+}
+
+impl RunResults {
+    /// Mark the document as a finished run: record its verdict. Called
+    /// once, on the final document only — a partial snapshot of a run in
+    /// flight keeps `verdict: None`, because a verdict over incomplete
+    /// data would read as final.
+    pub fn finalize(&mut self) {
+        self.verdict = Some(verdict(self));
+    }
+}
+
+/// The aggregate groups that enter the fleet-relative MAD passes (outliers
+/// and jitter): every group but the fleet-level ones (sweep headlines,
+/// barrier fleet span), which have one subject per run and so no peers to
+/// be compared against.
+fn mad_groups(
+    aggregates: &Aggregates,
+) -> impl Iterator<Item = (&String, &BTreeMap<String, MetricAggregate>)> {
+    aggregates
+        .iter()
+        .filter(|(group, _)| !fleet_nccl::is_fleet_level(group))
 }
 
 /// Reduce raw (possibly repeated) metric records into per-subject
@@ -658,47 +756,6 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
     derived
 }
 
-pub fn verdict(results: &RunResults) -> Verdict {
-    if !results.fleet.failed_hosts.is_empty() {
-        return Verdict::HostFailures;
-    }
-    let has_failed_tests = results.hosts.values().any(|obs| {
-        obs.outcomes
-            .iter()
-            .any(|(_, _, outcome)| matches!(outcome, crate::proto::TestOutcome::Failed { .. }))
-    });
-    let has_outliers = results
-        .fleet
-        .outliers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_violations = results
-        .fleet
-        .threshold_violations
-        .values()
-        .any(|violators| !violators.is_empty());
-    let has_barrier_stragglers = results
-        .fleet
-        .barrier_stragglers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_counter_findings = results
-        .fleet
-        .counter_findings
-        .values()
-        .any(|findings| !findings.is_empty());
-    if has_failed_tests
-        || has_outliers
-        || has_violations
-        || has_barrier_stragglers
-        || has_counter_findings
-    {
-        Verdict::Stragglers
-    } else {
-        Verdict::Clean
-    }
-}
-
 /// Error counters that went up under load, per host. Zero deltas stay in
 /// the raw `counter_deltas`; negative deltas are resets, not errors.
 fn counter_findings(
@@ -789,61 +846,6 @@ fn violates(bound: &Bound, value: f64) -> bool {
     bound.min.is_some_and(|min| value < min) || bound.max.is_some_and(|max| value > max)
 }
 
-/// Majority vote over `proto::consistency_fields`; only fields with at least
-/// one dissenter are reported.
-fn consistency_findings(
-    observations: &BTreeMap<String, HostObservations>,
-) -> BTreeMap<String, ConsistencyFinding> {
-    let mut by_field: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for (host, obs) in observations {
-        let Some(inventory) = &obs.inventory else {
-            continue;
-        };
-        for (field, value) in consistency_fields(inventory) {
-            by_field
-                .entry(field)
-                .or_default()
-                .insert(host.clone(), value);
-        }
-    }
-
-    let mut findings = BTreeMap::new();
-    for (field, values) in by_field {
-        let Some(majority_value) = majority(&values) else {
-            continue;
-        };
-        let dissenters: BTreeMap<String, String> = values
-            .into_iter()
-            .filter(|(_, value)| *value != majority_value)
-            .collect();
-        if !dissenters.is_empty() {
-            findings.insert(
-                field,
-                ConsistencyFinding {
-                    majority_value,
-                    dissenters,
-                },
-            );
-        }
-    }
-    findings
-}
-
-/// Most common value; ties broken by the lexicographically smallest value so
-/// the result never depends on map iteration luck.
-fn majority(values: &BTreeMap<String, String>) -> Option<String> {
-    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
-    for value in values.values() {
-        *counts.entry(value.as_str()).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .min_by(|(a_value, a_count), (b_value, b_count)| {
-            b_count.cmp(a_count).then_with(|| a_value.cmp(b_value))
-        })
-        .map(|(value, _)| value.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Calibration
 // ---------------------------------------------------------------------------
@@ -926,20 +928,12 @@ fn reduce(obs: &HostObservations, test: TestId, name: &str, how: Reduce) -> Opti
 }
 
 fn link_fits(observations: &BTreeMap<String, HostObservations>) -> BTreeMap<String, AlphaBetaFit> {
-    let mut links = BTreeMap::new();
-    for (test, key) in [
-        // "rank_per_gpu": the fleet world became one rank per GPU in
-        // schema v8 — n is total GPUs and the ring mixes NVLink with the
-        // fabric — so these fits are not the v7 per-node `*_fleet` fits
-        // and must not be compared against them under the same name.
-        (TestId::NcclAllReduce, "nccl_allreduce_rank_per_gpu"),
-        (TestId::NcclAllGather, "nccl_allgather_rank_per_gpu"),
-    ] {
-        let points = sweep_points(observations, test);
-        if let Ok(fit) = fit_alpha_beta(&points) {
-            links.insert(key.to_string(), fit);
-        }
-    }
+    // "rank_per_gpu": the fleet world became one rank per GPU in schema v8
+    // — n is total GPUs and the ring mixes NVLink with the fabric — so
+    // those fits are not the v7 per-node `*_fleet` fits and must not be
+    // compared against them under the same name. "inter_node" (v14): the
+    // NIC-forcing world shapes.
+    let mut links = fleet_nccl::link_fits(observations);
     if let Some(fit) = tcp_pairwise_fit(observations) {
         links.insert("tcp_pairwise".to_string(), fit);
     }
@@ -1061,21 +1055,31 @@ fn id_suffix<'a>(seed_epoch_secs: u64, hosts: impl ExactSizeIterator<Item = &'a 
 /// Render the human table (per-host summary, outliers section, consistency
 /// section, calibration digest) to the given writer.
 pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    let run_verdict = verdict(results);
     writeln!(
         out,
-        "gauntlet run {} ({} hosts, {}s wall, verdict: {:?})",
+        "gauntlet run {} ({} hosts, {}s wall, verdict: {} (exit {}))",
         results.run_id,
         results.hosts.len(),
         results
             .finished_epoch_secs
             .saturating_sub(results.started_epoch_secs),
-        verdict(results),
+        run_verdict,
+        run_verdict.exit_code(),
     )?;
+    if let Some(version) = &results.gauntlet_version {
+        writeln!(out, "gauntlet {version}")?;
+    }
     writeln!(
         out,
         "nccl env: {}",
         nccl_env::format_nccl_env(results.nccl_env.as_ref())
     )?;
+    for (level, env) in
+        nccl_env::format_level_overrides(results.nccl_env.as_ref(), results.nccl_level_env.as_ref())
+    {
+        writeln!(out, "nccl env [{level}]: {env}")?;
+    }
     if let Some(launch) = &results.launch {
         writeln!(out, "launch: {launch}")?;
     }
@@ -1083,10 +1087,12 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     render_hosts(results, out)?;
     render_sdc(results, out)?;
     gpu_idle::render(results, out)?;
+    nccl_nics::render(results, out)?;
     render_outliers(results, out)?;
     render_jitter(results, out)?;
     render_barrier_stragglers(results, out)?;
     render_counter_findings(results, out)?;
+    nccl_transport::render(results, out)?;
     render_violations(results, out)?;
     render_consistency(results, out)?;
     render_failures(results, out)?;
@@ -1698,7 +1704,7 @@ mod tests {
         assert_eq!(flagged[0].key, "n2");
         assert!((flagged[0].slowest_frac - 0.92).abs() < 1e-12);
         assert_eq!(flagged[0].considered_iters, 1800.0);
-        assert_eq!(verdict(&results), Verdict::Stragglers);
+        assert_eq!(verdict(&results), Verdict::Outliers);
     }
 
     #[test]

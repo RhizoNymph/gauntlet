@@ -30,7 +30,7 @@ presence/absence questions (those belong to inventory consistency).
 5. **Report** (`report/mod.rs`): `counter_findings()` keeps only deltas
    with `after > before` and lands them in
    `fleet.counter_findings: host -> Vec<CounterFinding>`. Any finding makes
-   the verdict at least `Stragglers` (exit 1). The terminal table renders a
+   the verdict at least `Failures` (exit 3). The terminal table renders a
    section "error-counter deltas (across load phases)" with host, domain,
    device, counter, before, after, +increment — omitted entirely when
    there are no findings. The complete delta list (zeros included) stays in

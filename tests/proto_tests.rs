@@ -20,6 +20,7 @@ fn sample_inventory() -> InventorySnapshot {
         gpus: vec![],
         nics: vec![],
         ib_ports: vec![],
+        ib_devices: Vec::new(),
         xid_errors: vec![79],
         gpu_libs: std::collections::BTreeMap::new(),
         cuda_visible_gpus: None,
@@ -446,6 +447,7 @@ fn consistency_includes_gpu_libs_only_on_gpu_hosts() {
         nvlinks_active: None,
         persistence_mode: None,
         occupancy: Default::default(),
+        pci: None,
     });
     let fields = consistency_fields(&inv);
     assert_eq!(fields.get("lib:nccl").map(String::as_str), Some("absent"));

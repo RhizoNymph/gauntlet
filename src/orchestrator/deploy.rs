@@ -22,6 +22,7 @@
 //!   orchestrator installs the binary there once, locally (temp name +
 //!   rename), and every node only verifies the hash.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,9 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use super::fanout::fan_out;
+use super::session::remote_fs::{
+    FileMode, install_command, staging_path, sweep_stale_staging_command, upload_nonce,
+};
 use super::session::{HostSession, single_quote};
 use super::transport::{Launcher, SrunLauncher, SrunTransportError};
 use crate::launch::srun::{SrunDeploy, sbcast_staging_path};
@@ -172,23 +176,28 @@ fn hash_script(agent_path: &str) -> String {
     )
 }
 
-/// Per-node install from the sbcast staging file: copy to a temp name
-/// unique to this shell (`$$`, so nodes sharing a filesystem never write
-/// the same temp file), make it executable, rename over the agent (atomic;
-/// a running old agent keeps its inode, no `ETXTBSY`), print the new
-/// digest.
-fn sbcast_install_script(staging: &str, agent_path: &str) -> String {
+/// Per-node install from the sbcast staging file, with the same staging
+/// discipline as the ssh upload (`session::remote_fs`): sweep stale
+/// `<agent>.tmp.*` leftovers, copy to a fresh random sibling
+/// (`staging_path` with `nonce`, so nodes sharing a filesystem never write
+/// one temp file), set the mode and rename over the agent
+/// (`install_command`: atomic; a running old agent keeps its inode, no
+/// `ETXTBSY`), print the new digest.
+fn sbcast_install_script(staging: &str, agent_path: &str, nonce: u64) -> String {
     let bin_dir = agent_path
         .rsplit_once('/')
         .map(|(parent, _)| parent)
         .filter(|parent| !parent.is_empty())
         .unwrap_or("/");
-    let agent = single_quote(agent_path);
+    let temp = staging_path(agent_path, nonce);
     format!(
-        "set -e; mkdir -p {bin}; tmp={agent}.staging.$$; cp -f {staging} \"$tmp\"; \
-         chmod 755 \"$tmp\"; mv -f \"$tmp\" {agent}; {hash}",
+        "set -e; mkdir -p {bin}; {{ {sweep}; }} || true; cp -f {staging} {temp}; \
+         {install}; {hash}",
         bin = single_quote(bin_dir),
+        sweep = sweep_stale_staging_command(agent_path),
         staging = single_quote(staging),
+        temp = single_quote(&temp),
+        install = install_command(&temp, agent_path, FileMode::Executable),
         hash = hash_script(agent_path),
     )
 }
@@ -232,7 +241,7 @@ async fn ensure_fleet_srun(
             sbcast_and_install(srun, &stale, local_exe, local, max_concurrent, timeout).await
         }
         SrunDeploy::Shared => {
-            shared_install(srun, &stale, local_exe, local, max_concurrent, timeout).await
+            shared_install(&stale, local_exe, local, max_concurrent, timeout).await
         }
     };
     for (slot, outcome) in stale_slots.into_iter().zip(installed) {
@@ -252,29 +261,57 @@ async fn sbcast_and_install(
     max_concurrent: usize,
     timeout: Duration,
 ) -> Vec<Result<DeployOutcome>> {
-    let staging = sbcast_staging_path(srun.dir(), srun.job_id(), local);
-    info!(hosts = stale.len(), staging = %staging, "broadcasting agent with sbcast");
-    let reached = scoped_broadcast(srun, stale, local_exe, &staging, max_concurrent, timeout).await;
+    // sbcast writes one literal path on every target, and the staging file
+    // lives inside each node's *resolved* (physical, owner-checked) agent
+    // directory — so broadcast once per distinct resolved directory
+    // (normally one: the same template resolves alike on every node).
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, session) in stale.iter().enumerate() {
+        groups.entry(session.remote_dir()).or_default().push(index);
+    }
+    let mut reached: Vec<Option<Result<(), SrunTransportError>>> =
+        stale.iter().map(|_| None).collect();
+    let mut stagings: Vec<String> = vec![String::new(); stale.len()];
+    for (remote_dir, members) in &groups {
+        let staging = sbcast_staging_path(remote_dir, srun.job_id(), local);
+        info!(hosts = members.len(), staging = %staging, "broadcasting agent with sbcast");
+        let group: Vec<Arc<HostSession>> = members
+            .iter()
+            .map(|&index| Arc::clone(&stale[index]))
+            .collect();
+        let results =
+            scoped_broadcast(srun, &group, local_exe, &staging, max_concurrent, timeout).await;
+        for (&index, result) in members.iter().zip(results) {
+            reached[index] = Some(result);
+            stagings[index] = staging.clone();
+        }
+    }
 
-    let staging = Arc::new(staging);
     let local = Arc::new(local.to_string());
-    let installs: Vec<(Arc<HostSession>, Option<SrunTransportError>)> = stale
+    let installs: Vec<(Arc<HostSession>, String, Option<SrunTransportError>)> = stale
         .iter()
         .cloned()
-        .zip(reached.into_iter().map(Result::err))
+        .zip(stagings.iter().cloned())
+        .zip(reached.into_iter().map(|result| match result {
+            Some(Ok(())) => None,
+            Some(Err(error)) => Some(error),
+            None => Some(SrunTransportError::Carrier {
+                nodes: "?".into(),
+                detail: "no broadcast attempted".into(),
+            }),
+        }))
+        .map(|((session, staging), error)| (session, staging, error))
         .collect();
     let outcomes = fan_out(installs, max_concurrent, {
-        let staging = Arc::clone(&staging);
         let local = Arc::clone(&local);
-        move |(session, broadcast_error)| {
-            let staging = Arc::clone(&staging);
+        move |(session, staging, broadcast_error)| {
             let local = Arc::clone(&local);
             async move {
                 if let Some(error) = broadcast_error {
                     return Err(anyhow::Error::new(error)
                         .context(format!("broadcasting the agent to {}", session.addr())));
                 }
-                let script = sbcast_install_script(&staging, session.agent_path());
+                let script = sbcast_install_script(&staging, session.agent_path(), upload_nonce());
                 let install = session.exec(&script);
                 let digest = match tokio::time::timeout(timeout, install).await {
                     Ok(result) => {
@@ -298,19 +335,17 @@ async fn sbcast_and_install(
     // binary per job and version into the node's scratch space. Every node
     // the broadcast targeted is cleaned, whatever the broadcast or install
     // outcome (`rm -f` of a file that never arrived is harmless).
-    let cleanup = per_host(stale, max_concurrent, timeout, {
-        let staging = Arc::clone(&staging);
-        move |session| {
-            let staging = Arc::clone(&staging);
-            async move {
-                session
-                    .exec(&format!("rm -f {}", single_quote(&staging)))
-                    .await
-                    .map(|_| ())
-            }
+    let staged: Vec<(Arc<HostSession>, String)> = stale.iter().cloned().zip(stagings).collect();
+    let cleanup = fan_out(staged, max_concurrent, |(session, staging)| async move {
+        let command = format!("rm -f {}", single_quote(&staging));
+        match tokio::time::timeout(timeout, session.exec(&command)).await {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(anyhow!("timed out after {}s", timeout.as_secs())),
         }
     })
-    .await;
+    .await
+    .into_iter()
+    .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("cleanup task aborted"))));
     for (session, result) in stale.iter().zip(cleanup) {
         if let Err(error) = result {
             debug!(host = %session.addr(), %error, "sbcast staging file not removed");
@@ -397,14 +432,18 @@ fn isolates_per_node(error: &SrunTransportError) -> bool {
 }
 
 async fn shared_install(
-    srun: &Arc<SrunLauncher>,
     stale: &[Arc<HostSession>],
     local_exe: &Path,
     local: &str,
     max_concurrent: usize,
     timeout: Duration,
 ) -> Vec<Result<DeployOutcome>> {
-    let dest = PathBuf::from(srun.dir().as_str()).join(AGENT_RELPATH);
+    // The directory as the nodes resolved it (physical path); on a shared
+    // filesystem the orchestrator sees it at the same path.
+    let Some(first) = stale.first() else {
+        return Vec::new();
+    };
+    let dest = PathBuf::from(first.remote_dir()).join(AGENT_RELPATH);
     info!(dest = %dest.display(), "installing agent on the shared path");
     if let Err(error) = install_local(local_exe, &dest) {
         let message = format!("{error:#}");
@@ -552,6 +591,7 @@ mod tests {
         let script = sbcast_install_script(
             staging.to_str().expect("utf8"),
             agent.to_str().expect("utf8"),
+            0x1234,
         );
         let output = std::process::Command::new("sh")
             .arg("-c")

@@ -32,15 +32,16 @@ use tracing::{debug, info, warn};
 pub(crate) use self::srun::local as slurm_local;
 pub use self::srun::{SlurmTools, SrunChild, SrunLauncher, SrunTransportError};
 pub(crate) use self::ssh::upload as ssh_upload;
-use super::session::{AgentEnv, HostSession, RemoteOutput};
+use super::session::{HostSession, RemoteOutput};
 use crate::config::{FleetConfig, HostConfig, SshConfig};
 use crate::launch::slurm::{
     NodeAddrs, SlurmAllocation, apply_node_addrs, parse_hostnames, parse_node_addrs,
     scontrol_hostnames_args, scontrol_show_nodes_args, select_hosts,
 };
-use crate::launch::srun::{SrunDir, StepTarget, env_to_strip};
+use crate::launch::srun::{StepTarget, env_to_strip};
 use crate::launch::{LaunchMode, LaunchRecord};
 use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
 
 /// Bound on each `scontrol` call while resolving the fleet.
 const SCONTROL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -74,10 +75,10 @@ impl Launcher {
         }
     }
 
-    /// Open a session to `host`: establish the transport, then create and
-    /// resolve the agent directory on the node. `nccl_env` is set on every
-    /// agent spawn of the session.
-    pub async fn connect(&self, host: HostConfig, nccl_env: &NcclEnv) -> Result<HostSession> {
+    /// Open a session to `host`: establish the transport, then create,
+    /// check and resolve the agent directory on the node. `nccl` resolves
+    /// the env of every agent spawn of the session.
+    pub async fn connect(&self, host: HostConfig, nccl: Arc<NcclLevelEnvs>) -> Result<HostSession> {
         match self {
             Launcher::Ssh(config) => {
                 let session = ssh::connect(&host.addr, config).await?;
@@ -86,19 +87,18 @@ impl Launcher {
                     host,
                     HostTransport::Ssh(session),
                     &config.remote_dir,
-                    nccl_env,
+                    nccl,
                     timeout,
                 )
                 .await
             }
             Launcher::Srun(srun) => {
-                let dir = srun.dir().as_str().to_string();
                 let addr = host.addr.clone();
                 let established = HostSession::establish(
                     host,
                     HostTransport::Srun(Arc::clone(srun)),
-                    &dir,
-                    nccl_env,
+                    srun.dir(),
+                    nccl,
                     srun::STEP_SETUP_TIMEOUT,
                 )
                 .await;
@@ -150,10 +150,10 @@ pub async fn resolve_launch(
                 }
             };
             let fleet = config.with_hosts(apply_node_addrs(hosts, &addrs))?;
-            let dir = match &config.launch.srun.dir {
-                Some(dir) => dir.clone(),
-                None => SrunDir::default_for(env)?,
-            };
+            // A node-side template like `ssh.remote_dir` (default
+            // `/tmp/gauntlet-$USER`), resolved and owner-checked on each
+            // node by the same script.
+            let dir = config.launch.srun.dir.clone().unwrap_or_default();
             let inherited: Vec<String> = std::env::vars_os()
                 .filter_map(|(name, _)| name.into_string().ok())
                 .collect();
@@ -238,10 +238,17 @@ pub(crate) struct SpawnStdio {
 }
 
 /// Everything a spawn needs besides the transport: the agent binary, the
-/// environment it must start under, and `agent <args>`.
+/// environment it must start under (the session's precomputed choice for
+/// one `AgentEnv`, in both forms), and `agent <args>`.
 pub(crate) struct AgentCommand<'a> {
     pub host: &'a str,
-    pub env: &'a AgentEnv,
+    /// ssh: the quoted `env` words (LD_LIBRARY_PATH plus the NCCL env).
+    pub ssh_words: &'a [String],
+    /// srun: the agent lib dir, prepended to LD_LIBRARY_PATH in the step.
+    pub lib_dir: &'a str,
+    /// srun: the NCCL env (level env plus capture variables, or the global
+    /// env), set on the srun process and exported to the step.
+    pub nccl: &'a NcclEnv,
     pub agent_path: &'a str,
     pub args: &'a [&'a str],
 }

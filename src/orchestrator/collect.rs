@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 
 use tracing::{debug, error, info, warn};
 
+use crate::nccl_transport::NcclTransportReport;
 use crate::proto::{
-    AgentEvent, CounterDeltas, InventorySnapshot, LogLevel, MetricRecord, Scope, TestId,
-    TestOutcome,
+    AgentEvent, CounterDeltas, InventorySnapshot, LogLevel, MetricRecord, NcclNicSummary, Scope,
+    TestId, TestOutcome,
 };
 
 /// Everything observed about one host during a run.
@@ -27,6 +28,17 @@ pub struct HostObservations {
     /// Absent when the run had no load phases or the delta pass failed.
     #[serde(default)]
     pub counter_deltas: Option<CounterDeltas>,
+    /// The transports each NCCL-hosting agent process's communicator used
+    /// (one per process: level, span, capture), in arrival order across
+    /// repeats.
+    #[serde(default)]
+    pub nccl_transports: Vec<NcclTransportReport>,
+    /// Which IB/RoCE ports NCCL would use under the run's fleet-level env,
+    /// derived by the orchestrator from the inventory
+    /// (`orchestrator::derive`; schema v16). Absent without an inventory
+    /// and in older documents.
+    #[serde(default)]
+    pub nccl_nics: Option<NcclNicSummary>,
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +110,12 @@ impl Collector {
             AgentEvent::CounterDeltas { deltas } => {
                 host.counter_deltas = Some(*deltas);
             }
+            AgentEvent::NcclTransport { report } => {
+                host.nccl_transports.push(*report);
+            }
+            AgentEvent::NcclNics { summary } => {
+                host.nccl_nics = Some(*summary);
+            }
             AgentEvent::Fatal { message } => {
                 error!(host = host_addr, message, "agent fatal");
                 host.errors.push(message);
@@ -159,6 +177,7 @@ mod tests {
             gpus: Vec::new(),
             nics: Vec::new(),
             ib_ports: Vec::new(),
+            ib_devices: Vec::new(),
             xid_errors: Vec::new(),
             gpu_libs: Default::default(),
             cuda_visible_gpus: None,

@@ -1,7 +1,6 @@
 //! Pure argv builders for the srun transport: steps, sbcast carrier steps,
 //! the agent command run inside a step, and sbcast itself.
 
-use super::SrunDir;
 use super::flags::SrunFlag;
 use super::steps::StepName;
 use crate::launch::slurm::SlurmJobId;
@@ -126,12 +125,14 @@ pub fn sbcast_args(jobid: &str, source: &str, dest: &str) -> Vec<String> {
     ]
 }
 
-/// The sbcast destination: a sibling of `dir` (so its parent — `/tmp` by
-/// default — exists on every node), unique per job and binary so
-/// concurrent jobs of one user never write the same file.
-pub fn sbcast_staging_path(dir: &SrunDir, job: SlurmJobId, sha256: &str) -> String {
+/// The sbcast destination: inside `remote_dir` — the node's *physical*,
+/// owner-checked, mode-700 agent directory, as `remote_dir_script`
+/// resolved it — so the staged binary never sits in a world-writable
+/// directory where another user could pre-create or swap it. Unique per
+/// job and binary so concurrent jobs of one user never write one file.
+pub fn sbcast_staging_path(remote_dir: &str, job: SlurmJobId, sha256: &str) -> String {
     let short: String = sha256.chars().take(12).collect();
-    format!("{}.sbcast-{job}-{short}", dir.as_str())
+    format!("{remote_dir}/.sbcast-{job}-{short}")
 }
 
 #[cfg(test)]
@@ -291,10 +292,13 @@ mod tests {
                 "/tmp/gauntlet-u.sbcast-77-abc"
             ]
         );
-        let dir = SrunDir::parse("/tmp/gauntlet-u").expect("dir");
         assert_eq!(
-            sbcast_staging_path(&dir, SlurmJobId::new(77), "0123456789abcdef0123"),
-            "/tmp/gauntlet-u.sbcast-77-0123456789ab"
+            sbcast_staging_path(
+                "/tmp/gauntlet-u",
+                SlurmJobId::new(77),
+                "0123456789abcdef0123"
+            ),
+            "/tmp/gauntlet-u/.sbcast-77-0123456789ab"
         );
     }
 }

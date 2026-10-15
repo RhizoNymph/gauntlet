@@ -62,15 +62,27 @@ says to use `salloc`/`sbatch` or `--launch ssh`.
      typed errors) → `select_hosts` → `scontrol --oneliner show node
      <nodelist>` (one call for the whole allocation) → `parse_node_addrs`
      → `apply_node_addrs` → `config.with_hosts(..)`. Agent dir =
-     `[launch.srun] dir` or `/tmp/gauntlet-$USER`. The orchestrator env
+     `[launch.srun] dir`, a `RemoteDir` template like `ssh.remote_dir`
+     (default `/tmp/gauntlet-$USER`, `~`/`$USER` expanded on the node).
+     The orchestrator env
      names to strip (`env_to_strip`) and its own `LD_LIBRARY_PATH` are
      captured once. `SrunLauncher::new` starts the launcher's kill
      batcher task.
-3. `Launcher::connect(host)` → `HostSession::establish`: `mkdir -p <dir>
-   && cd && pwd` through `exec_capture` (srun: `srun ... sh -c <script>`,
-   step `gauntlet:<host>:exec`), bounded by `STEP_SETUP_TIMEOUT` (60 s).
-   A failed connect also cancels the host's exec steps by name.
-4. Deploy: `deploy::ensure_fleet` (see below).
+3. `Launcher::connect(host, Arc<NcclLevelEnvs>)` →
+   `HostSession::establish`: the same `remote_dir_script` as ssh
+   (`session/remote_fs.rs`: `mkdir -p -m 700`, refuse a foreign symlink
+   or a directory not owned by the login user, create `nccl-logs/` for
+   the NCCL debug files, print `pwd -P`) through `exec_capture` (srun:
+   `srun ... sh -c <script>`, step `gauntlet:<host>:exec`), bounded by
+   `STEP_SETUP_TIMEOUT` (60 s). The physical path is the session's
+   `remote_dir`. A failed connect also cancels the host's exec steps by
+   name. The per-`AgentEnv` env (global, or a level's env plus the
+   transport-capture NCCL_DEBUG / NCCL_DEBUG_SUBSYS / NCCL_DEBUG_FILE
+   under `<remote_dir>/nccl-logs/`) is computed once, as quoted words for
+   ssh and as maps for srun.
+4. Deploy: `deploy::ensure_fleet` (see below), then the NCCL shim pass
+   (`nccl_shim::ensure_fleet_shims`), which runs over either transport's
+   exec.
 5. Phases: unchanged. `HostSession::{run_agent, run_agent_capture,
    spawn_agent}` spawn through `HostTransport::spawn`; for srun that is a
    local `srun` child (`SrunChild`) whose stdin/stdout/stderr are the
@@ -147,8 +159,15 @@ own `CUDA_VISIBLE_DEVICES`, `ROCR_VISIBLE_DEVICES` and
 `GPU_DEVICE_ORDINAL` are removed from the srun process env.
 
 ### Agent environment
-`HostSession` holds an `AgentEnv { lib_dir, nccl }`.
-- NCCL env: set on the local srun process (`Command::env`) and exported
+`HostSession` precomputes, per `AgentEnv` (`Base`, or `Nccl(level)`), the
+env as quoted words (`SpawnWords`, ssh) and as a typed map (`SpawnEnvs`,
+srun); spawns pass both through `AgentCommand` and the transport picks
+its form.
+- NCCL env (the global env for `Base`; for a level, its effective env
+  plus the transport-capture NCCL_DEBUG / NCCL_DEBUG_SUBSYS /
+  NCCL_DEBUG_FILE=`<remote_dir>/nccl-logs/<level>.%h.log`, never
+  overriding a configured one): set on the local srun process
+  (`Command::env`) and exported
   with `--export=ALL`; no shell parses it, so any value `NcclEnv` accepts
   arrives byte for byte. (`--export=ALL,NCCL_X=v` is not used: srun splits
   `--export` on commas.) Every `NCCL_*` of the orchestrator's own
@@ -197,22 +216,27 @@ There is no sftp. `[launch.srun] deploy`:
   --ntasks=K --ntasks-per-node=1 --nodelist=<stale> sleep <t>`) is
   started, found by name in squeue, and used as `sbcast --force
   --jobid=<SLURM_JOB_ID>[+<het offset>].<step> <binary>
-  <dir>.sbcast-<job>-<sha12>`, which transmits to that step's nodes only;
-  the carrier is then cancelled (scancel, plus SIGTERM on drop). If the
-  fleet broadcast fails (sbcast, carrier, squeue or timeout error), it is
-  retried **per node**, so one bad node fails only its own deploy. Then
-  per host an install step (`sbcast_install_script`: `mkdir -p bin; cp`
-  to `<agent>.staging.$$`; `chmod 755`; `mv -f`; print the digest,
-  verified against the local one). Finally the staging file is removed
-  (`rm -f`, best effort) from **every** targeted node, whatever the
-  broadcast or install outcome. The staging file is a sibling of `dir` so
-  its parent (`/tmp` by default) exists; unique per job and binary.
-  Node-local `dir` means every node writes only its own copy (no
-  shared-home write race, gap 6), and a running old agent keeps its
-  inode.
+  <remote_dir>/.sbcast-<job>-<sha12>`, which transmits to that step's
+  nodes only; the carrier is then cancelled (scancel, plus SIGTERM on
+  drop). The staging file lives *inside* the node's resolved agent
+  directory — physical, owned by the user, mode 700 — never in a
+  world-writable parent where another user could pre-create or swap it;
+  stale hosts are grouped by their resolved directory (normally one
+  group) since sbcast writes one literal path. If a group broadcast fails
+  (sbcast, carrier, squeue or timeout error), it is retried **per
+  node**, so one bad node fails only its own deploy. Then per host an
+  install step (`sbcast_install_script`, reusing `session::remote_fs`:
+  sweep stale `<agent>.tmp.*`, `cp` to a random `staging_path` sibling,
+  `install_command` = `chmod 755` + `mv -f`, print the digest, verified
+  against the local one). Finally the staging file is removed (`rm -f`,
+  best effort) from **every** targeted node, whatever the broadcast or
+  install outcome. Node-local `dir` means every node writes only its own
+  copy (no shared-home write race, gap 6), and a running old agent keeps
+  its inode.
 - `shared`: `dir` is a shared filesystem visible to the orchestrator and
-  all nodes; the orchestrator installs the binary once locally (temp name
-  + rename) and each stale node only re-hashes it.
+  all nodes at the path the nodes resolved; the orchestrator installs the
+  binary once locally (temp name + rename) and each stale node only
+  re-hashes it.
 srun transport failures are typed (`SrunTransportError`: Spawn, Io,
 Timeout, Squeue, Scancel, Sbcast, Carrier, Scontrol, ...), which is how
 deploy decides whether a failed fleet broadcast is worth isolating per
@@ -223,8 +247,8 @@ node.
 - `src/launch/slurm.rs` — `SlurmJobId`, `SlurmAllocation::from_env`,
   `parse_hostnames`, `select_hosts`, `scontrol_show_nodes_args`,
   `parse_node_addrs`, `apply_node_addrs`, `SlurmError`.
-- `src/launch/srun/mod.rs` — `SrunConfig`, `SrunDir`, `SrunDeploy`,
-  `DEFAULT_FLAGS`.
+- `src/launch/srun/mod.rs` — `SrunConfig` (`dir: Option<RemoteDir>`),
+  `SrunDeploy`, `DEFAULT_FLAGS`.
 - `src/launch/srun/flags.rs` — `SrunFlag`, `SrunFlagError`,
   `FlagRejection`.
 - `src/launch/srun/steps.rs` — `StepName`, `StepTarget`, `step_matches`,
@@ -236,13 +260,17 @@ node.
 - `src/orchestrator/transport/mod.rs` — `Launcher`, `resolve_launch`,
   `HostTransport`, `AgentChild`, `kill_agents`.
 - `src/orchestrator/transport/ssh.rs` — openssh transport (unchanged
-  behaviour).
+  behaviour), including the sftp upload with `remote_fs` staging.
+- `src/orchestrator/session/remote_fs.rs` — `remote_dir_script`,
+  `staging_path`, `upload_nonce`, `install_command`,
+  `sweep_stale_staging_command` (shared by both transports' deploys).
 - `src/orchestrator/transport/srun.rs` — `SrunLauncher` (exec, spawn,
   `kill_steps` via the kill batcher, `broadcast` via a carrier step),
   `SrunChild` (SIGTERM on drop), `SrunTransportError`, `SlurmTools`,
   `local`.
-- `src/orchestrator/session.rs` — `HostSession` (`kill_agent`,
-  `kill_agents`), `AgentEnv`.
+- `src/orchestrator/session.rs` — `HostSession` (`establish`,
+  `kill_agent`, `kill_agents`), `AgentEnv`, `SpawnWords`, `SpawnEnvs`,
+  `spawn_env`.
 - `src/orchestrator/fanout.rs` — `fan_out`, the bounded-concurrency
   helper shared by deploy and bootstrap.
 - `src/orchestrator/deploy.rs` — `ensure_fleet`, `scoped_broadcast`.
@@ -267,7 +295,11 @@ node.
   orchestrator's own `LD_LIBRARY_PATH`.
 - A broadcast never targets nodes outside the stale, connected set, and
   its staging file is removed from every node it targeted.
-- `PROTO_VERSION` is unchanged; `SCHEMA_VERSION` is 13
+- The srun agent directory passes the same `remote_dir_script` checks as
+  ssh (owner, foreign symlink, 700, `nccl-logs/`, physical path).
+- Errors before a verdict (`SlurmError`: not in an allocation, hosts
+  outside it) exit with `EXIT_ERROR` (4), never a verdict code.
+- `PROTO_VERSION` is unchanged (13); `SCHEMA_VERSION` is 17
   (`RunResults.launch`).
 
 ## Testing

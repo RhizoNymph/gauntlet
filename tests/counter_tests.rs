@@ -587,7 +587,7 @@ fn nonzero_increments_become_findings_and_zero_stays_quiet() {
             .len(),
         2
     );
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Failures);
 }
 
 #[test]

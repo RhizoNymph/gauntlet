@@ -56,10 +56,13 @@ rounds × window cost for little extra attribution.
      intra-node NCCL sweep): one `CudaContext` per GPU; NCCL communicator
      via `Comm::from_devices` (`ncclCommInitAll`, single process, one rank
      per GPU, each rank on its device's default stream). The init sees the
-     run's NCCL env because the orchestrator set it on the `agent run`
-     spawn command line (`agent run` executes on the multi-threaded tokio
-     runtime, so the agent never mutates its own env;
-     docs/features/nccl_env.md). Warmup rounds, then
+     `overlap_intranode` level's NCCL env (global `[nccl] env` plus
+     `[nccl.levels.overlap_intranode]`) because the orchestrator set it on
+     the overlap-phase `agent run` spawn command line (`agent run`
+     executes on the multi-threaded tokio runtime, so the agent never
+     mutates its own env; docs/features/nccl_env.md). Warmup rounds; after
+     them the agent records the transports NCCL chose (`NcclTransport`,
+     level `overlap_intranode`; docs/features/nccl_transport.md); then
      the **isolated baseline**: `timed_rounds` drives grouped all-reduces
      (`ncclGroupStart`/`End`, `ROUND_ITERS` per sync) for `baseline_secs`.
    - **Combined window**: one plain thread per GPU
@@ -110,7 +113,11 @@ collective path contends with its own compute and the whole node's power
 and PCIe pressure — the "every GPU loaded, fabric busy" regime training
 actually runs in. Rendezvous reuses the `agent nccl` relay (the lead host
 mints the `NcclId`, the orchestrator relays it); the NCCL env arrives the
-same way as for the sweep, on the spawn command line.
+same way as for the sweep, on the spawn command line, as the
+`overlap_fleet` level's effective env. After the step every host's
+process reports its communicator's transports (`NcclTransport`, level
+`overlap_fleet`, multi host); a socket fallback there is a
+`fleet.socket_fallbacks` finding like the sweep's.
 
 v6 ran one rank per node on GPU 0 only, so a degraded GPU↔NIC path
 behind any other GPU was invisible; that limitation is gone.
@@ -200,7 +207,9 @@ without a GPU):
 ### Flow
 1. Orchestrator (`orchestrator/nccl/mod.rs::overlap_fleet_sweep`, inside the
    Overlap phase arm after the node-local fan-out, gated on
-   `tests.overlap_fleet` and ≥ 2 hosts from `nccl_world`): builds an
+   `tests.overlap_fleet` and ≥ 2 hosts from `rank_per_gpu_world(nccl_hosts(..))` — always
+   rank-per-GPU, whatever `tests.nccl_world` says, because retention
+   compares every GPU against its own phase-2 baseline): builds an
    `NcclJob` with `NcclWorkload::Overlap(spec)` and runs it through
    `drive_fleet_nccl` — the rendezvous-relay + participant-supervision
    driver shared with the phase-3 sweep — in `WarnOnly` failure mode.
@@ -299,7 +308,7 @@ self-contained).
 - `src/agent/mod.rs` — phase dispatch (`overlap_phase`, gpu/non-gpu).
 - `src/orchestrator/mod.rs` — Overlap phase arm (node-local fan-out then
   the fleet step).
-- `src/orchestrator/nccl/mod.rs` — `nccl_world` / `NcclJob` /
+- `src/orchestrator/nccl/mod.rs` — `nccl_hosts` + `rank_per_gpu_world` / `NcclJob` /
   `drive_fleet_nccl` (returns the per-host failure map) shared with the
   phase-3 sweep; `overlap_fleet_sweep`.
 - `src/orchestrator/nccl/records.rs` — `host_overlap_records` (takes the

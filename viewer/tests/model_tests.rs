@@ -67,6 +67,7 @@ fn inventory(hostname: &str, kernel: &str) -> InventorySnapshot {
         gpus: Vec::new(),
         nics: Vec::new(),
         ib_ports: Vec::new(),
+        ib_devices: Vec::new(),
         xid_errors: Vec::new(),
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: None,
@@ -160,7 +161,7 @@ fn failed_node_scope_outcome_marks_node_bad() {
     ]);
     let vm = ViewModel::new(&results(&config, hosts));
 
-    assert_eq!(vm.verdict, Verdict::Stragglers);
+    assert_eq!(vm.verdict, Verdict::Failures);
     let n = node(&vm, "a");
     assert_eq!(n.severity, Severity::Bad);
     assert!(n.issues.iter().any(|(_, text)| {
@@ -217,7 +218,7 @@ fn slow_pair_flags_edge_warn_and_rows() {
     }
     let vm = ViewModel::new(&results(&config, hosts));
 
-    assert_eq!(vm.verdict, Verdict::Stragglers);
+    assert_eq!(vm.verdict, Verdict::Outliers);
     assert!(vm.nodes.iter().all(|n| n.severity == Severity::Ok));
     let e = edge(&vm, "c", "d");
     assert_eq!(e.severity, Severity::Warn);
