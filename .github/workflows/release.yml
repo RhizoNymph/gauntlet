@@ -1,0 +1,288 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+# The APT repository is a single git branch in another repo; two releases
+# rewriting its reprepro database at once would corrupt it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # gpui links libxkbcommon and libxkbcommon-x11 at build time. Wayland,
+  # Vulkan and fontconfig are dlopened at runtime and need no -dev packages
+  # here. cudarc likewise dlopens the CUDA stack, so no CUDA toolchain is
+  # required to build the GPU feature.
+  BUILD_DEPS: libxkbcommon-dev libxkbcommon-x11-dev pkg-config
+  # The CLI is what the orchestrator copies onto every node, so its glibc
+  # floor decides which nodes can run it. It is cross-linked against this
+  # glibc with zig rather than inheriting the runner's (24.04 -> 2.39).
+  CLI_TARGET: x86_64-unknown-linux-gnu
+  GLIBC_FLOOR: "2.31"
+  ZIG_VERSION: "0.16.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+
+jobs:
+  verify:
+    name: Verify version and test
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      # A tag whose version disagrees with the manifests would publish a crate
+      # that can never be matched to its release, so fail before anything is
+      # pushed anywhere.
+      - name: Check manifest versions match the tag
+        run: |
+          VERSION="${{ steps.resolve.outputs.version }}"
+          fail=0
+          for pkg in gauntlet-bench gauntlet-view; do
+            got=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg p "$pkg" '.packages[] | select(.name==$p) | .version')
+            if [ "$got" != "$VERSION" ]; then
+              echo "::error::$pkg is version $got but the tag says $VERSION"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  build:
+    name: Build packages
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --version =3.7.0 --locked
+
+      # zig supplies the linker and glibc stubs for an older glibc. It is
+      # installed into a plain directory rather than site-packages, because
+      # the runner's system Python is externally managed (PEP 668).
+      # cargo-zigbuild finds it through `python3 -m ziglang`.
+      - name: Install zig and cargo-zigbuild
+        run: |
+          python3 -m pip install --target "$RUNNER_TEMP/zig" "ziglang==$ZIG_VERSION"
+          echo "PYTHONPATH=$RUNNER_TEMP/zig" >> "$GITHUB_ENV"
+          cargo install cargo-zigbuild --version "=$CARGO_ZIGBUILD_VERSION" --locked
+
+      - name: Build the CLI against glibc ${{ env.GLIBC_FLOOR }}
+        run: |
+          cargo zigbuild --release --locked -p gauntlet-bench \
+            --target "$CLI_TARGET.$GLIBC_FLOOR"
+
+      # Guard the floor rather than trusting the toolchain: if any dependency
+      # pulls in a newer glibc symbol, fail the release instead of shipping a
+      # binary that older nodes cannot load.
+      - name: Check the CLI's glibc floor
+        run: |
+          BIN="target/$CLI_TARGET/release/gauntlet"
+          newest=$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
+          # An empty result sorts below any floor, so treat it as a failure
+          # rather than letting a missing or unreadable binary pass.
+          if [ -z "$newest" ]; then
+            echo "::error::no GLIBC_* symbols found in $BIN"
+            exit 1
+          fi
+          echo "newest glibc symbol: $newest (floor $GLIBC_FLOOR)"
+          if [ "$(printf '%s\n%s\n' "$newest" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::gauntlet needs glibc $newest, above the $GLIBC_FLOOR floor"
+            exit 1
+          fi
+
+      # Built separately so a node installing the CLI never pulls the GUI's
+      # Vulkan/Wayland runtime dependencies.
+      # - The CLI package wraps the zig-built binary as is (--no-build). Its
+      #   glibc-floor variant declares libc6 explicitly, because
+      #   dpkg-shlibdeps would report 2.34 for the libdl/libpthread links
+      #   (see Cargo.toml).
+      # - The viewer is a desktop app that never runs on nodes, so it is a
+      #   native build.
+      - name: Build .deb packages
+        run: |
+          mkdir -p dist
+          cargo deb -p gauntlet-bench --no-build --target "$CLI_TARGET" \
+            --variant glibc-floor --output dist/
+          cargo deb -p gauntlet-view --output dist/
+
+      # The declared libc6 floor is hand-written in Cargo.toml, so check that
+      # it matches the floor the binary was actually linked against.
+      - name: Check the CLI package's libc6 dependency
+        run: |
+          depends=$(dpkg-deb -f dist/gauntlet_*.deb Depends)
+          echo "gauntlet Depends: $depends"
+          case "$depends" in
+            *"libc6 (>= $GLIBC_FLOOR)"*) ;;
+            *) echo "::error::gauntlet .deb does not declare libc6 (>= $GLIBC_FLOOR)"; exit 1 ;;
+          esac
+
+      - name: Build release tarballs
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          tar -czf "dist/gauntlet-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C "target/$CLI_TARGET/release" gauntlet
+          tar -czf "dist/gauntlet-view-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            -C target/release gauntlet-view
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+          if-no-files-found: error
+
+  publish-apt:
+    name: Publish to APT repository
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - name: Check out the APT repository branch
+        uses: actions/checkout@v4
+        with:
+          repository: RhizoNymph/sysdui
+          ref: apt-repo
+          token: ${{ secrets.APT_REPO_TOKEN }}
+          path: apt-repo
+
+      - name: Install reprepro
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Import GPG signing key
+        run: echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
+
+      # `reprepro includedeb` refuses a version it already has, so drop any
+      # existing copy first; this makes re-running a release idempotent.
+      - name: Add packages to the repository
+        run: |
+          cd apt-repo
+          reprepro --export=never remove stable gauntlet gauntlet-view || true
+          for deb in ../dist/*.deb; do
+            reprepro includedeb stable "$deb"
+          done
+
+      - name: Push updated repository
+        run: |
+          cd apt-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repository already up to date."
+          else
+            git commit -m "Add gauntlet ${{ needs.verify.outputs.tag }}"
+            git push
+          fi
+
+  github-release:
+    name: Create GitHub release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
+
+      # gauntlet-view depends on gauntlet-bench, so the order is fixed and the
+      # second publish has to wait for the first to reach the index.
+      - name: Publish
+        run: |
+          VERSION="${{ needs.verify.outputs.version }}"
+          UA="gauntlet-release-ci (https://github.com/RhizoNymph/gauntlet)"
+
+          published() {
+            curl -sS -H "User-Agent: $UA" \
+              "https://crates.io/api/v1/crates/$1/$2" \
+              | grep -q '"num":'
+          }
+
+          for pkg in gauntlet-bench gauntlet-view; do
+            if published "$pkg" "$VERSION"; then
+              echo "$pkg $VERSION is already on crates.io, skipping."
+              continue
+            fi
+
+            # Deliberately not --locked: publishing gauntlet-view resolves
+            # gauntlet-bench from the registry rather than the workspace path,
+            # which the committed lock file does not describe.
+            cargo publish -p "$pkg"
+
+            echo "Waiting for $pkg $VERSION to appear in the index..."
+            for _ in $(seq 1 30); do
+              if published "$pkg" "$VERSION"; then
+                echo "$pkg $VERSION is available."
+                break
+              fi
+              sleep 10
+            done
+          done
