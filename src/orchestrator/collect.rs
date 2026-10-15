@@ -181,6 +181,7 @@ mod tests {
             xid_errors: Vec::new(),
             gpu_libs: Default::default(),
             cuda_visible_gpus: None,
+            gpu_driver: None,
         }
     }
 

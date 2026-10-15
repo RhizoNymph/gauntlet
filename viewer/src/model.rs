@@ -303,6 +303,15 @@ impl ViewModel {
                 }
             }
         }
+        // No majority: every host's value differs from some other host's,
+        // and none is singled out.
+        for (field, split) in &results.fleet.consistency_splits {
+            for (host, value) in &split.values {
+                if let Some(node) = nodes.get_mut(host) {
+                    note_skew(node, format!("inventory {field}: {value:?} (no majority)"));
+                }
+            }
+        }
 
         let links = results
             .calibration

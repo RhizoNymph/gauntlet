@@ -127,9 +127,14 @@ shows. The level also calibrates the simulator's intra-node link class.
    2 (the same CUDA-visible count the fleet world sizes rank blocks from,
    never the nvidia-smi count) gets Skipped outcomes for both tests from
    the orchestrator, with the reason. A host without a CUDA-visible count
-   is still dispatched: the agent's own gate is authoritative, and a
-   driver that cannot count GPUs on a GPU-bearing host is a Failed
-   finding. The rest run `node_phase(.., Phase::Network, ..)` — the ordinary per-node
+   is still dispatched: the agent's own gate is authoritative
+   (`intranode::gate_devices` over the classified `DeviceAvailability`,
+   docs/features/phase2_gpu.md): no usable GPU (`CUDA_ERROR_NO_DEVICE`,
+   an init-time load failure) is Skipped — the driver is the `gpu_driver`
+   finding — and any other driver fault is Failed. A host whose driver
+   is unavailable lists no GPU (nvidia-smi fails), so it is not
+   GPU-bearing (`orchestrator::is_gpu_bearing`) and never reaches the
+   intra-node or fleet NCCL steps (its rank count is 0 either way). The rest run `node_phase(.., Phase::Network, ..)` — the ordinary per-node
    fan-out, all hosts at once, no rendezvous, no relay. CPU-only hosts are
    not dispatched to (no intra-node level; a missing driver there is not a
    finding for this test).

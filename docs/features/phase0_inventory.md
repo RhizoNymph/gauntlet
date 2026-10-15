@@ -7,8 +7,10 @@ consistency analysis happens in reporting. Non-scope: fixing anything.
 ## Data flow
 `agent run` (phase `inventory`) → `inventory::collect()` →
 `AgentEvent::Inventory { snapshot }` → collector stores per host →
-`report::build` extracts `proto::consistency_fields` and flags dissenters
-from the majority value per field.
+`report::build` extracts the typed `proto::consistency_values`
+(`FieldValue::{Present, Missing}`) and flags dissenters from the majority
+of present values per field, or reports a field with no majority as a
+split (docs/features/reporting.md).
 
 ## Probe sources (all best effort — missing tool/permission ⇒ None/empty,
 never an error; only unreadable /proc fails)
@@ -59,8 +61,85 @@ never an error; only unreadable /proc fails)
   the inventory phase emits a Failed `inventory` outcome (Node scope)
   with the reason, making the verdict at least Failures.
 
+- GPU driver state: `gpu_driver` (proto v14), see "GPU driver state".
+
 The `ib_ports` bootstrap column reads `IbPortInventory::logical_state()`
 (typed `PortState`) rather than comparing strings.
+
+## GPU driver state and gpu_driver (proto v14 / schema v18)
+
+### Scope
+Tell "no NVIDIA hardware" apart from "NVIDIA hardware the driver cannot
+drive" without relying on the driver: a node rebooted into a kernel
+without the NVIDIA module (2026-10-15: RTX 3090 on the bus, nvidia-smi
+failing, `CUDA_ERROR_NO_DEVICE`) used to look like a CPU-only host in the
+inventory (gpus = 0) while its GPU and overlap tests each failed with the
+same CUDA error. Now the driver is exactly one hard finding and the GPU
+tests skip. Non-scope: fixing the driver, nouveau/other vendors.
+
+### Types (`src/proto/gpu_driver.rs`, `src/proto/pci_addr.rs`)
+- `InventorySnapshot.gpu_driver: Option<GpuDriverState>` (serde default;
+  `None` = not recorded: pre-v14 agents, snapshots built outside
+  `agent::inventory`).
+- `GpuDriverState::{NoNvidiaHardware, DriverOk, DriverUnavailable {
+  pci_gpus: PciGpus, module: NvidiaModule, nvidia_smi: NvidiaSmiFailure }}`
+  (tag `state`).
+- `PciGpus`: sorted, deduplicated, **non-empty** list of `PciBusId`
+  (`try_from` on decode rejects `[]`), so "driver unavailable for no
+  hardware" is unrepresentable.
+- `NvidiaModule::{Loaded, NotLoaded { kernel, availability }}`,
+  `ModuleAvailability::{Installed, MissingForKernel, Unknown}`.
+- `NvidiaSmiFailure::{NotFound, Failed { message }, TimedOut,
+  ListedNone}` (`message` = nvidia-smi's first non-empty output line).
+- `PciBusId` (moved from `agent::gpu_occupancy`, re-exported there) now
+  lives in proto and serializes as its canonical string.
+- `GpuDriverState::classify(pci_gpus, smi_listed_gpus, smi_failure,
+  module)` — the pure decision: nvidia-smi listing GPUs is `DriverOk`
+  (authoritative even with sysfs hidden); otherwise an empty bus is
+  `NoNvidiaHardware`; otherwise `DriverUnavailable` (the module and
+  nvidia-smi closures run only then).
+- `GpuDriverState::outcome()`: Failed (reason names the PCI GPUs, the
+  module state — "not loaded and the running kernel 6.17.0-5-generic has
+  no nvidia module" — and the nvidia-smi error), Passed, Skipped.
+
+### Collection (`src/agent/gpu_driver.rs`, `src/agent/inventory.rs`)
+1. `probe_gpus` runs the GPU query through `run_probe`, the typed form of
+   `run_capture` (`ProbeError::{NotFound, Spawn, Wait, TimedOut, Exited
+   { status, output }, NotUtf8}`; stdout *and* stderr are drained so a
+   failure keeps its text), and maps a failure to `NvidiaSmiFailure`.
+2. `gpu_driver::probe(roots, smi, kernel)` with `DriverProbeRoots
+   { pci_devices, sys_module, lib_modules }` (injectable; `Default` is
+   `/sys/bus/pci/devices`, `/sys/module`, `/lib/modules`):
+   - `nvidia_pci_gpus`: every `<pci_devices>/<addr>` with `vendor`
+     0x10de and `class >> 8` 0x0300 (VGA) or 0x0302 (3D controller); the
+     card's audio/USB functions and other vendors are skipped, unreadable
+     entries ignored.
+   - `nvidia_module`: `<sys_module>/nvidia` present ⇒ Loaded; otherwise
+     `<lib_modules>/<kernel>/modules.dep` decides availability
+     (`modules_dep_has_nvidia`: a module file named exactly `nvidia.ko*`;
+     nvidia-drm/uvm do not count), unreadable ⇒ Unknown.
+3. `collect` records `gpu_driver: Some(..)` with the same `kernel_release`
+   it reports.
+
+### Where the outcome is made
+`orchestrator::derive::derive_inventory_events` emits the node-scope
+`TestId::GpuDriver` outcome first, from `state.outcome()`, whenever the
+snapshot records a state. `report::failed_outcome_tier(GpuDriver)` is
+**hard**: a GPU the driver cannot drive is broken software on the node.
+The GPU-touching agent tests on such a host record Skipped
+(docs/features/phase2_gpu.md, overlap_phase.md, phase3_network.md), so
+the root cause is counted once. Such a host lists no GPU, so it is not
+GPU-bearing and never joins intra-node or fleet NCCL work.
+
+Running the GPU phase without the inventory phase loses the finding (the
+tests skip, nothing derives `gpu_driver`); the Skipped reasons still name
+the PCI GPUs and point at `gpu_driver`.
+
+### Invariants
+- `TestId::GpuDriver` is never emitted by an agent; at most one per host
+  per inventory.
+- `DriverUnavailable` always names at least one PCI GPU.
+- Old inventories decode with `gpu_driver: None` and derive nothing.
 
 ## InfiniBand inventory (proto v13 / schema v16)
 
@@ -231,16 +310,26 @@ site: they yield `None`.
 
 ## Files
 - `src/agent/inventory.rs` — `collect`, `run`, `probe_cuda_visible_gpus`,
-  `GPU_QUERY`, `gpus_from_nvidia_smi`, `parse_gpu_query`.
-- `src/agent/gpu_occupancy.rs` — `COMPUTE_APPS_QUERY`, `PciBusId`,
-  `PciBusIdError`, `ComputeApp`, `parse_compute_apps`, `AgentIdentity`,
+  `GPU_QUERY`, `gpus_from_nvidia_smi`, `parse_gpu_query`, `run_capture`,
+  `run_probe`, `ProbeError`.
+- `src/agent/gpu_driver.rs` — `DriverProbeRoots`, `nvidia_pci_gpus`,
+  `is_nvidia_gpu`, `modules_dep_has_nvidia`, `nvidia_module`, `probe`;
+  also `DeviceAvailability` / `unavailable_reason` for the GPU phases.
+- `src/proto/gpu_driver.rs` — `GpuDriverState`, `PciGpus`,
+  `EmptyPciGpus`, `NvidiaModule`, `ModuleAvailability`,
+  `NvidiaSmiFailure`.
+- `src/proto/pci_addr.rs` — `PciBusId`, `PciBusIdError`.
+- `src/proto/consistency.rs` — `FieldValue`, `consistency_values`,
+  `consistency_fields`, `ABSENT`.
+- `src/agent/gpu_occupancy.rs` — `COMPUTE_APPS_QUERY`, `PciBusId` /
+  `PciBusIdError` (re-exported from proto), `ComputeApp`, `parse_compute_apps`, `AgentIdentity`,
   `parse_stat_ppid`, `exe_basename`, `classify`, `processes_by_bus`,
   `processes_for`.
 - `src/agent/ib.rs` — `INFINIBAND_ROOT`, `IbInventory`, `probe`.
 - `src/agent/pci.rs` — `PCI_DEVICES_ROOT`, `locate`, `resolve`.
 - `src/agent/sysfs.rs` — `read_trimmed` (shared attribute reader).
 - `src/proto/mod.rs` — `InventorySnapshot`, `GpuInventory`, `NicInventory`,
-  `consistency_fields`, `gpu_visibility_mismatch`.
+  `gpu_visibility_mismatch`.
 - `src/proto/ib.rs` — `IbPortInventory`, `IbDeviceInventory`, `PortRate`,
   `PortState`, `PhysState`, `LinkLayer`, `RoceVersion`, `IbSpeed`,
   `IbRate`, `IbRateError`, `PciLocation`, `PciLocality`, `pci_locality`,
@@ -249,13 +338,14 @@ site: they yield `None`.
   `ProcessOwner`, `GpuIdleAssessment`, `MemoryOverage`, `assess_gpu_idle`,
   `gpu_idle_outcomes`.
 - `src/orchestrator/derive.rs` — `derive_inventory_events`, the one hook
-  `node_phase` runs on every arriving inventory: the gpu_idle outcomes and
-  the nccl_nics outcome, ceiling metric and summary
-  (docs/features/nccl_nics.md).
+  `node_phase` runs on every arriving inventory: the gpu_driver outcome,
+  the gpu_idle outcomes and the nccl_nics outcome, ceiling metric and
+  summary (docs/features/nccl_nics.md).
 
 ## Invariants
 - `collect()` must complete in < 5s on a healthy node.
 - Emits exactly one `Inventory` event per run, plus one Failed
   `inventory` outcome when the GPU-visibility counts disagree. The
-  orchestrator adds one `gpu_idle` outcome per listed GPU.
+  orchestrator adds one `gpu_driver` outcome and one `gpu_idle` outcome
+  per listed GPU.
 - No stdout writes outside `EventSink`.

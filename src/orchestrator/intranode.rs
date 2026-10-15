@@ -127,6 +127,7 @@ mod tests {
                 .map(|(lib, ok)| (lib.to_string(), *ok))
                 .collect(),
             cuda_visible_gpus: cuda,
+            gpu_driver: None,
         }
     }
 

@@ -79,6 +79,7 @@ fn inventory(host: &str, gpus: Vec<GpuInventory>) -> InventorySnapshot {
         xid_errors: vec![],
         gpu_libs: BTreeMap::new(),
         cuda_visible_gpus: Some(1),
+        gpu_driver: None,
     }
 }
 

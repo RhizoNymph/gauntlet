@@ -34,8 +34,8 @@ use crate::nccl_env::NcclEnv;
 use crate::nccl_level::NcclLevelEnvs;
 use crate::orchestrator::collect::HostObservations;
 use crate::proto::{
-    CounterDeltas, CounterDomain, MetricRecord, Scope, TestId, TestOutcome, Unit, nccl_metric,
-    overlap_metric,
+    CounterDeltas, CounterDomain, FailureKind, MetricRecord, Scope, TestId, TestOutcome, Unit,
+    nccl_metric, overlap_metric,
 };
 // The majority vote's unit tests live with the rest of this module's tests.
 #[cfg(test)]
@@ -136,7 +136,21 @@ use consistency::majority;
 // v17: run-level `launch` — how the agents were started: `{"mode":"ssh"}`
 // or `{"mode":"srun","job_id":N}` (srun steps inside Slurm job N).
 // Serde-defaulted: pre-v17 documents decode with it null ("not recorded").
-pub const SCHEMA_VERSION: u32 = 17;
+// v18: GPU driver state and consistency without arbitrary majorities.
+// Inventories carry `gpu_driver` (no NVIDIA hardware / driver ok / driver
+// unavailable, with the NVIDIA GPUs on the PCI bus, the nvidia module's
+// state and how nvidia-smi failed) and hosts gain a node-scope
+// `gpu_driver` outcome (Failed = hard evidence). GPU tests on a host
+// without a usable GPU are Skipped instead of Failed, and
+// `fleet.sdc_failures` lists only correctness findings, never
+// infrastructure errors (a CUDA/driver error, a panicked worker).
+// `fleet.consistency` majorities are taken over present values only (a
+// missing value never wins and always dissents); a field whose present
+// values have no strict plurality goes to `fleet.consistency_splits`
+// (every host's value) instead of naming an arbitrary majority.
+// Serde-defaulted: pre-v18 documents decode with no driver state and no
+// splits.
+pub const SCHEMA_VERSION: u32 = 18;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -221,6 +235,12 @@ pub struct FleetAnalysis {
     /// Inventory consistency findings: field -> (majority value,
     /// dissenting host -> its value).
     pub consistency: BTreeMap<String, ConsistencyFinding>,
+    /// Inventory fields with no majority: the present values tie (e.g. two
+    /// hosts on two different drivers, a third without one), so no host
+    /// can be called the dissenter. Field -> every host's value.
+    /// Informational, like `consistency`.
+    #[serde(default)]
+    pub consistency_splits: BTreeMap<String, ConsistencySplit>,
     /// Hosts that produced errors (Fatal, transport, timeout).
     pub failed_hosts: BTreeMap<String, Vec<String>>,
     /// Subjects whose run-to-run spread (MAD across repeats) is a fleet
@@ -279,10 +299,20 @@ pub struct CounterFinding {
     pub after: u64,
 }
 
+/// A field where a strict plurality of the *present* values agrees.
+/// `majority_value` is always a present value; `dissenters` are the hosts
+/// with any other value, missing values (rendered `"(absent)"`) included.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConsistencyFinding {
     pub majority_value: String,
     pub dissenters: BTreeMap<String, String>,
+}
+
+/// A field whose present values have no strict plurality: every host's
+/// value (missing rendered `"(absent)"`), none singled out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsistencySplit {
+    pub values: BTreeMap<String, String>,
 }
 
 /// Simulator-facing constants extracted from the run.
@@ -318,6 +348,7 @@ pub fn test_display_name(test: TestId) -> &'static str {
     match test {
         TestId::Inventory => "inventory",
         TestId::GpuIdle => "gpu_idle",
+        TestId::GpuDriver => "gpu_driver",
         TestId::CpuCorrectness => "cpu_correctness",
         TestId::CpuGflops => "cpu_gflops",
         TestId::CpuSdcHot => "cpu_sdc_hot",
@@ -475,10 +506,12 @@ pub fn build(
         .map(|(host, obs)| (host.clone(), obs.errors.clone()))
         .collect();
 
+    let consistency = consistency::findings(&observations);
     let fleet = FleetAnalysis {
         outliers,
         threshold_violations,
-        consistency: consistency::findings(&observations),
+        consistency: consistency.majorities,
+        consistency_splits: consistency.splits,
         failed_hosts,
         jitter_outliers,
         sdc_failures: sdc_failures(&observations),
@@ -816,7 +849,17 @@ fn is_sdc_test(test: TestId) -> bool {
     )
 }
 
-/// Failed correctness-screen outcomes, grouped by test display name.
+/// Whether a recorded outcome is a silent-data-corruption finding: a
+/// Failed correctness screen whose failure is a *finding* (a mismatch, a
+/// non-finite result), never an infrastructure error that kept the screen
+/// from running (a CUDA/driver error, a panicked worker — see
+/// `proto::FailureKind`). Those stay hard Failed outcomes of their test,
+/// but a missing driver is not data corruption.
+pub fn is_sdc_finding(test: TestId, outcome: &TestOutcome) -> bool {
+    is_sdc_test(test) && outcome.failure_kind() == Some(FailureKind::Finding)
+}
+
+/// SDC findings (`is_sdc_finding`), grouped by test display name.
 /// Derived from `hosts[].outcomes` (never a second source of truth) so JSON
 /// consumers get the hard findings without re-scanning every outcome.
 fn sdc_failures(
@@ -825,7 +868,7 @@ fn sdc_failures(
     let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (host, obs) in observations {
         for (test, scope, outcome) in &obs.outcomes {
-            if !is_sdc_test(*test) {
+            if !is_sdc_finding(*test, outcome) {
                 continue;
             }
             if let TestOutcome::Failed { reason } = outcome {
@@ -1302,20 +1345,42 @@ fn render_violations(results: &RunResults, out: &mut dyn Write) -> Result<()> {
     section(out, "absolute threshold violations", &table)
 }
 
+/// Shown in the majority column of a field without one.
+const NO_MAJORITY: &str = "(no majority)";
+
 fn render_consistency(results: &RunResults, out: &mut dyn Write) -> Result<()> {
-    if results.fleet.consistency.is_empty() {
+    let fleet = &results.fleet;
+    if fleet.consistency.is_empty() && fleet.consistency_splits.is_empty() {
         writeln!(out, "\nconsistency: fleet agrees on every inventory field")?;
         return Ok(());
     }
     let mut table = new_table(&["field", "majority", "dissenter", "value"]);
-    for (field, finding) in &results.fleet.consistency {
-        for (host, value) in &finding.dissenters {
-            table.add_row(vec![
-                field.clone(),
-                finding.majority_value.clone(),
-                host.clone(),
-                value.clone(),
-            ]);
+    let fields: BTreeSet<&String> = fleet
+        .consistency
+        .keys()
+        .chain(fleet.consistency_splits.keys())
+        .collect();
+    for field in fields {
+        // A field is a majority finding or a split, never both.
+        if let Some(finding) = fleet.consistency.get(field) {
+            for (host, value) in &finding.dissenters {
+                table.add_row(vec![
+                    field.clone(),
+                    finding.majority_value.clone(),
+                    host.clone(),
+                    value.clone(),
+                ]);
+            }
+        }
+        if let Some(split) = fleet.consistency_splits.get(field) {
+            for (host, value) in &split.values {
+                table.add_row(vec![
+                    field.clone(),
+                    NO_MAJORITY.to_string(),
+                    host.clone(),
+                    value.clone(),
+                ]);
+            }
         }
     }
     section(out, "inventory consistency", &table)
@@ -1445,20 +1510,24 @@ mod tests {
         );
     }
 
+    // Replaced `majority_breaks_ties_by_smallest_value`, which asserted that
+    // a 1-vs-1 tie elected the lexicographically smallest value: that
+    // arbitrary tie-break is what let "(absent)" (sorting before any
+    // version number) win the nvidia_driver vote over two hosts that had a
+    // driver. A tie now has no majority, whatever the host order.
     #[test]
-    fn majority_breaks_ties_by_smallest_value() {
+    fn majority_has_no_winner_on_a_tie() {
         let values = BTreeMap::from([
             ("n1".to_string(), "b".to_string()),
             ("n2".to_string(), "a".to_string()),
         ]);
-        assert_eq!(majority(&values).as_deref(), Some("a"));
-        // Reversed host order must not change the answer.
+        assert_eq!(majority(&values), None);
         let reversed = BTreeMap::from([
             ("n1".to_string(), "a".to_string()),
             ("n2".to_string(), "b".to_string()),
         ]);
-        assert_eq!(majority(&reversed).as_deref(), Some("a"));
-        assert_eq!(majority(&BTreeMap::new()), None);
+        assert_eq!(majority(&reversed), None);
+        assert_eq!(majority(&BTreeMap::<String, String>::new()), None);
     }
 
     #[test]

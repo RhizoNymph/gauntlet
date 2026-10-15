@@ -15,18 +15,28 @@ use thiserror::Error;
 use crate::nccl_level::NcclLevel;
 use crate::nccl_transport::NcclTransportReport;
 
+mod consistency;
+mod failure;
+mod gpu_driver;
 mod ib;
 pub mod nccl_nics;
 mod occupancy;
+mod pci_addr;
 mod ranks;
 mod series;
 
+pub use consistency::{ABSENT, FieldValue, consistency_fields, consistency_values};
+pub use failure::{FailureKind, INFRASTRUCTURE_PREFIX, failure_kind_of};
+pub use gpu_driver::{
+    EmptyPciGpus, GpuDriverState, ModuleAvailability, NvidiaModule, NvidiaSmiFailure, PciGpus,
+};
 pub use ib::{
     IbDeviceInventory, IbPortInventory, IbRate, IbRateError, IbSpeed, LinkLayer, PciLocality,
     PciLocation, PhysState, PortRate, PortState, RoceVersion, gbps_to_gib_per_sec, payload_gbps,
     pci_locality,
 };
 pub use nccl_nics::NcclNicSummary;
+pub use pci_addr::{PciBusId, PciBusIdError};
 
 pub use occupancy::{
     GpuIdleAssessment, GpuOccupancy, GpuProcess, MemoryOverage, ProcessOwner, assess_gpu_idle,
@@ -92,7 +102,14 @@ pub use series::SweepSeries;
 // be derived. The orchestrator-derived `nccl_nics` test id and `nccl_nics`
 // event ride the wire. Older inventories decode with link layer and
 // placement unknown and `rate_gbps` lifted into `rate`.
-pub const PROTO_VERSION: u32 = 13;
+// v14: GPU driver state — inventories carry `gpu_driver` (no NVIDIA
+// hardware / driver ok / driver unavailable, with the NVIDIA GPUs found on
+// the PCI bus, the nvidia kernel module's state and how nvidia-smi
+// failed), detected from sysfs independently of the driver; the
+// orchestrator-derived `gpu_driver` test id rides the wire. GPU tests on a
+// host without a usable GPU record Skipped instead of Failed.
+// Serde-defaulted: older inventories decode with the state unknown.
+pub const PROTO_VERSION: u32 = 14;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -312,6 +329,13 @@ pub enum TestId {
     /// the snapshot (the threshold is orchestrator config); agents never
     /// emit this test id.
     GpuIdle,
+    /// Whether the NVIDIA driver can drive the GPUs on the PCI bus,
+    /// derived orchestrator-side from `InventorySnapshot.gpu_driver`:
+    /// Failed when NVIDIA GPUs are on the bus but the driver is
+    /// unavailable, Passed with a working driver, Skipped on a host with no
+    /// NVIDIA hardware. The one hard finding for a missing driver: the GPU
+    /// tests on such a host record Skipped. Agents never emit this test id.
+    GpuDriver,
     CpuCorrectness,
     CpuGflops,
     /// Correctness screen re-run while every core burns power: silent data
@@ -473,6 +497,12 @@ pub struct InventorySnapshot {
     /// feature). See [`gpu_visibility_mismatch`].
     #[serde(default)]
     pub cuda_visible_gpus: Option<u32>,
+    /// NVIDIA driver state from the PCI bus and the driver probes (proto
+    /// v14). `None` = not recorded (older agents, or a snapshot built
+    /// outside `agent::inventory`); no `gpu_driver` outcome is derived
+    /// then.
+    #[serde(default)]
+    pub gpu_driver: Option<GpuDriverState>,
 }
 
 /// The per-host inventory finding for a GPU-visibility mismatch: nvidia-smi
@@ -988,46 +1018,6 @@ pub fn expect_hello(first: &AgentEvent) -> Result<String, ProtoError> {
     }
 }
 
-fn absent() -> String {
-    "(absent)".to_string()
-}
-
-/// Consistency-relevant fields extracted from an inventory, keyed by field
-/// name. Fleet analysis flags any host whose value differs from the majority.
-pub fn consistency_fields(inv: &InventorySnapshot) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::new();
-    fields.insert("kernel".into(), inv.kernel.clone());
-    fields.insert("cpu_model".into(), inv.cpu_model.clone());
-    // Present-vs-absent is itself a skew signal (one node with a driver the
-    // others lack), so Option fields dissent through a sentinel instead of
-    // being skipped.
-    fields.insert(
-        "nvidia_driver".into(),
-        inv.nvidia_driver.clone().unwrap_or_else(absent),
-    );
-    fields.insert(
-        "cuda_version".into(),
-        inv.cuda_version.clone().unwrap_or_else(absent),
-    );
-    fields.insert("gpu_count".into(), inv.gpus.len().to_string());
-    if !inv.gpus.is_empty() {
-        for (lib, available) in &inv.gpu_libs {
-            fields.insert(
-                format!("lib:{lib}"),
-                if *available { "present" } else { "absent" }.to_string(),
-            );
-        }
-    }
-    if let Some(gpu) = inv.gpus.first() {
-        fields.insert("gpu_model".into(), gpu.name.clone());
-        fields.insert("vbios".into(), gpu.vbios.clone());
-    }
-    for nic in &inv.nics {
-        fields.insert(format!("mtu:{}", nic.name), nic.mtu.to_string());
-    }
-    fields
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,6 +1204,7 @@ mod tests {
             xid_errors: vec![],
             gpu_libs: BTreeMap::new(),
             cuda_visible_gpus: visible,
+            gpu_driver: None,
         }
     }
 

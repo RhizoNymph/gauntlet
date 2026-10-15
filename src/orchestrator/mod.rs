@@ -1178,13 +1178,17 @@ async fn gpu_bearing_hosts(
 
     sessions
         .iter()
-        .filter(|session| {
-            inventories
-                .get(session.addr())
-                .is_some_and(|inventory| !inventory.gpus.is_empty())
-        })
+        .filter(|session| inventories.get(session.addr()).is_some_and(is_gpu_bearing))
         .map(Arc::clone)
         .collect()
+}
+
+/// A host the GPU-only steps (intra-node sweep, fleet NCCL) dispatch to:
+/// nvidia-smi lists GPUs. A host whose driver is unavailable lists none,
+/// so it is never dispatched — its missing driver is the `gpu_driver`
+/// finding, not an NCCL failure.
+fn is_gpu_bearing(inventory: &InventorySnapshot) -> bool {
+    !inventory.gpus.is_empty()
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,6 +1224,36 @@ fn parse_json_document<T: DeserializeOwned>(text: &str) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosts_with_an_unavailable_driver_are_not_gpu_bearing() {
+        // The rebooted node: GPU on the PCI bus, nvidia-smi failing, so the
+        // inventory lists no GPU and CUDA could not count.
+        let mut inventory: InventorySnapshot = serde_json::from_value(serde_json::json!({
+            "hostname": "n1", "kernel": "6.17", "cpu_model": "x", "logical_cores": 8,
+            "numa_nodes": 1, "mem_total_bytes": 1, "cpu_governor": null,
+            "clock_offset_ms": null, "nvidia_driver": null, "cuda_version": null,
+            "gpus": [], "nics": [], "ib_ports": [], "xid_errors": [],
+            "cuda_visible_gpus": null,
+            "gpu_driver": {
+                "state": "driver_unavailable", "pci_gpus": ["0000:01:00.0"],
+                "module": {"state": "not_loaded", "kernel": "6.17",
+                           "availability": "missing_for_kernel"},
+                "nvidia_smi": {"kind": "failed", "message": "NVIDIA-SMI has failed"}
+            }
+        }))
+        .expect("inventory");
+        assert!(!is_gpu_bearing(&inventory));
+        inventory.gpus = serde_json::from_value(serde_json::json!([{
+            "index": 0, "name": "RTX 3090", "uuid": "u", "vbios": "v",
+            "mem_total_bytes": 1, "ecc_volatile_errors": null,
+            "remapped_rows_pending": null, "pcie_gen_current": null,
+            "pcie_gen_max": null, "pcie_width_current": null,
+            "pcie_width_max": null, "nvlinks_active": null, "persistence_mode": null
+        }]))
+        .expect("gpus");
+        assert!(is_gpu_bearing(&inventory));
+    }
 
     #[test]
     fn partial_snapshots_carry_no_verdict() {

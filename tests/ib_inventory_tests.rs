@@ -263,6 +263,7 @@ impl Fixture {
             xid_errors: vec![],
             gpu_libs: BTreeMap::new(),
             cuda_visible_gpus: Some(2),
+            gpu_driver: None,
         }
     }
 }

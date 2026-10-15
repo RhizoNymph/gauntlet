@@ -25,6 +25,7 @@
 use std::num::NonZeroU32;
 
 use crate::agent::EventSink;
+use crate::agent::gpu_driver::DeviceAvailability;
 use crate::agent::sweep::{Collective, SweepLevel, SweepPoint};
 use crate::proto::{MetricRecord, Scope, TestId, TestOutcome, Unit, nccl_metric};
 
@@ -82,6 +83,18 @@ pub fn gate(device_count: Result<u32, String>) -> Gate {
     }
 }
 
+/// Gate on the node's classified device availability: a node without a
+/// usable GPU (no NVIDIA hardware, or a driver that cannot drive it) skips
+/// rather than fails — the driver is the `gpu_driver` finding, not this
+/// sweep's.
+pub fn gate_devices(availability: DeviceAvailability) -> Gate {
+    match availability {
+        DeviceAvailability::Usable(count) => gate(Ok(count.get())),
+        DeviceAvailability::Unavailable { reason } => Gate::Skip { reason },
+        DeviceAvailability::Fault { reason } => Gate::Fail { reason },
+    }
+}
+
 /// The same outcome for both intra-node tests (skip, node-level failure).
 pub fn node_outcomes(
     outcome: impl Fn(String) -> TestOutcome,
@@ -112,7 +125,24 @@ pub fn run_gated(
     probe: impl FnOnce() -> Result<u32, String>,
     execute: impl FnOnce(MultiGpuWorld) -> Result<(), String>,
 ) {
-    match gate(probe()) {
+    run_on_gate(sink, gate(probe()), execute);
+}
+
+/// `run_gated` over a classified device probe (`gate_devices`).
+pub fn run_gated_devices(
+    sink: &EventSink,
+    probe: impl FnOnce() -> DeviceAvailability,
+    execute: impl FnOnce(MultiGpuWorld) -> Result<(), String>,
+) {
+    run_on_gate(sink, gate_devices(probe()), execute);
+}
+
+fn run_on_gate(
+    sink: &EventSink,
+    gate: Gate,
+    execute: impl FnOnce(MultiGpuWorld) -> Result<(), String>,
+) {
+    match gate {
         Gate::Run(world) => {
             if let Err(reason) = execute(world) {
                 emit_outcomes(
@@ -303,6 +333,39 @@ mod tests {
                 reason: "cuda driver init: no libcuda".into()
             }
         );
+    }
+
+    #[test]
+    fn nodes_without_a_usable_gpu_skip_and_faults_fail() {
+        let unavailable = DeviceAvailability::Unavailable {
+            reason: "no usable GPU (driver unavailable)".into(),
+        };
+        let (sink, buf) = capture();
+        run_gated_devices(
+            &sink,
+            || unavailable,
+            |_| panic!("an unusable node must never reach the sweep"),
+        );
+        let skipped = outcomes(&events(&buf));
+        assert_eq!(skipped.len(), 2);
+        for (_, _, outcome) in skipped {
+            let TestOutcome::Skipped { reason } = outcome else {
+                panic!("expected Skipped, got {outcome:?}");
+            };
+            assert!(reason.contains("driver unavailable"), "{reason}");
+        }
+
+        assert_eq!(
+            gate_devices(DeviceAvailability::Fault {
+                reason: "CUDA_ERROR_UNKNOWN".into()
+            }),
+            Gate::Fail {
+                reason: "CUDA_ERROR_UNKNOWN".into()
+            }
+        );
+        let usable = |n| DeviceAvailability::Usable(NonZeroU32::new(n).expect("non-zero"));
+        assert_eq!(gate_devices(usable(8)), Gate::Run(world(8)));
+        assert!(matches!(gate_devices(usable(1)), Gate::Skip { .. }));
     }
 
     #[test]

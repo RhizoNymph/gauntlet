@@ -8,12 +8,50 @@ intra-node p2p. Non-scope: inter-node anything (phase 3), driver install.
 cudarc `dynamic-loading` + `cuda-12040` API baseline: libcuda/libcublas/
 libnccl are dlopened at runtime. The `gpu` cargo feature (default on) gates
 all of `src/agent/gpu/` and `nccl::imp`; a `--no-default-features` build
-emits Skipped outcomes for the phase. Driver init failure on a node whose
-inventory saw GPUs is reported as Failed (broken driver is a finding).
+emits Skipped outcomes for the phase.
+
+## Device availability (proto v14 / schema v18)
+Driver init is classified, never just stringified. `gpu::device_availability`
+runs `CudaContext::device_count` under `guard_typed` and reads the PCI bus
+(`agent::gpu_driver::nvidia_pci_gpus`), giving a typed
+`DeviceAvailability` (`src/agent/gpu_driver.rs`, GPU-independent):
+- `Usable(NonZeroU32)` — run the tests.
+- `Unavailable { reason }` — no usable GPU. Every phase-2 test
+  (`gpu_gemm_correctness`, `gpu_gemm_perf`, `gpu_gemm_sdc`,
+  `gpu_mem_bandwidth`, `gpu_p2p`) records **Skipped** at node scope with a
+  reason naming the hardware: "no NVIDIA GPU (none on the PCI bus; ...)" or
+  "no usable GPU (driver unavailable: CUDA cannot open the NVIDIA GPU on
+  the PCI bus at 0000:01:00.0; <cuda error>); see gpu_driver". The driver
+  itself is the inventory-derived `gpu_driver` finding
+  (docs/features/phase0_inventory.md), so one root cause is one hard
+  finding, and a CPU-only host is clean rather than failed.
+- `Fault { reason }` — a genuine CUDA error on a working driver: one
+  `gpu_gemm_correctness` infrastructure failure
+  (`TestOutcome::infrastructure_failure`, hard, never in the SDC section).
+
+Classification (`gpu::classify_driver_error`, pure over cudarc's
+`DriverError`): `CUDA_ERROR_NO_DEVICE`, `NOT_INITIALIZED`,
+`STUB_LIBRARY` and `SYSTEM_DRIVER_MISMATCH` are Unavailable; every other
+code is a Fault. A cudarc loader panic (libcuda not loadable) is
+Unavailable at init (`GuardError::init_class`) but a Fault after init
+(`runtime_class`: a missing libcublas or symbol is a broken stack, not
+an absent GPU). Zero devices is Unavailable. Errors are classified
+through the anyhow chain, so context-wrapped `DriverError`s keep their
+code.
+
+After a successful init, a per-GPU failure (`gemm`, `bandwidth`, `p2p`)
+goes through `runtime_failure_outcome`: Unavailable → Skipped (all three
+GEMM tests for a gemm failure), otherwise an infrastructure failure on
+the test that failed (`gpu_gemm_correctness` for the gemm run).
+
+`guard_typed` renders a `DriverError` without calling into libcuda
+when that would panic (its `Display` calls `cuGetErrorString`), so a
+reason always survives.
 
 ## Control flow
-`gpu::run` iterates visible GPUs; per GPU: `gemm::run_on_gpu` →
-`bandwidth::run_on_gpu`; then `p2p::run_all_pairs` once.
+`gpu::run` → `run_with(device_availability())`; with usable GPUs it
+iterates them; per GPU: `gemm::run_on_gpu` → `bandwidth::run_on_gpu`;
+then `p2p::run_all_pairs` once.
 
 - gemm.rs: fixed-seed host PRNG fills A,B; per dtype in `gemm_dtypes` run
   cuBLAS GEMM; compare a deterministic ~4096-element subsample against f64
@@ -50,6 +88,18 @@ metrics per size. Bus bandwidth formula: allreduce factor 2(n-1)/n.
 ## Files
 `src/agent/gpu/{mod,gemm,bandwidth,p2p}.rs`, `src/agent/nccl/`;
 specs/types in `src/proto/mod.rs` (`GpuTaskSpec`, `GemmDtype`, `NcclDirective`).
+- `src/agent/gpu/mod.rs` — `run`, `run_with`, `guard`, `guard_typed`,
+  `GuardError`, `CudaErrorClass`, `classify_driver_error`,
+  `device_availability`, `availability_from`.
+- `src/agent/gpu_driver.rs` — `DeviceAvailability`, `unavailable_reason`,
+  `nvidia_pci_gpus` (shared with the inventory's driver probe).
+- `src/proto/failure.rs` — `FailureKind`, `TestOutcome::infrastructure_failure`.
+
+## Invariants
+- A node without a usable GPU never produces a Failed phase-2 outcome;
+  it produces exactly one Skipped outcome per phase-2 test.
+- Genuine CUDA errors on a working driver stay Failed, as infrastructure
+  failures (never SDC findings).
 
 ## Implementation notes
 
@@ -70,9 +120,11 @@ are called directly.
 With `dynamic-loading`, cudarc resolves symbols lazily and **panics**
 (`panic_no_lib_found` / `Missing symbol ...`) when libcuda/libcublas/libnccl is
 absent — it does not return `DriverError`. Every entry into cudarc therefore
-goes through `gpu::guard`, which wraps `catch_unwind` and turns both errors and
-panics into a string for a `Failed` outcome. `agent nccl` uses the same guard so
-a missing NCCL stack is an `anyhow` error rather than an abort.
+goes through `gpu::guard` / `gpu::guard_typed`, which wrap `catch_unwind`.
+`guard_typed` keeps the failure typed (`GuardFailure::{Error, Panicked}`)
+for classification (see "Device availability"); `guard` is its string
+form. `agent nccl` uses the same guard so a missing NCCL stack is an
+`anyhow` error rather than an abort.
 
 ### GEMM dtype configuration
 All four dtypes go through one `cublasGemmEx` call with C always `CUDA_R_32F`:
