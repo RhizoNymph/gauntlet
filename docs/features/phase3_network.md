@@ -8,8 +8,58 @@ Non-scope: intra-node pairwise p2p copies (phase 2, `gpu_p2p`), IB-verbs
 microbenchmarks (post-v1; NCCL measures what training experiences),
 pair-level NCCL sweeps (full fleet + TCP pairwise usually localizes).
 
+## Step selection (`[tests] net_steps`, `--net-steps`)
+The phase is four independent steps, a typed `NetStep` set
+(`src/net_steps.rs`): `intranode`, `pairwise` (alias `tcp`), `nccl` (the
+fleet sweep) and `barrier` (both barrier-skew probes). Default: all.
+`--net-steps` (comma-separated, help generated from
+`NetStep::PARSE_TABLE`) overrides `tests.net_steps`;
+`tests.nccl_intranode = false` always removes `intranode`.
+Config, CLI and serde share one spelling table (`crate::names`), so
+`net_steps = ["tcp"]` in the config works exactly like `--net-steps tcp`;
+an unknown name fails at load (config) or with
+`ConfigError::UnknownNetStep` (CLI). The set is resolved by
+`FleetConfig::run_plan` *after* the `--net-steps` override is merged and
+*only* when the network phase is selected (`RunPlan::net_steps` is
+`Some` exactly then): a config whose own selection empties out (say
+`nccl_intranode = false` with `net_steps = ["intranode"]`) still loads,
+bootstraps, and runs `--phases gpu`; a network run with an empty resolved
+set is `ConfigError::NoNetSteps` (drop the network phase instead).
+`resolve_net_steps` is the only constructor of `NetSteps`, so the set the
+orchestrator sees is never empty.
+
+A quick NCCL-only check is `gauntlet run --phases network --net-steps
+nccl` (add `intranode` for both NCCL levels). Before any step runs,
+`network_phase` records `Skipped { reason: "disabled by config" }`
+(`net_steps::DISABLED_REASON`) at node scope on every host for each test a
+deselected step would have produced (`disabled_outcomes`, from
+`NetStep::tests`): intranode → `nccl_intra_all_reduce` /
+`nccl_intra_all_gather`; pairwise → `net_latency` / `net_bandwidth`;
+nccl → `nccl_all_reduce` / `nccl_all_gather` / `nccl_inter_all_reduce` /
+`nccl_inter_all_gather` (every world shape's series); barrier →
+`nccl_barrier` / `tcp_barrier`. Skipped outcomes never affect the verdict.
+
+How the steps map onto the network-phase structure is one pure decision,
+`orchestrator::network_plan::NetworkPhasePlan::new(&NetSteps)`:
+- `intranode` dispatches the intra-node sweep, and the same flag sets
+  `IntraNodeCoverage` for the fleet sweep's one-host gate: with the step
+  off (CLI, config or `nccl_intranode = false`) the coverage is
+  `NotCovered`, so a one-host world of 2+ GPUs still runs the fleet sweep.
+- `nccl` dispatches `nccl::nccl_sweep` — every world shape
+  (rank-per-GPU, rank-per-node, per-rail rails) and every NCCL barrier
+  placement live under it, so deselecting it drops all of them. Both NCCL
+  barrier placements need it, so `barrier` without `nccl` runs only the
+  TCP barrier and records `nccl_barrier` as Skipped
+  (`NetSteps::nccl_barrier`).
+- `barrier` gates the TCP barrier directly and every NCCL placement via
+  `nccl::BarrierSelection` → `BarrierPlacement::plan_selected`, so
+  deselecting it suppresses the barrier riding the rank-per-GPU sweep and
+  the own-world barrier job alike. `barrier_iters = 0` still disables the barrier
+probes without a trace (it is a size knob, not the step switch).
+
 ## Control flow
-Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
+Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`),
+each step gated on the resolved `NetSteps`:
 0. Intra-node NCCL sweep (`tests.nccl_intranode`, default on) — see
    "Intra-node level" below. Runs first, before any cross-node traffic.
 1. `analysis::schedule::tournament_rounds(n)` (or `sampled_rounds` with
@@ -322,7 +372,7 @@ invisible). Real training runs one rank per GPU; so does this.
   larger than the host's rank block. A multi-host communicator on NCCL's
   socket transport, on a host whose inventory shows an ACTIVE IB/RoCE
   port and with IB not disabled by the level env, becomes
-  `fleet.socket_fallbacks` (verdict Stragglers); an Ethernet-only fleet
+  `fleet.socket_fallbacks` (hard evidence: verdict Failures); an Ethernet-only fleet
   on sockets is not flagged. Details: docs/features/nccl_transport.md.
 
 ## World shapes (proto v12 / schema v14)
@@ -382,9 +432,10 @@ communicator reports its transport.
 3. Gate (`shape::sweep_gate(world, coverage)`): every world needs at
    least 2 ranks; it also needs at least 2 hosts **when the intra-node
    sweep ran in this phase** (`IntraNodeCoverage::Covered`, decided in
-   `network_phase` by the very branch that dispatches the intra-node
-   step). With `tests.nccl_intranode = false` a one-host world of 2+ GPUs
-   still runs, since the fleet sweep is then its only NCCL coverage.
+   `network_phase` from the same `NetworkPhasePlan` flag that dispatches
+   the intra-node step). With the intranode step deselected (`--net-steps`,
+   `net_steps`, or `tests.nccl_intranode = false`) a one-host world of 2+
+   GPUs still runs, since the fleet sweep is then its only NCCL coverage.
 4. `sweep::nccl_sweep` (orchestrator) runs each world through the
    unchanged `drive_fleet_nccl` with `NcclWorkload::Sweep { .., series }`
    — same rendezvous relay, failure attribution, early abort and remote
@@ -540,7 +591,19 @@ Intra-node level and shared sweep loop:
 - `src/proto/mod.rs` — `NcclSweepSpec`, `AgentTaskSpec.nccl_intranode`,
   `TestId::{NcclIntraAllReduce, NcclIntraAllGather}`, `nccl_metric` name
   consts and helpers (`bus_peak`, `gpu_class_suffix`); PROTO_VERSION 8.
-- `src/config.rs` — `tests.nccl_intranode`, `intranode_sweep_spec`.
+- `src/config.rs` — `tests.nccl_intranode`, `intranode_sweep_spec`,
+  `tests.net_steps`, `resolve_net_steps`, `run_plan` / `RunPlan`.
+- `src/names.rs` — `NameTable`, `parse`, `help_list`, `parse_named`,
+  `serde_via_name_table!` (shared with `Phase`).
+- `src/orchestrator/network_plan.rs` — `NetworkPhasePlan`,
+  `NcclStepPlan` (steps → intra-node coverage, NCCL step, barrier
+  selection).
+- `src/orchestrator/nccl/barrier_job.rs` — `BarrierSelection`,
+  `BarrierPlacement::plan_selected`.
+- `src/net_steps.rs` — `NetStep` (`ALL`, `PARSE_TABLE`, `name`, `parse`,
+  `help_list`, `tests`), `NetSteps` (`contains`, `iter`, `nccl_barrier`),
+  `disabled_outcomes`, `DISABLED_REASON`.
+- `src/cli.rs` — `RunArgs::net_steps` (`--net-steps`, generated help).
 - `src/analysis/schedule.rs`, `src/analysis/fit.rs`.
 - `src/orchestrator/mod.rs` — `network_phase` (hierarchy order), pairwise
   + TCP barrier; `src/orchestrator/intranode.rs` — intra-node step
@@ -666,6 +729,9 @@ Fleet NCCL world:
   `agent nccl` process outlives its job: early abort or the timeout kill
   reaches every host.
 - Hierarchy order within the phase: intra-node, then pairwise, then fleet.
+- A deselected network step leaves one Skipped outcome ("disabled by
+  config") per test per host per repeat, never a silent gap; the resolved
+  step set is never empty.
 - Every sweep level runs the same per-size loop (`sweep::run_plan`) with
   the same sizes, iterations, warmup, and all-gather sharding; levels
   differ only in how a collective is launched and which TestIds they

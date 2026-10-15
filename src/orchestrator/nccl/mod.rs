@@ -41,6 +41,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 
+pub(super) use self::barrier_job::BarrierSelection;
 pub(super) use self::shape::IntraNodeCoverage;
 pub(super) use self::sweep::nccl_sweep;
 

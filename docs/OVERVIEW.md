@@ -16,8 +16,10 @@ Overview:
       Runs on the operator's machine (`gauntlet run`). Tokio task per host,
       persistent ssh sessions via the `openssh` crate (native-mux
       ControlMaster multiplexing, respects ~/.ssh/config). Deploys the agent
-      (sftp upload of the running binary, staged then renamed, skipped when
-      the remote sha256 matches), drives the phase schedule, aggregates
+      (sftp upload of the running binary to a per-upload random temp name,
+      then an atomic rename, skipped when the remote sha256 matches) into
+      `ssh.remote_dir` (default node-local `/tmp/gauntlet-$USER`, `~` and
+      `$USER` expanded on the node), drives the phase schedule, aggregates
       results over an mpsc channel into a single lock-free collector task.
     agent: >
       Same binary in `gauntlet agent` mode, executed on each node. At
@@ -42,8 +44,11 @@ Overview:
       for quick runs.
     reporting: >
       Collector computes fleet median/MAD per metric, flags outliers beyond k
-      MADs, applies optional absolute thresholds, renders table + JSON, sets
-      exit code. Runs persisted for diffing against last known-good. With
+      MADs, applies optional absolute thresholds, renders table + JSON,
+      classifies a typed Verdict (clean / outliers / host_failures /
+      failures -> exit 0 / 1 / 2 / 3) recorded in the JSON along with the
+      producing binary's version + git revision. Runs persisted for
+      diffing against last known-good. With
       --repeat N, metrics aggregate into per-subject distribution moments
       (median/MAD/min/max/mean/stddev); outliers flag on medians and
       high run-to-run spread flags as jitter. A run in
@@ -78,8 +83,10 @@ Features Index:
       gpu_idle column), optional --tune
       (GPU persistence mode, performance governor). Renders a host x check
       readiness matrix; idempotent. `--json` emits the same report as a
-      schema-versioned document (the GUI viewer's interface).
-    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs]
+      schema-versioned document (the GUI viewer's interface; v2 records
+      gauntlet_version). remote_dir is a validated template (default
+      /tmp/gauntlet-$USER, owner-checked, created 700).
+    entry_points: [orchestrator/bootstrap.rs, orchestrator/deploy.rs, orchestrator/session.rs, remote_dir.rs]
     depends_on: []
     doc: docs/features/bootstrap.md
   phase0_inventory:
@@ -102,7 +109,8 @@ Features Index:
       orchestrator derives one TestId::GpuIdle outcome per GPU as the
       inventory arrives (proto::assess_gpu_idle against
       thresholds.gpu_idle_max_used_mib, default 1024): Failed names each
-      process, pid and MiB and makes the verdict Stragglers; unknown is
+      process, pid and MiB and makes the verdict Outliers (soft tier:
+      environmental, not broken hardware); unknown is
       Skipped. Bootstrap shows the same policy as its gpu_idle column
       (warn); the report adds a "gpus in use" section. Detection only: no
       phase is auto-skipped.
@@ -185,7 +193,15 @@ Features Index:
       threshold-checked but never MAD-compared (one value per run, no
       fleet peers; the barrier fleet_span_* follow the same rule).
       Barrier probe and fleet overlap always stay rank-per-GPU.
-    entry_points: [agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
+      Steps are a typed selection (tests.net_steps / --net-steps:
+      intranode, pairwise, nccl, barrier); deselected steps record
+      Skipped "disabled by config", so `--net-steps nccl` is a quick
+      NCCL-only check. Deselecting nccl drops every world shape, rail
+      and NCCL barrier; deselecting barrier suppresses both NCCL
+      barrier placements and the TCP barrier; the intra-node
+      coverage the one-host gate needs follows the intranode step
+      (orchestrator/network_plan.rs).
+    entry_points: [net_steps.rs, agent/net.rs, agent/sweep.rs, agent/nccl/, agent/intranode.rs, agent/gpu/intranode.rs, analysis/schedule.rs, orchestrator/mod.rs, orchestrator/network_plan.rs, orchestrator/intranode.rs, orchestrator/nccl/, proto/ranks.rs, report/intranode.rs, report/fleet_nccl.rs]
     depends_on: [phase0_inventory, phase2_gpu]
     doc: docs/features/phase3_network.md
   barrier_skew:
@@ -246,7 +262,7 @@ Features Index:
       (P2P/SHM/NET/GDR/COLLNET), NCCL version. A multi-host communicator on
       TCP sockets, on a host whose inventory shows an ACTIVE IB/RoCE port,
       without NCCL_IB_DISABLE / NCCL_NET=Socket in its level env, is a
-      `fleet.socket_fallbacks` finding (verdict Stragglers); Ethernet-only
+      `fleet.socket_fallbacks` finding (hard evidence: verdict Failures); Ethernet-only
       hosts are never flagged. The table shows a "nccl transports"
       section.
     entry_points: [nccl_transport/, agent/transport.rs, orchestrator/session.rs, report/nccl_transport.rs]
@@ -284,7 +300,7 @@ Features Index:
       port and NVMe error counters before the first load phase (baseline
       held by the orchestrator) and again after the last repeat, diffs on
       the agent, and emits per-node CounterDeltas. Any positive increment
-      is a per-host finding (verdict Stragglers) rendered in its own table
+      is a per-host finding (verdict Failures) rendered in its own table
       section; full deltas (zeros included) land in the JSON. Collection
       is best effort — nodes without a subsystem contribute nothing.
     entry_points: [agent/counters.rs, orchestrator/mod.rs]
@@ -293,12 +309,17 @@ Features Index:
   reporting:
     description: >
       JSON schema-versioned results, MAD outlier flags, absolute-threshold
-      overlay, run history, terminal table, exit codes. Live runs publish
+      overlay, run history, terminal table, typed verdict + exit codes
+      (schema v15, monotonic in severity: 0 clean, 1 outliers/soft
+      incl. gpu_idle, 2 host failures, 3 hard evidence; 4 = error before
+      any verdict, CLI usage errors included; null verdict = run in
+      flight), run-level gauntlet_version (build.rs git
+      revision; also `gauntlet --version`). Live runs publish
       periodic partial snapshots (runs/<run_id>.partial.json, written via
       temp+rename, removed on completion) under a run id fixed at startup;
       history::list excludes them, history::list_live enumerates them.
       Snapshots are disabled when --out redirects the run elsewhere.
-    entry_points: [report/mod.rs, report/history.rs, report/fleet_nccl.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
+    entry_points: [report/mod.rs, report/verdict.rs, build_info.rs, report/history.rs, report/fleet_nccl.rs, analysis/stats.rs, analysis/fit.rs, orchestrator/collect.rs]
     depends_on: [phase0_inventory, gpu_idle, phase1_cpu_mem_disk, phase2_gpu, phase3_network, overlap_phase, counter_deltas, barrier_skew, nccl_env, nccl_transport]
     doc: docs/features/reporting.md
   viewer:

@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use super::attribution::Attribution;
-use super::barrier_job::{self, BarrierPlacement, BarrierTimings};
+use super::barrier_job::{self, BarrierPlacement, BarrierSelection, BarrierTimings};
 use super::layout::{LayoutError, RankLayout};
 use super::rails::{Exclusions, RailFate, RailLedger, plan_rail};
 use super::records::OutcomeRecord;
@@ -69,13 +69,16 @@ fn addr(session: &Arc<HostSession>) -> &str {
 /// Fleet-wide NCCL sweep in the configured world shape, then the
 /// barrier-skew probe (riding the sweep in the rank-per-GPU shape, its own
 /// rank-per-GPU job otherwise). `coverage` says whether the intra-node
-/// sweep ran in this phase (it decides the one-host gate).
+/// sweep ran in this phase (it decides the one-host gate);
+/// `barrier_selection` whether the barrier network step is selected
+/// (`Disabled` suppresses both placements).
 pub(in crate::orchestrator) async fn nccl_sweep(
     config: &FleetConfig,
     sessions: &[Arc<HostSession>],
     inventories: &mut BTreeMap<String, InventorySnapshot>,
     sink: &ObservationSink,
     coverage: IntraNodeCoverage,
+    barrier_selection: BarrierSelection,
 ) {
     let hosts = nccl_hosts(sessions, inventories).await;
     let shape = config.tests.nccl_world;
@@ -83,9 +86,9 @@ pub(in crate::orchestrator) async fn nccl_sweep(
     // for a rank-per-GPU sweep under the fleet env. The per-level envs are
     // run-wide (resolved from one config), so any session's view is the
     // run's.
-    let barrier = hosts
-        .first()
-        .and_then(|(session, _)| BarrierPlacement::plan(config, session.nccl_levels(), shape));
+    let barrier = hosts.first().and_then(|(session, _)| {
+        BarrierPlacement::plan_selected(barrier_selection, config, session.nccl_levels(), shape)
+    });
     let exclusions = match shape {
         NcclWorldShape::RankPerGpu => {
             rank_per_gpu_sweep(config, &hosts, sink, coverage, barrier).await;

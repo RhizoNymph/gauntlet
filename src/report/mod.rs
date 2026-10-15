@@ -11,6 +11,7 @@ pub mod history;
 pub mod intranode;
 pub mod nccl_env;
 pub mod nccl_transport;
+mod verdict;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -19,9 +20,11 @@ use anyhow::{Context, Result};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use serde::{Deserialize, Serialize};
 
+pub use self::verdict::{EXIT_ERROR, EvidenceTier, Verdict, failed_outcome_tier, verdict};
 use crate::analysis::fit::{AlphaBetaFit, FitBound};
 use crate::analysis::skew;
 use crate::analysis::stats::{self, Moments, Outlier, Sample};
+use crate::build_info::BuildInfo;
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
 use crate::nccl_env::NcclEnv;
@@ -68,7 +71,8 @@ use crate::proto::{
 // which suppresses drift display.
 // v11: GPU occupancy — inventory GPUs carry `occupancy` (memory used/total,
 // foreign compute processes, stale gauntlet agents) and hosts gain one
-// `gpu_idle` outcome per GPU (Failed feeds the verdict as Stragglers).
+// `gpu_idle` outcome per GPU (Failed fed the verdict as Stragglers; soft
+// `outliers` since v15).
 // Serde-defaulted: pre-v11 documents decode with occupancy unknown and no
 // gpu_idle outcomes.
 // v12: link fits are least squares constrained to alpha >= 0, beta >= 0
@@ -82,7 +86,8 @@ use crate::proto::{
 // `hosts.*.nccl_transports` (the network/peer transports each NCCL-hosting
 // process's communicator used, parsed from NCCL's INFO log, or why
 // unknown) and `fleet.socket_fallbacks` (a multi-host communicator on TCP
-// sockets without IB disabled; part of the verdict as Stragglers).
+// sockets without IB disabled; part of the verdict — Stragglers then,
+// hard evidence (Failures) since v15).
 // Serde-defaulted: pre-v13 documents decode with no level envs ("not
 // recorded", which suppresses level drift), no transports and no
 // findings.
@@ -100,7 +105,15 @@ use crate::proto::{
 // (aggregated, never MAD/jitter-compared). A one-host fleet no longer
 // runs the fleet sweep while the intra-node sweep runs (Skipped
 // outcomes). No field changed shape.
-pub const SCHEMA_VERSION: u32 = 14;
+// v15: run-level `verdict` — "clean" / "outliers" / "host_failures" /
+// "failures", the classification behind the exit code (0 / 1 / 2 / 3,
+// monotonic in severity; failed tests, counter findings and socket
+// fallbacks no longer share exit 1 with statistical outliers; set only on
+// the finished document, null in partial snapshots) — and run-level
+// `gauntlet_version` (crate version plus build-time git revision of the
+// producing binary). Both serde-defaulted: pre-v15 documents decode with
+// them null, and `report::verdict` classifies them.
+pub const SCHEMA_VERSION: u32 = 15;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -134,6 +147,11 @@ pub struct RunResults {
     /// built without optimizations; such numbers are not comparable.
     #[serde(default)]
     pub debug_build: bool,
+    /// Crate version and git revision of the orchestrator binary — which
+    /// is also the deployed agent (self-deploy, sha256-matched). `None` =
+    /// not recorded (pre-v13 documents).
+    #[serde(default)]
+    pub gauntlet_version: Option<BuildInfo>,
     pub hosts: BTreeMap<String, HostObservations>,
     /// The resolved NCCL environment (`[nccl] env` plus `socket_ifname` as
     /// NCCL_SOCKET_IFNAME) every agent process was started with. Run-level
@@ -145,6 +163,13 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// `verdict(self)` of the finished run (`finalize`): the same
+    /// classification the exit code reports, so consumers never parse the
+    /// exit status. `None` = no final verdict: a partial snapshot of a run
+    /// still in flight (`*.partial.json`), or a pre-v13 document (serde
+    /// default); call `verdict` for a provisional classification.
+    #[serde(default)]
+    pub verdict: Option<Verdict>,
     /// The effective NCCL env of every level (`[nccl] env` with that
     /// level's `[nccl.levels.<level>]` override layered on top): what each
     /// NCCL-hosting process was started with, minus the debug-log
@@ -179,7 +204,7 @@ pub struct FleetAnalysis {
     /// correctness screens (isolated and hot), grouped by test display
     /// name; entries are "host[:scope]: reason". Hard failures — these are
     /// absolute findings on a node, never fleet-relative outliers, and any
-    /// entry makes the verdict at least `Stragglers`.
+    /// entry makes the verdict at least `Failures`.
     #[serde(default)]
     pub sdc_failures: BTreeMap<String, Vec<String>>,
     /// Error counters that incremented across the load phases, per host.
@@ -195,8 +220,8 @@ pub struct FleetAnalysis {
     #[serde(default)]
     pub barrier_stragglers: BTreeMap<String, Vec<BarrierStraggler>>,
     /// Hosts whose multi-host NCCL communicator fell back to TCP sockets
-    /// while IB was not disabled by the level's env, per level. Part of the
-    /// verdict (Stragglers).
+    /// while IB was not disabled by the level's env, per level. Hard
+    /// evidence in the verdict (`Failures`, see `report::verdict`).
     #[serde(default)]
     pub socket_fallbacks: BTreeMap<String, Vec<nccl_transport::SocketFallback>>,
 }
@@ -254,27 +279,6 @@ pub struct NodeRoofline {
     pub pcie_h2d_gib_per_sec: Option<f64>,
     pub disk_read_gib_per_sec: Option<f64>,
     pub disk_write_gib_per_sec: Option<f64>,
-}
-
-/// Exit code contract for `gauntlet run`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Verdict {
-    /// 0: all hosts completed, no outliers, no violations.
-    Clean,
-    /// 1: completed with failed tests, outliers, or threshold violations.
-    Stragglers,
-    /// 2: at least one host failed to complete.
-    HostFailures,
-}
-
-impl Verdict {
-    pub fn exit_code(self) -> i32 {
-        match self {
-            Verdict::Clean => 0,
-            Verdict::Stragglers => 1,
-            Verdict::HostFailures => 2,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -468,15 +472,27 @@ pub fn build(
         started_epoch_secs,
         finished_epoch_secs,
         debug_build: false,
+        gauntlet_version: Some(BuildInfo::current()),
         hosts: observations,
         // `None` only for a config whose `[nccl]` never validated, which
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
         // than guessed.
         nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
+        verdict: None,
         nccl_level_env,
         fleet,
         aggregates,
         calibration,
+    }
+}
+
+impl RunResults {
+    /// Mark the document as a finished run: record its verdict. Called
+    /// once, on the final document only — a partial snapshot of a run in
+    /// flight keeps `verdict: None`, because a verdict over incomplete
+    /// data would read as final.
+    pub fn finalize(&mut self) {
+        self.verdict = Some(verdict(self));
     }
 }
 
@@ -706,53 +722,6 @@ pub fn derive_overlap_retention(obs: &HostObservations) -> Vec<MetricRecord> {
         }
     }
     derived
-}
-
-pub fn verdict(results: &RunResults) -> Verdict {
-    if !results.fleet.failed_hosts.is_empty() {
-        return Verdict::HostFailures;
-    }
-    let has_failed_tests = results.hosts.values().any(|obs| {
-        obs.outcomes
-            .iter()
-            .any(|(_, _, outcome)| matches!(outcome, crate::proto::TestOutcome::Failed { .. }))
-    });
-    let has_outliers = results
-        .fleet
-        .outliers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_violations = results
-        .fleet
-        .threshold_violations
-        .values()
-        .any(|violators| !violators.is_empty());
-    let has_barrier_stragglers = results
-        .fleet
-        .barrier_stragglers
-        .values()
-        .any(|flagged| !flagged.is_empty());
-    let has_counter_findings = results
-        .fleet
-        .counter_findings
-        .values()
-        .any(|findings| !findings.is_empty());
-    let has_socket_fallbacks = results
-        .fleet
-        .socket_fallbacks
-        .values()
-        .any(|findings| !findings.is_empty());
-    if has_failed_tests
-        || has_outliers
-        || has_violations
-        || has_barrier_stragglers
-        || has_counter_findings
-        || has_socket_fallbacks
-    {
-        Verdict::Stragglers
-    } else {
-        Verdict::Clean
-    }
 }
 
 /// Error counters that went up under load, per host. Zero deltas stay in
@@ -1109,16 +1078,21 @@ fn id_suffix<'a>(seed_epoch_secs: u64, hosts: impl ExactSizeIterator<Item = &'a 
 /// Render the human table (per-host summary, outliers section, consistency
 /// section, calibration digest) to the given writer.
 pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
+    let run_verdict = verdict(results);
     writeln!(
         out,
-        "gauntlet run {} ({} hosts, {}s wall, verdict: {:?})",
+        "gauntlet run {} ({} hosts, {}s wall, verdict: {} (exit {}))",
         results.run_id,
         results.hosts.len(),
         results
             .finished_epoch_secs
             .saturating_sub(results.started_epoch_secs),
-        verdict(results),
+        run_verdict,
+        run_verdict.exit_code(),
     )?;
+    if let Some(version) = &results.gauntlet_version {
+        writeln!(out, "gauntlet {version}")?;
+    }
     writeln!(
         out,
         "nccl env: {}",
@@ -1749,7 +1723,7 @@ mod tests {
         assert_eq!(flagged[0].key, "n2");
         assert!((flagged[0].slowest_frac - 0.92).abs() < 1e-12);
         assert_eq!(flagged[0].considered_iters, 1800.0);
-        assert_eq!(verdict(&results), Verdict::Stragglers);
+        assert_eq!(verdict(&results), Verdict::Outliers);
     }
 
     #[test]

@@ -43,6 +43,15 @@ use crate::orchestrator::ObservationSink;
 use crate::orchestrator::barrier::emit_barrier_metrics;
 use crate::proto::{AgentEvent, BarrierSpec, NcclWorkload, Scope, TestId, TestOutcome};
 
+/// Whether the run selected the barrier network step (`net_steps`). Every
+/// NCCL barrier placement — riding the sweep or on its own world — goes
+/// through `BarrierPlacement::plan_selected`, so `Disabled` suppresses both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarrierSelection {
+    Enabled,
+    Disabled,
+}
+
 /// Where the NCCL barrier probe runs: riding the rank-per-GPU sweep's
 /// communicator, or on its own rank-per-GPU world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +103,20 @@ impl BarrierPlacement {
             };
             Self::new(spec, levels.barrier_shares_fleet_comm()).in_shape(shape)
         })
+    }
+
+    /// `plan`, gated on the run's barrier step selection: `None` when the
+    /// barrier step is deselected, whatever the shape or env.
+    pub(super) fn plan_selected(
+        selection: BarrierSelection,
+        config: &FleetConfig,
+        levels: &NcclLevelEnvs,
+        shape: NcclWorldShape,
+    ) -> Option<Self> {
+        match selection {
+            BarrierSelection::Enabled => Self::plan(config, levels, shape),
+            BarrierSelection::Disabled => None,
+        }
     }
 
     pub(super) fn spec(self) -> BarrierSpec {
@@ -324,5 +347,32 @@ mod tests {
             },
         )]);
         assert_eq!(own_world_blocked(&only_skips), None);
+    }
+
+    #[test]
+    fn a_deselected_barrier_step_suppresses_every_placement() {
+        let config: FleetConfig = toml::from_str(r#"hosts = ["a", "b"]"#).expect("config");
+        let levels = config.nccl_levels().expect("levels");
+        for shape in [
+            NcclWorldShape::RankPerGpu,
+            NcclWorldShape::RankPerNode,
+            NcclWorldShape::PerRail,
+        ] {
+            assert_eq!(
+                BarrierPlacement::plan_selected(BarrierSelection::Disabled, &config, levels, shape),
+                None,
+                "{shape:?}"
+            );
+            assert_eq!(
+                BarrierPlacement::plan_selected(BarrierSelection::Enabled, &config, levels, shape),
+                BarrierPlacement::plan(&config, levels, shape),
+                "{shape:?}"
+            );
+            assert!(
+                BarrierPlacement::plan_selected(BarrierSelection::Enabled, &config, levels, shape)
+                    .is_some(),
+                "default barrier_iters > 0"
+            );
+        }
     }
 }

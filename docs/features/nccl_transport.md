@@ -13,7 +13,7 @@ NCCL actually used:
 - the NCCL version.
 
 A multi-host communicator whose network transport is the socket fallback
-is a finding (`fleet.socket_fallbacks`, verdict Stragglers) when the host
+is a finding (`fleet.socket_fallbacks`, hard evidence: verdict Failures, exit 3) when the host
 had an ACTIVE IB/RoCE port to fall back from and the level's env did not
 ask for sockets on purpose. A fleet with no IB at all (e.g. an Ethernet
 bond) runs NCCL over sockets by necessity, and that is never flagged. The
@@ -133,8 +133,9 @@ Non-scope:
    NCCL_IB_HCA set, "no device" may be the misconfiguration itself, so it
    is not taken as proof of absence. Unknown captures and single-host
    communicators never flag either. The transport record itself is kept
-   in every case. `fleet.socket_fallbacks` non-empty makes the verdict at
-   least Stragglers.
+   in every case. `fleet.socket_fallbacks` non-empty is hard evidence:
+   the verdict is `failures` (exit 3; docs/features/reporting.md, "Verdict
+   and exit codes", explains the tier).
 
 6. **Terminal** (`report::render_table`). A "nccl transports" section, one
    row per (host, level) with the latest report: span, network

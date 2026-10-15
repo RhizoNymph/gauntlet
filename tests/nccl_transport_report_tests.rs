@@ -117,7 +117,7 @@ fn a_socket_fallback_is_a_straggler_finding() {
     assert_eq!(findings.keys().collect::<Vec<_>>(), vec!["n1"]);
     assert_eq!(findings["n1"][0].level, NcclLevel::Fleet);
     assert_eq!(findings["n1"][0].ifaces[0].name, "bond0");
-    assert_eq!(report::verdict(&results), Verdict::Stragglers);
+    assert_eq!(report::verdict(&results), Verdict::Failures);
 }
 
 #[test]
