@@ -33,7 +33,7 @@ use super::deploy::ensure_agent;
 use super::session::HostSession;
 use crate::cli::BootstrapArgs;
 use crate::config::{FleetConfig, HostConfig, SshConfig};
-use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
 use crate::proto::InventorySnapshot;
 
 /// Versioned machine interface of `gauntlet bootstrap --json`; the GUI
@@ -115,7 +115,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
     let hosts: Vec<HostConfig> = config.hosts().collect();
     let ssh = Arc::new(config.ssh.clone());
     // Same spawn environment as `gauntlet run`, so probes see what runs see.
-    let nccl_env = Arc::new(config.nccl_env()?.clone());
+    let nccl_env = Arc::new(config.nccl_levels()?.clone());
     let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
     info!(
@@ -136,7 +136,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
             let _permit = permits.acquire_owned().await.ok();
             (
                 index,
-                prepare_host(host, &ssh, &nccl_env, tune, gpu_idle_max_used_mib).await,
+                prepare_host(host, &ssh, nccl_env, tune, gpu_idle_max_used_mib).await,
             )
         });
     }
@@ -198,7 +198,7 @@ pub async fn run(args: BootstrapArgs) -> Result<()> {
 async fn prepare_host(
     host: HostConfig,
     ssh: &SshConfig,
-    nccl_env: &NcclEnv,
+    nccl_env: Arc<NcclLevelEnvs>,
     tune: bool,
     gpu_idle_max_used_mib: u64,
 ) -> HostReadiness {

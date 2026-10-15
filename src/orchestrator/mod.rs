@@ -37,13 +37,13 @@ use tracing::{debug, info, warn};
 
 use self::barrier::{RankSubject, emit_barrier_metrics};
 use self::collect::{Collector, HostObservations};
-use self::session::{HostSession, single_quote};
+use self::session::{AgentEnv, HostSession, single_quote};
 use crate::agent::barrier::TcpBarrierReport;
 use crate::agent::net::{BandwidthReport, LatencyReport};
 use crate::analysis::schedule::{sampled_rounds, tournament_rounds};
 use crate::cli::RunArgs;
 use crate::config::FleetConfig;
-use crate::nccl_env::NcclEnv;
+use crate::nccl_level::NcclLevelEnvs;
 use crate::proto::{
     AgentEvent, CounterRequest, CounterSnapshot, InventorySnapshot, MetricRecord, Phase, Scope,
     TestId, Unit, gpu_idle_outcomes,
@@ -219,7 +219,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         collector.into_observations()
     });
 
-    let sessions = connect_fleet(&config, config.nccl_env()?, &sink).await;
+    let sessions = connect_fleet(&config, config.nccl_levels()?, &sink).await;
     let sessions = deploy_fleet(&config, sessions, &sink).await;
     if sessions.is_empty() {
         bail!("no hosts are usable; see the errors above");
@@ -352,14 +352,15 @@ fn epoch_secs() -> u64 {
 /// the handshake). Order follows the config so host indices are stable.
 async fn connect_fleet(
     config: &FleetConfig,
-    nccl_env: &NcclEnv,
+    nccl: &NcclLevelEnvs,
     sink: &ObservationSink,
 ) -> Vec<Arc<HostSession>> {
     let permits = Arc::new(Semaphore::new(config.ssh.max_concurrent.max(1)));
-    // Set on every agent spawn's command line: the one path by which NCCL
-    // tuning reaches every communicator (sweep, barrier, both overlap
+    // Set on every agent spawn's command line, per the level the spawned
+    // process hosts: the one path by which NCCL tuning reaches every
+    // communicator (intra-node and fleet sweeps, barrier, both overlap
     // steps) without the agent ever mutating its own environment.
-    let nccl_env = Arc::new(nccl_env.clone());
+    let nccl_env = Arc::new(nccl.clone());
     let mut tasks = JoinSet::new();
     let mut count = 0usize;
     for (index, host) in config.hosts().enumerate() {
@@ -371,7 +372,7 @@ async fn connect_fleet(
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.ok();
             let addr = host.addr.clone();
-            match HostSession::connect(host, &ssh, &nccl_env).await {
+            match HostSession::connect(host, &ssh, nccl_env).await {
                 Ok(session) => (index, Some(Arc::new(session))),
                 Err(error) => {
                     sink.error(&addr, format!("ssh connect failed: {error:#}"));
@@ -461,6 +462,9 @@ async fn node_phase(
     };
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
     let gpu_idle_max_used_mib = config.thresholds.gpu_idle_max_used_mib;
+    // One phase per spawn, so the process hosts at most one NCCL level
+    // (network: the intra-node sweep; overlap: the node-local overlap).
+    let env = phase.nccl_level().map_or(AgentEnv::Base, AgentEnv::Nccl);
 
     let mut tasks = JoinSet::new();
     for session in sessions {
@@ -472,7 +476,7 @@ async fn node_phase(
             let mut inventory = None;
             let outcome = tokio::time::timeout(
                 timeout,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(env, &["run"], Some(document), |event| {
                     // gpu_idle is derived here, as the snapshot arrives: the
                     // threshold is orchestrator config, the agent reports
                     // facts only. One outcome per GPU, right behind the
@@ -558,7 +562,7 @@ async fn counter_baseline_pass(
             let mut baseline = None;
             let outcome = tokio::time::timeout(
                 COUNTER_PASS_TIMEOUT,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
                     if let AgentEvent::CounterBaseline { snapshot } = event {
                         baseline = Some(*snapshot);
                     }
@@ -621,7 +625,7 @@ async fn counter_delta_pass(
             let addr = session.addr().to_string();
             let outcome = tokio::time::timeout(
                 COUNTER_PASS_TIMEOUT,
-                session.run_agent(&["run"], Some(document), |event| {
+                session.run_agent(AgentEnv::Base, &["run"], Some(document), |event| {
                     if matches!(&event, AgentEvent::CounterDeltas { .. }) {
                         sink.event(&addr, event);
                     }
