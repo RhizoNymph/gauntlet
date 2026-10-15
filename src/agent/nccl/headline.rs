@@ -1,4 +1,4 @@
-//! Fleet-level sweep headline (proto v11). Pure, so it is tested without a
+//! Fleet-level sweep headline (proto v12). Pure, so it is tested without a
 //! GPU; its only caller (`sweep::run_sweep`) is gpu-gated.
 //!
 //! After a fleet sweep the host holding global rank 0 emits one node-scope

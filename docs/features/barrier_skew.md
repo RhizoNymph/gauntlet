@@ -10,7 +10,10 @@ integrate into one per-rank number. Two probes share one analysis:
 - **NCCL barrier** (`nccl_barrier`): a 4–8 byte all-reduce over the same
   fleet-wide communicator the phase-3 sweep already sets up — one rank
   per GPU (proto v7), so per-rank results are per GPU. GPU/NCCL fleets
-  only.
+  only. When `[nccl.levels.barrier]` makes the barrier's effective NCCL
+  env differ from the fleet sweep's, it runs instead on a communicator
+  of its own (same rank layout) under its own env
+  (`NcclWorkload::Barrier`, proto v11; docs/features/nccl_env.md).
 - **TCP barrier** (`tcp_barrier`): a star barrier over plain TCP, run
   across the *whole* fleet regardless of GPUs — the CPU-only fallback, and
   a fabric-independent complement on GPU fleets.
@@ -98,7 +101,13 @@ straggler experiences.
    (from `tests.barrier_iters` / `tests.barrier_bytes`, only when the NCCL
    world spans ≥ 2 *hosts* — one host's ranks share one arrival, so a
    single-host world has no skew to measure) to the `Lead` and
-   `Participate` directives. After the sweep, every host's process runs
+   `Participate` directives — or, when the barrier and fleet levels'
+   NCCL envs differ, runs it afterwards as a separate
+   `NcclWorkload::Barrier(spec)` job under the barrier env, with the same
+   intercept and analysis (`orchestrator/nccl/barrier_job.rs`). That job
+   runs only after a clean sweep: if the sweep blamed a host, every member
+   records `nccl_barrier` Skipped naming it, rather than re-forming a
+   world that includes the culprit. After the sweep, every host's process runs
    warmup + `iters` timed tiny grouped all-reduces over its local ranks
    and emits one `AgentEvent::NcclBarrierTimings { rank, elapsed_us }` per
    local rank (participants included — the one time they speak). The
@@ -136,7 +145,7 @@ straggler experiences.
    attributed to the lead / coordinator host under `Scope::Node` like
    the sweep metrics: `fleet_span_p50_us`, `fleet_span_p90_us`,
    `fleet_span_p99_us`, `fleet_span_max_us` (`proto::barrier_metric`).
-   One series per run, so (schema v13) they are aggregated across
+   One series per run, so (schema v14) they are aggregated across
    repeats and threshold-checked but kept out of MAD and jitter
    (`report::fleet_nccl::is_fleet_level`, the fleet-headline rule).
 5. **Analysis**: the per-rank metrics are one-value-per-host groups, so
@@ -175,17 +184,21 @@ straggler experiences.
 - `fleet_span_*` stays one node-scope series on the lead host.
 - The TCP barrier is unchanged (one rank per host, `analyze`).
 
-## World shapes (proto v11)
+## World shapes (proto v12)
 
 The NCCL barrier always runs on the rank-per-GPU world, whatever
 `tests.nccl_world` says (docs/features/phase3_network.md "World
 shapes"). With `rank_per_gpu` it rides the sweep's communicator as
 before. With `rank_per_node` / `per_rail` the sweep's worlds hold one
 rank per host on one GPU, so the probe runs afterwards as its own
-rank-per-GPU job: `NcclWorkload::BarrierOnly(BarrierSpec)` (buffers sized to
-the barrier payload alone, `agent::nccl::sweep::run_barrier`), driven by
-the same `drive_fleet_nccl` and analyzed by the same
-`orchestrator::nccl::sweep::analyze_barrier`. Choice: keeping one barrier
+rank-per-GPU job: `NcclWorkload::Barrier(BarrierSpec)` (buffers sized to
+the barrier payload alone, `agent::nccl::sweep::run_barrier`) under the
+`barrier` level env, driven by the same `drive_fleet_nccl` and analyzed
+by the same `barrier_job::BarrierTimings::analyze`. It is the one
+barrier-only workload: the same job the per-level env split (v11) runs
+when the barrier env differs, and `barrier_job::BarrierPlacement` makes
+the ride-or-own-world decision once, from both rules (rides only a
+rank-per-GPU sweep under the fleet env). Choice: keeping one barrier
 world means `nccl_barrier` subjects (`host:gpuN`) and straggler flags are
 comparable across runs with different sweep shapes, at the cost of one
 extra communicator init in the NIC-forcing shapes. The job is gated on
@@ -213,11 +226,16 @@ laid out never skips the barrier: it runs on its own world regardless.
 - `src/proto/mod.rs` — `BarrierSpec`, `NcclBarrierTimings`, new `TestId`s,
   `PROTO_VERSION` 5.
 - `src/orchestrator/mod.rs` — `tcp_barrier_sweep`.
+- `src/orchestrator/nccl/barrier_job.rs` — `BarrierPlacement` (`new`:
+  env rule, `in_shape`: shape rule, `plan`, `rides_sweep`, `own_world`),
+  `BarrierTimings` (timing interception with the sending host,
+  ownership check, grouped analysis + per-GPU attribution via the rank
+  layout), `run_own_world`, `own_world_blocked`.
 - `src/orchestrator/nccl/sweep.rs` — barrier spec on the sweep workload
-  (or `barrier_only` for the NIC-forcing shapes), timing interception in
-  the fleet NCCL driver (`Collected`, with the sending host), ownership
-  check, grouped analysis + per-GPU attribution via the rank layout
-  (`analyze_barrier`).
+  when it rides, the own-world job after a rank-per-GPU sweep
+  (`rank_per_gpu_sweep`) or a NIC-forcing one (`barrier_after`,
+  without excluded hosts); `Collected` adds the headline capture to
+  the barrier intercept.
 - `src/orchestrator/nccl/ownership.rs` — `accept_owned` (rank
   ownership of per-rank reports).
 - `src/orchestrator/collect.rs` — stray `NcclBarrierTimings` ignored.

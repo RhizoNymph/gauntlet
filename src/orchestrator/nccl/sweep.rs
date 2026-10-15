@@ -16,18 +16,23 @@
 //!   `nccl_inter_all_*.bus_gib_per_sec_peak_min_rail` — peak per rail,
 //!   worst rail overall (`shape::rail_rollup`) — on the lead host.
 //!
-//! For the two NIC-forcing shapes the barrier probe runs afterwards as its
-//! own rank-per-GPU job (`NcclWorkload::BarrierOnly`), without the hosts
-//! the sweep excluded: barrier subjects stay `host:gpuN` whatever the
-//! shape, so barrier results stay comparable across runs with different
-//! sweep shapes.
+//! Where the barrier probe runs is decided once
+//! (`barrier_job::BarrierPlacement`): it rides a rank-per-GPU sweep under
+//! the fleet env, and otherwise runs as its own rank-per-GPU
+//! `NcclWorkload::Barrier` job under the barrier env — after a clean
+//! rank-per-GPU sweep, or after a NIC-forcing sweep without the hosts that
+//! sweep blamed. Barrier subjects stay `host:gpuN` whatever the shape, so
+//! barrier results stay comparable across runs with different sweep
+//! shapes.
 //!
 //! Every world goes through `shape::sweep_gate`; a gated world records
 //! Skipped outcomes naming the failed condition. A world that cannot be
 //! laid out records Skipped outcomes naming the layout error, and the
 //! barrier still runs on its own world. Every job reuses the shared
 //! driver (`drive_fleet_nccl`: rendezvous relay, failure attribution,
-//! early abort, remote kill).
+//! early abort, remote kill) and spawns under its workload's NCCL level
+//! (`NcclWorkload::level`: every sweep shape is the `fleet` level, the
+//! barrier job the `barrier` level), with transport capture in the agent.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -35,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use super::attribution::Attribution;
+use super::barrier_job::{self, BarrierPlacement, BarrierTimings};
 use super::layout::{LayoutError, RankLayout};
 use super::rails::{Exclusions, RailFate, RailLedger, plan_rail};
 use super::records::OutcomeRecord;
@@ -43,13 +49,10 @@ use super::shape::{
     sweep_gate, world_of,
 };
 use super::{
-    EventIntercept, FleetWorld, NcclFailureMode, NcclJob, accept_owned, block_owners,
-    drive_fleet_nccl, emit_outcomes, gpu_subject, nccl_hosts, report_violations,
+    EventIntercept, NcclFailureMode, NcclJob, drive_fleet_nccl, emit_outcomes, nccl_hosts,
 };
-use crate::analysis::skew::{self, Margin, RankSeries, SkewPolarity};
 use crate::config::{FleetConfig, NcclWorldShape};
 use crate::orchestrator::ObservationSink;
-use crate::orchestrator::barrier::emit_barrier_metrics;
 use crate::orchestrator::session::HostSession;
 use crate::proto::{
     AgentEvent, BarrierSpec, InventorySnapshot, NcclWorkload, Scope, SweepSeries, TestId,
@@ -75,8 +78,15 @@ pub(in crate::orchestrator) async fn nccl_sweep(
     coverage: IntraNodeCoverage,
 ) {
     let hosts = nccl_hosts(sessions, inventories).await;
-    let barrier = barrier_spec(config);
-    let exclusions = match config.tests.nccl_world {
+    let shape = config.tests.nccl_world;
+    // Decided once (`barrier_job::BarrierPlacement`): rides the sweep only
+    // for a rank-per-GPU sweep under the fleet env. The per-level envs are
+    // run-wide (resolved from one config), so any session's view is the
+    // run's.
+    let barrier = hosts
+        .first()
+        .and_then(|(session, _)| BarrierPlacement::plan(config, session.nccl_levels(), shape));
+    let exclusions = match shape {
         NcclWorldShape::RankPerGpu => {
             rank_per_gpu_sweep(config, &hosts, sink, coverage, barrier).await;
             return;
@@ -84,17 +94,10 @@ pub(in crate::orchestrator) async fn nccl_sweep(
         NcclWorldShape::RankPerNode => rank_per_node_sweep(config, &hosts, sink, coverage).await,
         NcclWorldShape::PerRail => per_rail_sweep(config, &hosts, sink, coverage).await,
     };
-    if let Some(spec) = barrier {
+    // A NIC-forcing shape always places the barrier on its own world.
+    if let Some(spec) = barrier.and_then(BarrierPlacement::own_world) {
         barrier_after(config, &hosts, &exclusions, sink, spec).await;
     }
-}
-
-/// The barrier-skew probe's parameters, `None` when disabled.
-fn barrier_spec(config: &FleetConfig) -> Option<BarrierSpec> {
-    (config.tests.barrier_iters > 0).then_some(BarrierSpec {
-        iters: config.tests.barrier_iters,
-        bytes: config.tests.barrier_bytes,
-    })
 }
 
 /// Job step name, as failure reasons and logs show it.
@@ -146,21 +149,43 @@ async fn rank_per_gpu_sweep(
     hosts: &Hosts,
     sink: &ObservationSink,
     coverage: IntraNodeCoverage,
-    barrier: Option<BarrierSpec>,
+    barrier: Option<BarrierPlacement>,
 ) {
     let series = SweepSeries::RankPerGpu;
     let world = match world_of(series, hosts) {
         Ok(world) => world,
         Err(error) => {
             // The barrier rides this very world: it cannot run either.
+            // A layout error is about this world, which both placements use.
             let barrier_test = barrier.map(|_| TestId::NcclBarrier);
             let tests = series.tests().into_iter().chain(barrier_test);
             report_layout_failure(sink, hosts, tests, "rank-per-gpu", &error);
             return;
         }
     };
-    if let WorldRun::Gated(skip) = run_world(config, &world, sink, coverage, barrier).await {
-        emit_skip(sink, &world, &skip);
+    let riding = barrier.and_then(BarrierPlacement::rides_sweep);
+    match run_world(config, &world, sink, coverage, riding).await {
+        WorldRun::Gated(skip) => emit_skip(sink, &world, &skip),
+        WorldRun::Ran { failures, .. } => {
+            // Under a different barrier env: its own job on the same rank
+            // layout, only after a clean sweep (`run_own_world`).
+            if let Some(spec) = barrier.and_then(BarrierPlacement::own_world) {
+                let timings = BarrierTimings::default();
+                if barrier_job::run_own_world(
+                    config,
+                    &world.layout,
+                    sink,
+                    spec,
+                    timings.intercept(),
+                    &failures,
+                )
+                .await
+                    && let Some((lead, _)) = world.layout.members().first()
+                {
+                    timings.analyze(sink, &world.layout, lead.addr());
+                }
+            }
+        }
     }
 }
 
@@ -336,7 +361,7 @@ async fn run_world(
     // when the intra-node sweep is off) carries no barrier.
     let barrier = barrier.filter(|_| layout.member_count() >= MIN_HOSTS);
     let collected = Collected::default();
-    let intercept = collected.intercept(lead.addr().to_string(), Some(series.headline()));
+    let intercept = collected.intercept(lead.addr().to_string(), series.headline());
     let job = NcclJob {
         workload: NcclWorkload::Sweep {
             sizes: config.tests.nccl_sizes.clone(),
@@ -357,7 +382,7 @@ async fn run_world(
     .await;
     let (timings, headlines) = collected.take();
     if barrier.is_some() {
-        analyze_barrier(sink, layout, timings);
+        timings.analyze(sink, layout, lead.addr());
     }
     WorldRun::Ran {
         headlines,
@@ -366,8 +391,11 @@ async fn run_world(
 }
 
 /// The barrier probe after a NIC-forcing sweep: its own rank-per-GPU
-/// world, without the hosts the sweep excluded (each records Skipped for
-/// `nccl_barrier` with the reason).
+/// world (`NcclWorkload::Barrier`, barrier level env), without the hosts
+/// the sweep's worlds blamed (each records Skipped for `nccl_barrier` with
+/// the reason). The sweep's culprits are already out of this world, so
+/// nothing here re-forms a world around them; `run_own_world` sees no
+/// sweep failures to block on.
 async fn barrier_after(
     config: &FleetConfig,
     hosts: &Hosts,
@@ -389,142 +417,68 @@ async fn barrier_after(
             )],
         );
     }
-    match RankLayout::new(kept.iter().cloned()) {
-        Ok(world) => barrier_only(config, world, sink, spec).await,
-        Err(error) => report_layout_failure(
-            sink,
-            &kept,
-            [TestId::NcclBarrier],
-            "rank-per-gpu barrier",
-            &error,
-        ),
-    }
-}
-
-/// The barrier probe as its own rank-per-GPU job, for sweeps that ran in
-/// a NIC-forcing shape. Needs `MIN_HOSTS` independent arrivals, like the
-/// riding probe.
-async fn barrier_only(
-    config: &FleetConfig,
-    world: FleetWorld,
-    sink: &ObservationSink,
-    spec: BarrierSpec,
-) {
-    if world.member_count() < MIN_HOSTS {
-        info!(
-            nccl_hosts = world.member_count(),
-            min_hosts = MIN_HOSTS,
-            "too few NCCL-capable hosts; skipping the NCCL barrier probe"
-        );
-        return;
-    }
-    let Some((lead, _)) = world.members().first() else {
-        return;
+    let world = match RankLayout::new(kept.iter().cloned()) {
+        Ok(world) => world,
+        Err(error) => {
+            report_layout_failure(
+                sink,
+                &kept,
+                [TestId::NcclBarrier],
+                "rank-per-gpu barrier",
+                &error,
+            );
+            return;
+        }
     };
-    info!(
-        world_size = world.world_size(),
-        hosts = world.member_count(),
-        lead = %lead.addr(),
-        "NCCL barrier probe"
-    );
-    let collected = Collected::default();
-    // No headline rides a barrier job.
-    let intercept = collected.intercept(lead.addr().to_string(), None);
-    let job = NcclJob {
-        workload: NcclWorkload::BarrierOnly(spec),
-    };
-    drive_fleet_nccl(
+    let timings = BarrierTimings::default();
+    if barrier_job::run_own_world(
         config,
         &world,
         sink,
-        "nccl barrier",
-        &job,
-        NcclFailureMode::HostError,
-        intercept,
+        spec,
+        timings.intercept(),
+        &BTreeMap::new(),
     )
-    .await;
-    let (timings, _) = collected.take();
-    analyze_barrier(sink, &world, timings);
+    .await
+        && let Some((lead, _)) = world.members().first()
+    {
+        timings.analyze(sink, &world, lead.addr());
+    }
 }
 
-/// Barrier timing series with the host that sent each.
-type SenderTimings = Vec<(String, RankSeries)>;
-
-/// What one sweep or barrier job's intercept collects from the event
-/// streams: every rank's barrier timings with their sender (consumed),
-/// and the lead's headline values (forwarded as well).
-#[derive(Default, Clone)]
+/// What one sweep job's intercept collects from the event streams: every
+/// rank's barrier timings (`BarrierTimings`, consumed) and the lead's
+/// headline values (forwarded as well).
+#[derive(Default)]
 struct Collected {
-    timings: Arc<Mutex<SenderTimings>>,
+    timings: BarrierTimings,
     headlines: Arc<Mutex<RailPeaks>>,
 }
 
 impl Collected {
-    /// `headline`: the metric name whose values to capture from the lead,
-    /// `None` for a job with no headline.
-    fn intercept(&self, lead: String, headline: Option<String>) -> EventIntercept {
-        let collected = self.clone();
-        Arc::new(move |host, event| match event {
-            AgentEvent::NcclBarrierTimings { rank, elapsed_us } => {
-                collected
-                    .timings
+    /// `headline`: the metric name whose values to capture from `lead`.
+    fn intercept(&self, lead: String, headline: String) -> EventIntercept {
+        let barrier = self.timings.intercept();
+        let headlines = Arc::clone(&self.headlines);
+        Arc::new(move |host, event| {
+            if let AgentEvent::Metric { record } = &event
+                && host == lead
+                && record.name == headline
+            {
+                // Only the world's lead emits sweep metrics; a headline from
+                // anywhere else is forwarded but never rolled up.
+                headlines
                     .lock()
-                    .expect("barrier timings poisoned")
-                    .push((host.to_string(), RankSeries { rank, elapsed_us }));
-                None
+                    .expect("headlines poisoned")
+                    .push((record.test, record.value));
             }
-            AgentEvent::Metric { record } => {
-                // Only the world's lead emits sweep metrics; a headline
-                // from anywhere else is forwarded but never rolled up.
-                if host == lead && headline.as_deref() == Some(record.name.as_str()) {
-                    collected
-                        .headlines
-                        .lock()
-                        .expect("headlines poisoned")
-                        .push((record.test, record.value));
-                }
-                Some(AgentEvent::Metric { record })
-            }
-            event => Some(event),
+            barrier(host, event)
         })
     }
 
-    fn take(self) -> (SenderTimings, RailPeaks) {
-        let timings = std::mem::take(&mut *self.timings.lock().expect("barrier timings poisoned"));
+    fn take(self) -> (BarrierTimings, RailPeaks) {
         let headlines = std::mem::take(&mut *self.headlines.lock().expect("headlines poisoned"));
-        (timings, headlines)
-    }
-}
-
-/// Ownership-check the collected barrier timings against the world's
-/// blocks, then run the fleet-wide skew analysis and emit its metrics
-/// (per rank as `host:gpuN`, fleet span against the lead).
-fn analyze_barrier(sink: &ObservationSink, world: &FleetWorld, collected: SenderTimings) {
-    let Some((lead, _)) = world.members().first() else {
-        return;
-    };
-    let (accepted, violations) =
-        accept_owned(&block_owners(world), collected, |series| series.rank);
-    report_violations(sink, violations);
-    let series: Vec<RankSeries> = accepted.into_values().collect();
-    match skew::analyze_grouped(
-        &series,
-        SkewPolarity::LateIsMin,
-        Margin::default(),
-        |rank| world.arrival_group(rank),
-    ) {
-        Some(skew) => emit_barrier_metrics(
-            sink,
-            TestId::NcclBarrier,
-            &skew,
-            |rank| gpu_subject(world, rank),
-            Some(lead.addr()),
-        ),
-        None => warn!(
-            ranks_reporting = series.len(),
-            world_size = world.world_size(),
-            "NCCL barrier produced no analyzable timings"
-        ),
+        (self.timings, headlines)
     }
 }
 

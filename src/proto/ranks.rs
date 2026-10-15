@@ -7,7 +7,7 @@
 //! block.
 //!
 //! A block also says which local GPUs its ranks run on: a contiguous run
-//! of CUDA device ordinals starting at `first_gpu` (proto v11). The
+//! of CUDA device ordinals starting at `first_gpu` (proto v12). The
 //! rank-per-GPU world always starts at GPU 0, so local GPU `i` is rank
 //! `base + i`; the NIC-forcing world shapes (`rank_per_node`, `per_rail`)
 //! give each host a one-rank block on a chosen GPU — rail `r` runs on
@@ -303,7 +303,7 @@ mod tests {
         );
         let back: RankAssignment = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, rail);
-        // A pre-v11 block without the field decodes onto GPU 0.
+        // A pre-v12 block without the field decodes onto GPU 0.
         let old: RankBlock = serde_json::from_str(r#"{"base":0,"count":4}"#).expect("decode");
         assert_eq!(old.first_gpu(), 0);
         // Overflowing GPU ranges are rejected on decode, too.

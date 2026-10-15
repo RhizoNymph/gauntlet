@@ -1,4 +1,4 @@
-//! Fleet-level results (schema v13): which metric groups are fleet-level
+//! Fleet-level results (schema v14): which metric groups are fleet-level
 //! (one value per run), and the calibration link classes of the fleet and
 //! inter-node sweeps.
 //!

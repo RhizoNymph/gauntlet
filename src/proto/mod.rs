@@ -12,6 +12,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::nccl_level::NcclLevel;
+use crate::nccl_transport::NcclTransportReport;
+
 mod occupancy;
 mod ranks;
 mod series;
@@ -55,15 +58,23 @@ pub use series::SweepSeries;
 // agent, stale gauntlet agents marked as such), and the `gpu_idle` test id
 // rides the wire. Serde-defaulted, so older inventories decode as
 // "occupancy unknown".
-// v11: NCCL world shapes — `RankBlock` carries the local GPU its ranks
+// v11: per-level NCCL env and transport capture — `NcclWorkload::Barrier`
+// (the barrier-skew probe in its own world, when the barrier level's env
+// differs from the fleet level's) and the `nccl_transport` event (the
+// network/peer transports NCCL used, parsed from its INFO log, or why
+// unknown). The per-level env and NCCL debug-log variables travel on the
+// spawn command line, never on the wire.
+// v12: NCCL world shapes — `RankBlock` carries the local GPU its ranks
 // start on (`first_gpu`, serde-defaulted to 0 and omitted when 0), the
 // sweep workload carries its `SweepSeries` (serde-defaulted to
-// rank-per-GPU), `NcclWorkload::BarrierOnly` runs the barrier probe alone,
-// and the `nccl_inter_all_reduce` / `nccl_inter_all_gather` test ids ride
-// the wire. The lead of every fleet sweep also emits a fleet-level
-// `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`) headline,
-// and an inter-node lead opens its per-size series with a `ranks` record.
-pub const PROTO_VERSION: u32 = 11;
+// rank-per-GPU), and the `nccl_inter_all_reduce` / `nccl_inter_all_gather`
+// test ids ride the wire. `NcclWorkload::Barrier` now also runs the
+// barrier probe on its own rank-per-GPU world whenever the sweep ran in a
+// NIC-forcing world shape. The lead of every fleet sweep also emits a
+// fleet-level `bus_gib_per_sec_peak` (or `bus_gib_per_sec_peak_rail<r>`)
+// headline, and an inter-node lead opens its per-size series with a
+// `ranks` record.
+pub const PROTO_VERSION: u32 = 12;
 
 /// Exit status of an `agent nccl` process that stopped *itself* because
 /// the fleet stopped, not because of a fault on its own host: the fleet
@@ -160,6 +171,13 @@ pub enum AgentEvent {
     CounterDeltas {
         deltas: Box<CounterDeltas>,
     },
+    /// The transports NCCL used for the communicator this process hosted
+    /// (or why they are unknown), parsed from NCCL's INFO log after the
+    /// workload ran. One per NCCL-hosting process; forwarded to the
+    /// collector as is.
+    NcclTransport {
+        report: Box<NcclTransportReport>,
+    },
     /// Unrecoverable agent-side failure; always the last event if emitted.
     Fatal {
         message: String,
@@ -187,6 +205,19 @@ impl Phase {
         Phase::Network,
         Phase::Overlap,
     ];
+
+    /// The NCCL level of the communicator an `agent run` of this phase
+    /// hosts, if any. The orchestrator spawns such a process under that
+    /// level's env, and the agent records its transport under it — one
+    /// source of truth for both sides. The orchestrator sends exactly one
+    /// phase per `agent run`, so a process never hosts two levels.
+    pub fn nccl_level(self) -> Option<NcclLevel> {
+        match self {
+            Phase::Network => Some(NcclLevel::Intranode),
+            Phase::Overlap => Some(NcclLevel::OverlapIntranode),
+            Phase::Inventory | Phase::CpuMem | Phase::Gpu => None,
+        }
+    }
 
     pub fn parse(s: &str) -> Option<Phase> {
         match s {
@@ -635,7 +666,7 @@ pub mod nccl_metric {
     /// `BUS_PEAK` (bare), `bus_peak_rail` and `BUS_PEAK_MIN_RAIL`.
     pub const BUS_PEAK_PREFIX: &str = "bus_gib_per_sec_peak";
     /// Fleet-level headline of the rank-per-GPU and rank-per-node sweeps
-    /// (proto v11): one value per run, attributed to the world's lead
+    /// (proto v12): one value per run, attributed to the world's lead
     /// host at node scope. Not fleet-comparable within a run (it has no
     /// peers); the report aggregates it across repeats but keeps it out
     /// of MAD.
@@ -804,7 +835,7 @@ pub enum NcclWorkload {
         barrier: Option<BarrierSpec>,
         /// Which world shape this sweep's world was laid out in, and so
         /// which test ids and headline name the lead emits under (proto
-        /// v11; absent = rank-per-GPU).
+        /// v12; absent = rank-per-GPU).
         #[serde(default)]
         series: SweepSeries,
     },
@@ -812,10 +843,26 @@ pub enum NcclWorkload {
     /// all-reduce under GEMM load on every local GPU; every rank reports
     /// an `OverlapFleetReport`.
     Overlap(OverlapSpec),
-    /// The barrier-skew microbenchmark alone (proto v11): run on the
-    /// rank-per-GPU world when the sweep itself ran in a different world
-    /// shape, so barrier subjects stay `host:gpuN` whatever the shape.
-    BarrierOnly(BarrierSpec),
+    /// The barrier-skew probe on its own rank-per-GPU communicator: used
+    /// instead of `Sweep { barrier }` whenever the barrier cannot ride the
+    /// sweep — the barrier level's NCCL env differs from the fleet level's
+    /// (v11), or the sweep ran in a NIC-forcing world shape (v12), so
+    /// barrier subjects stay `host:gpuN` whatever the shape. The
+    /// orchestrator decides once (`BarrierPlacement`).
+    Barrier(BarrierSpec),
+}
+
+impl NcclWorkload {
+    /// The NCCL level this workload's communicator belongs to (a sweep
+    /// carrying the barrier probe is still the fleet communicator, and so
+    /// is an inter-node sweep: same fabric, same fleet-level knobs).
+    pub fn level(&self) -> NcclLevel {
+        match self {
+            NcclWorkload::Sweep { .. } => NcclLevel::Fleet,
+            NcclWorkload::Overlap(_) => NcclLevel::OverlapFleet,
+            NcclWorkload::Barrier(_) => NcclLevel::Barrier,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -956,7 +1003,7 @@ mod tests {
 
     #[test]
     fn sweep_workloads_default_to_the_rank_per_gpu_series() {
-        // A pre-v11 sweep workload has no series: it is the rank-per-GPU
+        // A pre-v12 sweep workload has no series: it is the rank-per-GPU
         // sweep.
         let json = r#"{"kind":"sweep","sizes":[1024],"iters_per_size":20}"#;
         let workload: NcclWorkload = serde_json::from_str(json).expect("decode");
@@ -964,21 +1011,6 @@ mod tests {
             panic!("expected a sweep");
         };
         assert_eq!(series, SweepSeries::RankPerGpu);
-    }
-
-    #[test]
-    fn barrier_only_workloads_round_trip() {
-        let directive = NcclDirective::Lead {
-            assignment: assignment(0, 4, 8),
-            workload: NcclWorkload::BarrierOnly(BarrierSpec {
-                iters: 2000,
-                bytes: 8,
-            }),
-        };
-        let json = serde_json::to_string(&directive).expect("serialize");
-        assert!(json.contains(r#""kind":"barrier_only""#), "{json}");
-        let back: NcclDirective = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, directive);
     }
 
     #[test]

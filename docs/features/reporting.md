@@ -26,7 +26,8 @@ started, finished)`:
    straggler defines the node) and `links` alpha-beta fits → `calibration`.
 6. `verdict()`: HostFailures if any host has errors; else Stragglers if
    any test outcome is Failed (including `gpu_idle`) or any
-   outliers/violations exist; else Clean.
+   outliers/violations, barrier stragglers, counter findings or NCCL
+   socket fallbacks exist; else Clean.
    Exit codes 2/1/0.
 
 `run_id` = "<started_epoch_secs>-<6 lowercase hex>", the hex being FNV-1a
@@ -66,7 +67,7 @@ intra-node straggler headline. Its name carries the GPU count, so nodes
 are only compared within their own topology (the same keying as the
 `_<n>gpu` link classes); a topology with fewer than 4 nodes never flags.
 
-Fleet-level groups (schema v13) are the opposite case: one value per
+Fleet-level groups (schema v14) are the opposite case: one value per
 *run*, attributed to a lead host at node scope —
 `nccl_all_{reduce,gather}.bus_gib_per_sec_peak`,
 `nccl_inter_all_{reduce,gather}.bus_gib_per_sec_peak` (rank-per-node),
@@ -134,7 +135,7 @@ Per-host `NodeRoofline`:
 
 `calibration.links`:
 - `nccl_allreduce_inter_node_<n>rank` / `nccl_allgather_inter_node_<n>rank`
-  (schema v13): the `nccl_inter_all_*` series of the NIC-forcing world
+  (schema v14): the `nccl_inter_all_*` series of the NIC-forcing world
   shapes (`tests.nccl_world = "rank_per_node" | "per_rail"`), keyed by
   world size like the intra-node `_<n>gpu` classes — rails of a
   heterogeneous fleet differ in size, and a fit pooled across sizes
@@ -218,7 +219,7 @@ tail progress:
 
 ## Files
 `src/analysis/{stats,fit,schedule}.rs`,
-`src/report/{mod,history,intranode,nccl_env,gpu_idle,fleet_nccl}.rs`
+`src/report/{mod,history,intranode,nccl_env,nccl_transport,gpu_idle,fleet_nccl}.rs`
 (`fleet_nccl`: `is_fleet_level`, fleet/inter-node `link_fits`; `mod`:
 `mad_groups`),
 `src/orchestrator/mod.rs` (`PartialWriter`, snapshot cadence),
@@ -317,6 +318,37 @@ loading. `Some(empty)` means an untuned run. The terminal table prints
 `report::nccl_env::nccl_env_drift` lists the keys added, removed or
 changed between two runs, and returns `None` if either run did not record
 its env. The viewer's diff mode uses it.
+
+## Per-level NCCL env and transports (schema v13)
+
+- `RunResults.nccl_level_env: Option<BTreeMap<NcclLevel, BTreeMap<String,
+  String>>>` records the effective env of every NCCL level (`intranode`,
+  `fleet`, `barrier`, `overlap_intranode`, `overlap_fleet`): the global
+  `[nccl]` env with that level's `[nccl.levels.<level>]` override layered
+  on top. `nccl_env` stays the global map. Serde-defaulted; `None` = not
+  recorded (pre-v13). The table prints `nccl env [<level>]: ...` for
+  every level whose env differs from the global one
+  (`nccl_env::format_level_overrides`), and
+  `nccl_env::nccl_level_env_drift` gives the viewer per-level drift
+  beyond the global drift.
+- `hosts.*.nccl_transports: Vec<NcclTransportReport>` — one record per
+  NCCL-hosting process (level, single/multi host, and the parsed
+  transport or why unknown). Serde-defaulted.
+- `fleet.socket_fallbacks: BTreeMap<host, Vec<SocketFallback { level,
+  ifaces }>>` — `report::nccl_transport::socket_fallbacks`: a multi-host
+  communicator whose captured network transport is TCP sockets, on a host
+  whose phase-0 inventory shows at least one ACTIVE IB/RoCE port
+  (`ib_ports`), at a level whose recorded env neither sets
+  NCCL_IB_DISABLE to a non-zero integer nor NCCL_NET=Socket. A host with
+  no IB ports, only inactive ones, or no inventory is never flagged:
+  sockets are then its only transport, not a fallback (an Ethernet-only
+  fleet stays Clean). One entry per (host, level) across repeats;
+  unknown captures never count; the transport record is kept regardless.
+  Any entry makes the verdict at least `Stragglers`. Serde-defaulted.
+- Terminal: a "nccl transports" section (latest record per host and
+  level: span, network summary or "unknown: <reason>", peer channel
+  counts, NCCL version) and, when any, a "nccl socket fallback" section
+  with one line per finding. See docs/features/nccl_transport.md.
 
 ## Barrier stragglers (schema v6)
 

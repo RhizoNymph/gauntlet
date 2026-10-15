@@ -11,8 +11,10 @@
 //! headline, `super::headline`); every other host runs silently. The
 //! workload's `SweepSeries` decides the test ids and headline name. The
 //! barrier probe times every local rank separately and reports one
-//! `NcclBarrierTimings` per rank; it rides the sweep, or runs alone
-//! (`run_barrier`) when the sweep ran in another world shape.
+//! `NcclBarrierTimings` per rank; it rides the sweep, or runs alone on its
+//! own rank-per-GPU communicator (`run_barrier`, `NcclWorkload::Barrier`)
+//! when the orchestrator's `BarrierPlacement` says so (a different barrier
+//! env, or a sweep in a NIC-forcing world shape).
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -101,24 +103,42 @@ impl SweepBuffers {
             max_elements,
         })
     }
+}
 
-    /// Buffers for the barrier probe alone: exactly its payload, so the
-    /// probe never clamps below the configured barrier size.
-    pub(super) fn alloc_for_barrier(prepared: &PreparedRanks, spec: BarrierSpec) -> Result<Self> {
-        let max_elements = barrier_elements(spec, usize::MAX);
+/// The barrier probe's buffers when it runs on its own communicator
+/// (`NcclWorkload::Barrier`): one tiny payload per local rank.
+pub(super) struct BarrierBuffers {
+    buffers: Buffers,
+    elements: usize,
+}
+
+impl BarrierBuffers {
+    pub(super) fn alloc(prepared: &PreparedRanks, spec: &BarrierSpec) -> Result<Self> {
+        let elements = barrier_elements(spec.bytes);
         Ok(Self {
-            buffers: Buffers::alloc(&prepared.streams(), max_elements)?,
-            max_elements,
+            buffers: Buffers::alloc(&prepared.streams(), elements)?,
+            elements,
         })
     }
 }
 
-/// f32 elements of the barrier all-reduce: the payload rounded up to whole
-/// elements, at least one, at most what the buffers hold.
-fn barrier_elements(spec: BarrierSpec, max_elements: usize) -> usize {
-    (spec.bytes as usize)
-        .div_ceil(F32_BYTES)
-        .clamp(1, max_elements.max(1))
+/// The barrier-skew probe alone, on a communicator of its own.
+pub(super) fn run_barrier(
+    sink: &EventSink,
+    ranks: &LocalRanks,
+    buffers: BarrierBuffers,
+    spec: BarrierSpec,
+) -> Result<()> {
+    let BarrierBuffers {
+        mut buffers,
+        elements,
+    } = buffers;
+    barrier_probe(sink, ranks, &mut buffers, elements, spec)
+}
+
+/// f32 elements of the barrier payload: `bytes` rounded up, never zero.
+fn barrier_elements(bytes: u64) -> usize {
+    (bytes as usize).div_ceil(F32_BYTES).max(1)
 }
 
 /// The message-size sweep (plus the optional barrier-skew probe).
@@ -183,21 +203,6 @@ pub(super) fn run_sweep(
     Ok(())
 }
 
-/// The barrier-skew probe alone, on its own communicator
-/// (`NcclWorkload::BarrierOnly`).
-pub(super) fn run_barrier(
-    sink: &EventSink,
-    ranks: &LocalRanks,
-    buffers: SweepBuffers,
-    spec: BarrierSpec,
-) -> Result<()> {
-    let SweepBuffers {
-        mut buffers,
-        max_elements,
-    } = buffers;
-    barrier_probe(sink, ranks, &mut buffers, max_elements, spec)
-}
-
 /// Barrier-skew microbenchmark: many iterations of a tiny all-reduce, each
 /// timed per local rank from the common launch instant to that rank's
 /// completion. The per-iteration drain aligns iteration boundaries across
@@ -214,7 +219,7 @@ fn barrier_probe(
     max_elements: usize,
     spec: BarrierSpec,
 ) -> Result<()> {
-    let elements = barrier_elements(spec, max_elements);
+    let elements = barrier_elements(spec.bytes).min(max_elements.max(1));
     // Algorithm/channel selection is per message size; keep setup for the
     // barrier size out of the first measured iterations.
     for _ in 0..WARMUP_ITERS {

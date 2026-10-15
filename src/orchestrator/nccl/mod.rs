@@ -26,6 +26,7 @@
 //! killed remotely, never just dropped.
 
 mod attribution;
+mod barrier_job;
 mod layout;
 mod ownership;
 mod rails;
@@ -46,11 +47,12 @@ pub(super) use self::sweep::nccl_sweep;
 use self::attribution::{
     AbortAction, AbortTracker, Attribution, FailureKind, HostFailure, attribute,
 };
+
 use self::layout::RankLayout;
 use self::ownership::accept_owned;
 use self::records::{host_overlap_records, outcomes_with};
 use super::barrier::RankSubject;
-use super::session::HostSession;
+use super::session::{AgentEnv, HostSession};
 use super::{ObservationSink, gpu_bearing_hosts, kill_remote_agent};
 use crate::config::FleetConfig;
 use crate::proto::{
@@ -156,13 +158,19 @@ fn block_owners(world: &FleetWorld) -> BTreeMap<String, RankBlock> {
 
 /// What one fleet-wide `agent nccl` job runs, beyond the world itself. The
 /// lead and participant directives differ only in rendezvous plumbing, so
-/// one job builds both. NCCL env is not part of the job: every session
-/// sets it on the agent's spawn command line (`HostSession::connect`).
+/// one job builds both. NCCL env is not part of the job's wire form: every
+/// host's process is spawned under the env of the workload's level
+/// (`spawn_env`), on its command line.
 struct NcclJob {
     workload: NcclWorkload,
 }
 
 impl NcclJob {
+    /// The spawn env of every host's process in this job.
+    fn spawn_env(&self) -> AgentEnv {
+        AgentEnv::Nccl(self.workload.level())
+    }
+
     fn lead(&self, assignment: RankAssignment) -> NcclDirective {
         NcclDirective::Lead {
             assignment,
@@ -231,6 +239,7 @@ async fn drive_fleet_nccl(
         .map(|(session, _)| (session.addr().to_string(), Arc::clone(session)))
         .collect();
     let timeout = Duration::from_secs(config.tests.phase_timeout_secs.max(1));
+    let env = job.spawn_env();
     let mut tasks = JoinSet::new();
     let mut running: BTreeSet<String> = BTreeSet::new();
 
@@ -261,6 +270,7 @@ async fn drive_fleet_nccl(
             let addr = session.addr().to_string();
             let failure = run_host(
                 &session,
+                env,
                 assignment,
                 document,
                 timeout,
@@ -332,7 +342,7 @@ async fn drive_fleet_nccl(
             running.insert(session.addr().to_string());
             tasks.spawn(async move {
                 let addr = session.addr().to_string();
-                let failure = run_host(&session, assignment, document, timeout, |event| {
+                let failure = run_host(&session, env, assignment, document, timeout, |event| {
                     if let Some(event) = intercept(&addr, event) {
                         sink.event(&addr, event);
                     }
@@ -406,6 +416,7 @@ async fn abort_rest(
 /// decides how the failure is reported.
 async fn run_host(
     session: &HostSession,
+    env: AgentEnv,
     assignment: RankAssignment,
     document: String,
     timeout: Duration,
@@ -414,7 +425,7 @@ async fn run_host(
     let fatal: Mutex<Option<String>> = Mutex::new(None);
     let outcome = tokio::time::timeout(
         timeout,
-        session.run_agent(&["nccl"], Some(document), |event| match event {
+        session.run_agent(env, &["nccl"], Some(document), |event| match event {
             AgentEvent::Fatal { message } => {
                 *fatal.lock().expect("fatal slot poisoned") = Some(message);
             }
@@ -659,6 +670,50 @@ mod tests {
                 gemm_dtype: GemmDtype::Bf16,
                 msg_bytes: 64 << 20,
             }),
+        }
+    }
+
+    #[test]
+    fn every_job_spawns_under_its_workloads_level() {
+        use crate::nccl_level::NcclLevel;
+        use crate::proto::BarrierSpec;
+        assert_eq!(job().spawn_env(), AgentEnv::Nccl(NcclLevel::OverlapFleet));
+        let sweep = NcclJob {
+            workload: NcclWorkload::Sweep {
+                sizes: vec![1024],
+                iters_per_size: 1,
+                barrier: Some(BarrierSpec { iters: 1, bytes: 8 }),
+                series: crate::proto::SweepSeries::RankPerGpu,
+            },
+        };
+        // The barrier riding the sweep shares the fleet communicator.
+        assert_eq!(sweep.spawn_env(), AgentEnv::Nccl(NcclLevel::Fleet));
+        let barrier = NcclJob {
+            workload: NcclWorkload::Barrier(BarrierSpec { iters: 1, bytes: 8 }),
+        };
+        assert_eq!(barrier.spawn_env(), AgentEnv::Nccl(NcclLevel::Barrier));
+    }
+
+    #[test]
+    fn inter_node_sweeps_spawn_under_the_fleet_level() {
+        // rank_per_node and every rail ride the same fabric with the same
+        // fleet-level knobs: no level of their own.
+        use crate::nccl_level::NcclLevel;
+        use crate::proto::SweepSeries;
+        for series in [SweepSeries::RankPerNode, SweepSeries::Rail { rail: 3 }] {
+            let sweep = NcclJob {
+                workload: NcclWorkload::Sweep {
+                    sizes: vec![1024],
+                    iters_per_size: 1,
+                    barrier: None,
+                    series,
+                },
+            };
+            assert_eq!(
+                sweep.spawn_env(),
+                AgentEnv::Nccl(NcclLevel::Fleet),
+                "{series}"
+            );
         }
     }
 

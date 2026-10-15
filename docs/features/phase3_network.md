@@ -22,7 +22,7 @@ Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
    `net_bandwidth.gib_per_sec`) before forwarding to the collector.
 3. NCCL sweeps, hierarchical: fleet-wide world with **one rank per GPU**
    by default (proto v7; see "Fleet NCCL world" below), or a NIC-forcing
-   world shape (`tests.nccl_world`, proto v11; see "World shapes"
+   world shape (`tests.nccl_world`, proto v12; see "World shapes"
    below); rendezvous = orchestrator
    relays `NcclUniqueId` from the lead host's in-process mint to every
    other host's Participate stdin doc. The per-size timing loop is
@@ -41,7 +41,7 @@ Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
    completes and emits the node-scope `nccl_all_reduce.*` /
    `nccl_all_gather.*` series; bus bandwidth uses the full world size
    (total GPUs). After the last size the lead emits the fleet-level
-   headline `nccl_all_{reduce,gather}.bus_gib_per_sec_peak` (proto v11,
+   headline `nccl_all_{reduce,gather}.bus_gib_per_sec_peak` (proto v12,
    see "Fleet headline" below).
 4. `analysis::fit::fit_alpha_beta` over (size, elapsed_us) → calibration
    `links` entries ("tcp_pairwise" from latency+bandwidth points per pair
@@ -50,12 +50,12 @@ Orchestrator phase-3 driver (`network_phase` in `orchestrator/mod.rs`):
    world changed meaning: n is total GPUs and the ring mixes NVLink with
    the fabric, so v7 per-node fits must not line up under the same key),
    "nccl_{allreduce,allgather}_inter_node_<n>rank" from the NIC-forcing
-   world shapes (schema v13, keyed by world size), and "nccl_{allreduce,allgather}_intranode_<n>gpu"
+   world shapes (schema v14, keyed by world size), and "nccl_{allreduce,allgather}_intranode_<n>gpu"
    from the intra-node sweep.
 5. Barrier-skew microbenchmark: a tiny-collective straggler probe riding
    the same NCCL communicator (rank-per-GPU shape) or run afterwards as
-   its own rank-per-GPU job (`NcclWorkload::BarrierOnly`, the NIC-forcing
-   shapes), plus a TCP star-barrier fallback after it. See
+   its own rank-per-GPU job (`NcclWorkload::Barrier`: a different
+   barrier env, or a NIC-forcing shape — `BarrierPlacement`), plus a TCP star-barrier fallback after it. See
    docs/features/barrier_skew.md.
 
 ## Intra-node level (proto v8 / schema v9)
@@ -160,6 +160,21 @@ Some knobs have no effect here:
 
 Other knobs do act on intra-node paths: NCCL_P2P_LEVEL, NCCL_ALGO,
 NCCL_PROTO and NCCL_DEBUG.
+
+Since proto v11 the sweep's process runs under the `intranode` level's
+effective env (`[nccl.levels.intranode]` layered over `[nccl] env`), so a
+knob such as NCCL_ALGO=Ring can be forced on the NVLink sweep alone
+without touching the fleet levels. The orchestrator picks it through
+`Phase::Network.nccl_level()` when it spawns the network-phase `agent
+run`.
+
+### Transport record
+After the sweep loop the agent parses NCCL's INFO log and emits an
+`NcclTransport` event (level `intranode`, span single host): the network
+NCCL initialized and, more usefully here, how many peer connections ran
+over P2P, SHM or NET. A NET count on an intra-node communicator means
+P2P/SHM were unavailable or disabled. A single-host communicator is never
+flagged for its network transport. See docs/features/nccl_transport.md.
 
 ### Calibration link classes
 `report/intranode.rs`: per (host, repeat), `msg_bytes` and `elapsed_us`
@@ -283,7 +298,34 @@ invisible). Real training runs one rank per GPU; so does this.
   agent, whichever step) — never misattributed, and a duplicate no
   longer voids the whole barrier analysis.
 
-## World shapes (proto v11 / schema v13)
+## Per-level env and transport (proto v11 / schema v13)
+
+- The fleet sweep's processes run under the `fleet` level env, the fleet
+  overlap step's under `overlap_fleet` (`NcclWorkload::level`, read by
+  `NcclJob::spawn_env`). Setting `[nccl.levels.fleet] env = {
+  NCCL_P2P_DISABLE = 1, NCCL_SHM_DISABLE = 1 }` pushes every hop of the
+  rank-per-GPU world through the NICs (the cheap approximation of a
+  pure-IB mode) without affecting the intra-node levels.
+- The NCCL barrier probe rides the sweep's communicator only when the
+  `barrier` and `fleet` effective envs are identical and the sweep
+  runs the rank-per-GPU world shape (v12, see "World shapes").
+  Otherwise
+  `nccl_sweep` runs the sweep without it and then a second job,
+  `NcclWorkload::Barrier(spec)`, on a fresh communicator with the same
+  rank layout under the `barrier` env (`orchestrator/nccl/barrier_job.rs`).
+  Its timings feed the same skew analysis and `nccl_barrier` metrics. That
+  second job runs only after a clean sweep; when the sweep blamed a host,
+  every member records `nccl_barrier` Skipped naming it.
+- Every `agent nccl` process that reached its first NCCL call emits one
+  `NcclTransport` report for its communicator, whether the id mint, init
+  or workload succeeded or failed; span is `MultiHost` when the world is
+  larger than the host's rank block. A multi-host communicator on NCCL's
+  socket transport, on a host whose inventory shows an ACTIVE IB/RoCE
+  port and with IB not disabled by the level env, becomes
+  `fleet.socket_fallbacks` (verdict Stragglers); an Ethernet-only fleet
+  on sockets is not flagged. Details: docs/features/nccl_transport.md.
+
+## World shapes (proto v12 / schema v14)
 
 ### Why
 The rank-per-GPU world is what training runs, but its ring mixes
@@ -314,6 +356,13 @@ NCCL env (every shape inherits the run-level `[nccl] env`).
   communicator, gate, rendezvous and job — so they never contend for
   PCIe/NIC bandwidth and every rail's number is attributable to its own
   NIC/PCIe path.
+
+Every NCCL job spawns under its workload's level (`NcclWorkload::level`):
+every sweep shape — rank-per-node and each rail included — is the
+`fleet` level (same fabric, same fleet-level knobs; no level of its
+own), and the barrier job the `barrier` level. Transport capture wraps
+every one of them in the agent (`CaptureWindow::run`), so each rail's
+communicator reports its transport.
 
 ### Types and control flow
 1. `orchestrator::nccl::nccl_hosts` selects NCCL-capable hosts with
@@ -371,8 +420,9 @@ NCCL env (every shape inherits the run-level `[nccl] env`).
      against its host); rails the gate kept out never ran and are not
      part of it.
 7. NIC-forcing shapes then run the barrier probe as its own rank-per-GPU
-   job (`NcclWorkload::BarrierOnly`, `sweep::barrier_after` /
-   `barrier_only`, gated on `shape::MIN_HOSTS`) without the excluded
+   job (`NcclWorkload::Barrier` under the `barrier` level env,
+   `sweep::barrier_after` / `barrier_job::run_own_world`, gated on
+   `shape::MIN_HOSTS`) without the excluded
    hosts, each of which records Skipped for `nccl_barrier` with the
    exclusion reason; barrier subjects stay `host:gpuN`. The fleet overlap
    step ignores `nccl_world` entirely (rank-per-GPU; its retention
@@ -511,10 +561,10 @@ Fleet NCCL world:
   `RankError` (incl. `GpuRangeOverflow`).
 - `src/proto/mod.rs` — `InventorySnapshot::cuda_visible_gpus`,
   `gpu_visibility_mismatch`, `AGENT_EXIT_CASCADE`; `SweepSeries`
-  `NcclWorkload::{Sweep.series, BarrierOnly}`, `TestId::{NcclInterAllReduce,
+  `NcclWorkload::{Sweep.series, Barrier}`, `TestId::{NcclInterAllReduce,
   NcclInterAllGather}`, `nccl_metric::{BUS_PEAK, BUS_PEAK_MIN_RAIL,
   bus_peak_rail, rail_suffix, rank_class_suffix}`, `barrier_metric`;
-  PROTO_VERSION 11.
+  PROTO_VERSION 12.
 - `src/proto/series.rs` — `SweepSeries` (`is_inter_node`, `headline`,
   `tests`, `inter_node_tests`, `all_fleet_tests`): the one source of the
   fleet sweeps' test ids and headline names.
@@ -531,9 +581,10 @@ Fleet NCCL world:
   `HostRailSummary`.
 - `src/orchestrator/nccl/sweep.rs` — `nccl_sweep` (shape dispatch:
   `rank_per_gpu_sweep`, `rank_per_node_sweep`, `per_rail_sweep`),
-  `run_world`/`WorldRun`, `barrier_after`, `barrier_only`, `Collected`
-  (intercept: barrier timings + lead headline), `analyze_barrier`,
-  layout-failure outcomes.
+  `run_world`/`WorldRun`, `barrier_after`, `Collected` (intercept:
+  `BarrierTimings` + lead headline), layout-failure outcomes.
+- `src/orchestrator/nccl/barrier_job.rs` — `BarrierPlacement` (the
+  one ride-or-own-world decision), `BarrierTimings`, `run_own_world`.
 - `src/orchestrator/nccl/mod.rs` — `nccl_hosts` (`nccl_rank_count`),
   `rank_per_gpu_world`, `NcclJob`, `drive_fleet_nccl` (`run_host`,
   `abort_rest`, `blame_the_lead`, `report_failures`), `block_failure`,

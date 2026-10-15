@@ -1,4 +1,4 @@
-//! Which fleet sweep a `NcclWorkload::Sweep` is (proto v11): the world
+//! Which fleet sweep a `NcclWorkload::Sweep` is (proto v12): the world
 //! shape it was laid out in (`[tests] nccl_world`). The one source of the
 //! fleet sweeps' test ids and headline names — the agent's emitters, the
 //! orchestrator's gating/roll-up and the report's fleet-level rule and
