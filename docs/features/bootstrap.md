@@ -1,16 +1,27 @@
 # Bootstrap
 
 ## Scope
-`gauntlet bootstrap`: take a fleet from "ssh works" to "ready for `gauntlet run`"
+`gauntlet bootstrap`: take a fleet from "ssh works" (or, with `--launch
+srun`, "I am inside a Slurm allocation") to "ready for `gauntlet run`"
 with no manual node setup. Non-scope: OS/driver installation, user creation,
-ssh key distribution (the operator must already be able to ssh in).
+ssh key distribution (in ssh mode the operator must already be able to ssh
+in; srun mode needs no ssh at all).
 
 ## Control flow
-1. Load `FleetConfig`, fan out per host with `ssh.max_concurrent` bound
-   (`tokio::sync::Semaphore`; the permit covers session establishment only).
-2. Per host: connect (`HostSession::connect`) → arch check (`uname -m` must
-   equal orchestrator arch, else Fail) → `deploy::ensure_agent` (sha256
-   compare, upload on mismatch) → run `agent probe`, parse
+1. Load `FleetConfig`, resolve the launcher (`transport::resolve_launch`:
+   `--launch` over `[launch] mode`; srun mode takes hosts from the Slurm
+   allocation, see docs/features/slurm_launch.md), fan out per host with
+   `ssh.max_concurrent` bound (`tokio::sync::Semaphore`).
+2. Three stages, each preserving host order (`Stage`: `Ready` with the
+   session and checks so far, or `Done` with a final row):
+   connect (`Launcher::connect`) → arch check (`uname -m` must equal
+   orchestrator arch, else Fail), per host (`connect_host`); then deploy
+   fleet-wide (`deploy::ensure_fleet` over the Ready sessions: sha256
+   compare, then per-host sftp upload over ssh, or one step-scoped sbcast
+   to the stale nodes (per-node fallback on failure) plus per-node
+   installs over srun — a broadcast covers many nodes at once, which is
+   why deploy is not a per-host step); then per host
+   (`finish_host`): run `agent probe`, parse
    `InventorySnapshot` into readiness checks (gpu_driver, gpu_libs,
    gpu_idle, clock_sync, ib_ports, governor, persistence_mode) → with `--tune`, apply
    `nvidia-smi -pm 1` and set the performance governor (sudo-gated; refusal
@@ -36,10 +47,16 @@ ssh key distribution (the operator must already be able to ssh in).
 
 ## Check policy
 Only these produce a Fail (i.e. a non-zero exit):
-- `connectivity`: session or remote_dir setup failed.
+- `connectivity`: session or remote_dir setup failed. Over ssh the ok
+  detail is the resolved remote dir; over srun it is `srun step in job
+  <id>: <dir>` (a step reached the node inside that allocation). Running
+  in srun mode outside an allocation, or naming hosts outside it, fails
+  the whole command before any row (typed `SlurmError`).
 - `arch`: node arch known and different from the orchestrator's. An
   unrecognized `uname -m` is a Warn — the deploy step fails loudly anyway.
 - `deploy`, `probe`: the agent could not be installed or did not report.
+  The deploy ok detail names the path: `up to date`, `uploaded` (sftp),
+  `installed via sbcast`, `installed on the shared path`.
 - `clock_sync`: |offset| ≥ 1000 ms (≥ 100 ms warns, absent offset warns).
 - `ib_ports`: ports exist and none is Active (a partial outage warns; a node
   with no IB ports warns).
@@ -71,11 +88,15 @@ writes `performance` into every `cpufreq/scaling_governor` via
 
 ## Files
 - `src/orchestrator/bootstrap.rs` — `run`, `CheckStatus`, `HostReadiness`,
-  `ReadinessCheck`.
+  `ReadinessCheck`, `Stage`, `connect_host`, `finish_host`,
+  `connectivity_detail`.
 - `src/orchestrator/bootstrap/gpu_idle.rs` — `gpu_idle_check`.
-- `src/orchestrator/deploy.rs` — `ensure_agent`, `local_sha256`,
-  `AGENT_RELPATH`.
-- `src/orchestrator/session.rs` — `HostSession` (connect/exec/upload).
+- `src/orchestrator/deploy.rs` — `ensure_fleet`, `DeployOutcome`,
+  `DeployMethod`, `local_sha256`, `AGENT_RELPATH`.
+- `src/orchestrator/session.rs` — `HostSession` (establish/exec/upload).
+- `src/orchestrator/transport/` — `Launcher`, `resolve_launch` (ssh or
+  srun; docs/features/slurm_launch.md); `transport/ssh.rs` holds the sftp
+  upload with the staging discipline below.
 - `src/orchestrator/session/remote_fs.rs` — `remote_dir_word`,
   `remote_dir_script`, `staging_path`, `upload_nonce`, `install_command`,
   `FileMode`, `sweep_stale_staging_command`, `STALE_STAGING_MINUTES`.
@@ -124,8 +145,14 @@ writes `performance` into every `cpufreq/scaling_governor` via
   modified for `STALE_STAGING_MINUTES` (15) — leftovers of killed uploads,
   each a full-size binary often on tmpfs — while younger ones, which may
   be another node's upload in flight on a shared directory, are never
-  touched. Before uploading, `deploy::ensure_agent` compares the local
+  touched. Before uploading, `deploy::ensure_fleet` compares the local
   sha256 with the remote `sha256sum` and skips the upload on a match.
+- srun mode resolves `[launch.srun] dir` (a `RemoteDir` template, default
+  `/tmp/gauntlet-$USER`) with the same `remote_dir_script` through an
+  srun step, so the ownership/symlink checks, mode 700, `nccl-logs/` and
+  the physical path apply on node-local /tmp just the same. The sbcast
+  staging file lives *inside* that checked directory, and the per-node
+  install uses the same sweep / random temp name / `install_command`.
 
 ## Machine interface (`--json`)
 

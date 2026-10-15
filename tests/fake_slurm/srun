@@ -1,0 +1,88 @@
+#!/bin/sh
+# Fake srun for the srun-launch integration tests: every invocation is one
+# "job step" run on this machine, behaving like srun where gauntlet depends
+# on it:
+#  - argv and the srun *client* environment are recorded;
+#  - every --nodelist node must be in the fake allocation;
+#  - the step is registered for the fake squeue (<id>|<name>, its nodes,
+#    its task pid); the step id is this shell's pid, printed as
+#    <job>.<step>, or <array_id>.<step> when <root>/array_id exists;
+#  - the command runs as a child with stdin/stdout/stderr passed through
+#    (srun's I/O forwarding for one task);
+#  - SIGTERM makes it SIGKILL the task and exit 137, like srun's "forcing
+#    job termination"; an exit reports the task's status (128+signal for a
+#    signalled task).
+#
+# State lives next to the shim: <root>/bin/srun, <root>/state/, <root>/nodes,
+# <root>/job_id.
+root=$(cd "$(dirname "$0")/.." && pwd)
+state="$root/state"
+job=$(cat "$root/job_id")
+step=$$
+sep=$(printf '\037')
+
+# One write per record: concurrent steps append to the same logs.
+record=$(
+    printf 'step=%s' "$step"
+    for arg in "$@"; do printf '%s%s' "$sep" "$arg"; done
+)
+printf '%s\n' "$record" >> "$state/srun.log"
+
+record=$(
+    printf 'step=%s' "$step"
+    env | grep -E '^(NCCL_[A-Z0-9_]*|CUDA_VISIBLE_DEVICES|ROCR_VISIBLE_DEVICES|GPU_DEVICE_ORDINAL|LD_LIBRARY_PATH)=' \
+        | sort | while IFS= read -r line; do printf '%s%s' "$sep" "$line"; done
+)
+printf '%s\n' "$record" >> "$state/srun-env.log"
+
+name=""
+nodes=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --job-name=*) name=${1#--job-name=} ;;
+        --nodelist=*) nodes=${1#--nodelist=} ;;
+        -*) ;;
+        *) break ;;
+    esac
+    shift
+done
+if [ $# -eq 0 ]; then
+    echo "srun: fatal: no command given" >&2
+    exit 2
+fi
+for node in $(printf '%s' "$nodes" | tr ',' ' '); do
+    if ! grep -qx -- "$node" "$root/nodes"; then
+        echo "srun: error: Required node not available (down, drained or reserved): $node" >&2
+        exit 1
+    fi
+done
+
+id="$job.$step"
+if [ -f "$root/array_id" ]; then
+    id="$(cat "$root/array_id").$step"
+fi
+mkdir -p "$state/steps"
+printf '%s\n' "$nodes" | tr ',' '\n' > "$state/steps/$step.nodes"
+printf '%s|%s\n' "$id" "$name" > "$state/steps/$step"
+
+# POSIX sh gives an asynchronous command /dev/null as stdin *before* its
+# redirections apply, so forward the real stdin through fd 3.
+exec 3<&0
+"$@" <&3 3<&- &
+task=$!
+exec 3<&-
+printf '%s\n' "$task" > "$state/steps/$step.task"
+
+cancelled=0
+trap 'cancelled=1; kill -KILL "$task" 2>/dev/null; printf "%s\n" "$step" >> "$state/cancelled.log"' TERM
+
+wait "$task"
+rc=$?
+while kill -0 "$task" 2>/dev/null; do
+    wait "$task"
+    rc=$?
+done
+if [ "$cancelled" = 1 ]; then
+    exit 137
+fi
+exit "$rc"

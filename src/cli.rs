@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::launch::LaunchMode;
 use crate::net_steps::NetStep;
 use crate::proto::Phase;
 
@@ -57,7 +58,8 @@ pub enum Command {
     Bootstrap(BootstrapArgs),
     /// Re-render a saved results JSON as a table.
     Report(ReportArgs),
-    /// Node-side mode; invoked over ssh by the orchestrator, not by hand.
+    /// Node-side mode; started by the orchestrator (over ssh or as an srun
+    /// step), not by hand.
     Agent(AgentArgs),
 }
 
@@ -83,6 +85,10 @@ pub struct RunArgs {
     /// Inventory runs once.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=100))]
     pub repeat: u32,
+    /// How agents are started; overrides `[launch] mode`. `srun` runs every
+    /// agent as a job step of the current Slurm allocation (no ssh keys).
+    #[arg(long, value_enum)]
+    pub launch: Option<LaunchMode>,
 }
 
 #[derive(Debug, Args)]
@@ -96,6 +102,9 @@ pub struct BootstrapArgs {
     /// Emit the readiness report as JSON on stdout instead of a table.
     #[arg(long)]
     pub json: bool,
+    /// How agents are started; overrides `[launch] mode`.
+    #[arg(long, value_enum)]
+    pub launch: Option<LaunchMode>,
 }
 
 #[derive(Debug, Args)]

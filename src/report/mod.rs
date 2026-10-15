@@ -29,6 +29,7 @@ use crate::analysis::stats::{self, Moments, Outlier, Sample};
 use crate::build_info::BuildInfo;
 use crate::cli::ReportArgs;
 use crate::config::{Bound, FleetConfig, Thresholds};
+use crate::launch::LaunchRecord;
 use crate::nccl_env::NcclEnv;
 use crate::nccl_level::NcclLevelEnvs;
 use crate::orchestrator::collect::HostObservations;
@@ -132,7 +133,10 @@ use consistency::majority;
 // nccl_ib_ports / nccl_ib_link_layer / nccl_ib_ceiling_gbps.
 // Serde-defaulted: pre-v16 documents decode with no summaries and a bare
 // `rate_gbps` lifted into `rate`.
-pub const SCHEMA_VERSION: u32 = 16;
+// v17: run-level `launch` — how the agents were started: `{"mode":"ssh"}`
+// or `{"mode":"srun","job_id":N}` (srun steps inside Slurm job N).
+// Serde-defaulted: pre-v17 documents decode with it null ("not recorded").
+pub const SCHEMA_VERSION: u32 = 17;
 
 /// Metric groups produced by the barrier-skew microbenchmarks; the
 /// slowest-rank flagging rule scans exactly these.
@@ -182,6 +186,11 @@ pub struct RunResults {
     /// even under a future, different key policy.
     #[serde(default)]
     pub nccl_env: Option<BTreeMap<String, String>>,
+    /// How the agents were launched (ssh, or srun inside a named Slurm
+    /// job). `None` = not recorded (pre-v17 documents, or a document built
+    /// outside `gauntlet run`).
+    #[serde(default)]
+    pub launch: Option<LaunchRecord>,
     /// `verdict(self)` of the finished run (`finalize`): the same
     /// classification the exit code reports, so consumers never parse the
     /// exit status. `None` = no final verdict: a partial snapshot of a run
@@ -498,6 +507,9 @@ pub fn build(
         // `FleetConfig::load` rules out; recorded as "not recorded" rather
         // than guessed.
         nccl_env: config.nccl_env().ok().map(NcclEnv::to_string_map),
+        // Known only to the orchestrator (`--launch` override, allocation
+        // env); `gauntlet run` stamps it after building.
+        launch: None,
         verdict: None,
         nccl_level_env,
         fleet,
@@ -1067,6 +1079,9 @@ pub fn render_table(results: &RunResults, out: &mut dyn Write) -> Result<()> {
         nccl_env::format_level_overrides(results.nccl_env.as_ref(), results.nccl_level_env.as_ref())
     {
         writeln!(out, "nccl env [{level}]: {env}")?;
+    }
+    if let Some(launch) = &results.launch {
+        writeln!(out, "launch: {launch}")?;
     }
 
     render_hosts(results, out)?;

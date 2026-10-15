@@ -10,7 +10,7 @@ use crate::remote_dir::{RemoteDir, RemoteDirPart};
 /// Upload file mode, applied before the rename so the destination is
 /// never visible with the wrong bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FileMode {
+pub(crate) enum FileMode {
     Executable,
     Regular,
 }
@@ -26,7 +26,7 @@ impl FileMode {
 
 /// Sibling temp name for one upload: `<dest>.tmp.<16 hex>`. Same directory
 /// as the destination, so the final `mv` is a same-filesystem rename(2).
-pub(super) fn staging_path(dest: &str, nonce: u64) -> String {
+pub(crate) fn staging_path(dest: &str, nonce: u64) -> String {
     format!("{dest}.tmp.{nonce:016x}")
 }
 
@@ -34,7 +34,7 @@ pub(super) fn staging_path(dest: &str, nonce: u64) -> String {
 /// pid and a process-wide counter. Collisions only matter between
 /// concurrent uploaders of one path (different processes or hosts), which
 /// differ in key, pid or clock.
-pub(super) fn upload_nonce() -> u64 {
+pub(crate) fn upload_nonce() -> u64 {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,7 +52,7 @@ pub(super) fn upload_nonce() -> u64 {
 }
 
 /// Set the mode on the staged file, then atomically rename it over `dest`.
-pub(super) fn install_command(staging: &str, dest: &str, mode: FileMode) -> String {
+pub(crate) fn install_command(staging: &str, dest: &str, mode: FileMode) -> String {
     format!(
         "chmod {mode} {staging} && mv -f {staging} {dest}",
         mode = mode.octal(),
@@ -65,7 +65,7 @@ pub(super) fn install_command(staging: &str, dest: &str, mode: FileMode) -> Stri
 /// (the first may carry a leading `~`) or `single_quote`, each `$USER`
 /// replaced by `"$(id -un)"` — the remote login name, whether or not the
 /// login environment exports USER.
-pub(super) fn remote_dir_word(remote_dir: &RemoteDir) -> String {
+pub(crate) fn remote_dir_word(remote_dir: &RemoteDir) -> String {
     remote_dir
         .parts()
         .into_iter()
@@ -92,7 +92,7 @@ pub(super) fn remote_dir_word(remote_dir: &RemoteDir) -> String {
 /// - The path printed — and later used for every upload and exec — is
 ///   `pwd -P`, the directory that was checked, not a logical path whose
 ///   symlinks could be repointed afterwards.
-pub(super) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
+pub(crate) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
     let word = remote_dir_word(remote_dir);
     format!(
         "d={word}; \
@@ -111,13 +111,13 @@ pub(super) fn remote_dir_script(remote_dir: &RemoteDir) -> String {
 /// Temp files older than this are leftovers of killed uploads; younger ones
 /// may belong to an upload in flight (on a shared directory, from another
 /// node) and are never touched.
-pub(super) const STALE_STAGING_MINUTES: u32 = 15;
+pub(crate) const STALE_STAGING_MINUTES: u32 = 15;
 
 /// Remove `<dest>.tmp.*` siblings not modified for `STALE_STAGING_MINUTES`
 /// (regular files only). Each killed upload leaves a full-size binary, often
 /// on tmpfs, so they are swept before every new staging. `-mmin` is not
 /// POSIX but GNU, BSD and busybox find all support it.
-pub(super) fn sweep_stale_staging_command(dest: &str) -> String {
+pub(crate) fn sweep_stale_staging_command(dest: &str) -> String {
     let (dir, base) = match dest.rsplit_once('/') {
         Some(("", base)) => ("/", base),
         Some((dir, base)) => (dir, base),

@@ -133,6 +133,7 @@ mod tests {
             finished_epoch_secs: 2,
             hosts: BTreeMap::new(),
             nccl_env: None,
+            launch: None,
             verdict: None,
             nccl_level_env: None,
             fleet: FleetAnalysis::default(),
