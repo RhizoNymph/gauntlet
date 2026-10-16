@@ -32,8 +32,11 @@ env:
   # glibc with zig rather than inheriting the runner's (24.04 -> 2.39).
   CLI_TARGET: x86_64-unknown-linux-gnu
   GLIBC_FLOOR: "2.31"
+  # Every tool that shapes the CLI's bytes is pinned, the compiler by
+  # rust-toolchain.toml, so a rebuild of a tag reproduces its artifacts.
   ZIG_VERSION: "0.16.0"
   CARGO_ZIGBUILD_VERSION: "0.23.4"
+  CARGO_DEB_VERSION: "3.7.0"
 
 jobs:
   verify:
@@ -53,7 +56,11 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the nightly (and its components); with no
+      # argument rustup installs exactly that, so CI tests and builds with
+      # the same compiler as anyone rebuilding the tag.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc -vV
 
       - uses: Swatinem/rust-cache@v2
 
@@ -89,7 +96,8 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc -vV
 
       - uses: Swatinem/rust-cache@v2
 
@@ -97,7 +105,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS
 
       - name: Install cargo-deb
-        run: cargo install cargo-deb --version =3.7.0 --locked
+        run: cargo install cargo-deb --version "=$CARGO_DEB_VERSION" --locked
 
       # zig supplies the linker and glibc stubs for an older glibc. It is
       # installed into a plain directory rather than site-packages, because
@@ -109,10 +117,11 @@ jobs:
           echo "PYTHONPATH=$RUNNER_TEMP/zig" >> "$GITHUB_ENV"
           cargo install cargo-zigbuild --version "=$CARGO_ZIGBUILD_VERSION" --locked
 
+      # The script is the single definition of the release CLI build (path
+      # trimming included); the reproduce job and anyone rebuilding a tag
+      # run the same one.
       - name: Build the CLI against glibc ${{ env.GLIBC_FLOOR }}
-        run: |
-          cargo zigbuild --release --locked -p gauntlet-bench \
-            --target "$CLI_TARGET.$GLIBC_FLOOR"
+        run: scripts/build-release-cli.sh
 
       # Guard the floor rather than trusting the toolchain: if any dependency
       # pulls in a newer glibc symbol, fail the release instead of shipping a
@@ -133,20 +142,26 @@ jobs:
             exit 1
           fi
 
-      # Built separately so a node installing the CLI never pulls the GUI's
-      # Vulkan/Wayland runtime dependencies.
-      # - The CLI package wraps the zig-built binary as is (--no-build). Its
-      #   glibc-floor variant declares libc6 explicitly, because
-      #   dpkg-shlibdeps would report 2.34 for the libdl/libpthread links
-      #   (see Cargo.toml).
-      # - The viewer is a desktop app that never runs on nodes, so it is a
-      #   native build.
-      - name: Build .deb packages
+      # Archive timestamps (tarballs and cargo-deb's) come from the tagged
+      # commit rather than the clock.
+      - name: Set SOURCE_DATE_EPOCH from the tagged commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      # The CLI's raw binary, tarball and .deb, all reproducible; see the
+      # script. Packaged separately from the viewer so a node installing the
+      # CLI never pulls the GUI's Vulkan/Wayland runtime dependencies.
+      - name: Package the CLI
+        run: scripts/package-release-cli.sh "${{ needs.verify.outputs.version }}" dist
+
+      # The viewer is a desktop app that never runs on nodes, so it is a
+      # native build, and is not covered by the reproducibility check.
+      - name: Package the viewer
         run: |
-          mkdir -p dist
-          cargo deb -p gauntlet-bench --no-build --target "$CLI_TARGET" \
-            --variant glibc-floor --output dist/
+          VERSION="${{ needs.verify.outputs.version }}"
           cargo deb -p gauntlet-view --output dist/
+          tar --sort=name --format=gnu --owner=0 --group=0 --numeric-owner \
+            --mtime="@$SOURCE_DATE_EPOCH" -C target/release -cf - gauntlet-view \
+            | gzip -9n > "dist/gauntlet-view-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 
       # The declared libc6 floor is hand-written in Cargo.toml, so check that
       # it matches the floor the binary was actually linked against.
@@ -159,14 +174,14 @@ jobs:
             *) echo "::error::gauntlet .deb does not declare libc6 (>= $GLIBC_FLOOR)"; exit 1 ;;
           esac
 
-      - name: Build release tarballs
+      # Published with the release so consumers can pin and verify the
+      # artifacts; the reproduce job checks the CLI entries against a rebuild.
+      - name: Write SHA256SUMS
         run: |
-          VERSION="${{ needs.verify.outputs.version }}"
-          tar -czf "dist/gauntlet-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            -C "target/$CLI_TARGET/release" gauntlet
-          tar -czf "dist/gauntlet-view-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            -C target/release gauntlet-view
-          ls -l dist
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          ls -l
+          cat SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -174,9 +189,65 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # Rebuild the CLI from scratch on a different runner, in a different
+  # checkout path with a different CARGO_HOME and target dir and no build
+  # cache, and fail the release unless every CLI artifact (raw binary,
+  # tarball, .deb) is byte-identical to the one the build job produced.
+  reproduce:
+    name: Check the CLI build is reproducible
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    env:
+      SRC: rebuild/src/gauntlet
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.tag }}
+          path: ${{ env.SRC }}
+
+      - name: Install the pinned toolchain
+        working-directory: ${{ env.SRC }}
+        run: rustup toolchain install && rustc -vV
+
+      - name: Install cargo-deb, zig and cargo-zigbuild
+        run: |
+          cargo install cargo-deb --version "=$CARGO_DEB_VERSION" --locked
+          python3 -m pip install --target "$RUNNER_TEMP/zig" "ziglang==$ZIG_VERSION"
+          echo "PYTHONPATH=$RUNNER_TEMP/zig" >> "$GITHUB_ENV"
+          cargo install cargo-zigbuild --version "=$CARGO_ZIGBUILD_VERSION" --locked
+
+      - name: Rebuild and repackage the CLI
+        working-directory: ${{ env.SRC }}
+        env:
+          CARGO_HOME: ${{ runner.temp }}/rebuild-cargo-home
+          CARGO_TARGET_DIR: ${{ runner.temp }}/rebuild-target
+        run: |
+          scripts/build-release-cli.sh
+          scripts/package-release-cli.sh "${{ needs.verify.outputs.version }}" "$RUNNER_TEMP/rebuild-dist"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+
+      - name: Compare against the published checksums
+        run: |
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          cd "$RUNNER_TEMP/rebuild-dist"
+          fail=0
+          for f in *; do
+            sum=$(sha256sum -- "$f" | cut -d' ' -f1)
+            echo "$sum  $f"
+            if ! grep -qxF "$sum  $f" "$GITHUB_WORKSPACE/dist/SHA256SUMS"; then
+              echo "::error::$f rebuilt to $sum, which does not match SHA256SUMS"
+              fail=1
+            fi
+          done
+          exit $fail
+
   publish-apt:
     name: Publish to APT repository
-    needs: [verify, build]
+    needs: [verify, build, reproduce]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -223,7 +294,7 @@ jobs:
 
   github-release:
     name: Create GitHub release
-    needs: [verify, build]
+    needs: [verify, build, reproduce]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -239,7 +310,7 @@ jobs:
 
   publish-crates:
     name: Publish to crates.io
-    needs: [verify, build]
+    needs: [verify, build, reproduce]
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -248,7 +319,8 @@ jobs:
         with:
           ref: ${{ needs.verify.outputs.tag }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned toolchain
+        run: rustup toolchain install && rustc -vV
 
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y $BUILD_DEPS

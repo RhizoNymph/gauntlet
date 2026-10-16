@@ -345,8 +345,11 @@ failure classes bad.
 also the deployed agent (self-deploy, sha256-matched) — as
 `{ version: <CARGO_PKG_VERSION>, git: { state: "known", sha, dirty } |
 { state: "unknown" } }` (`build_info::BuildInfo` / `GitRevision`).
-`build.rs` captures the short sha and a dirty flag (tracked files only)
-at build time as `GAUNTLET_GIT_REVISION`; a build outside a checkout of
+`build.rs` captures the sha (always exactly its first 12 characters, so
+the value cannot depend on how many objects the clone holds) and a dirty
+flag (tracked files only) at build time as `GAUNTLET_GIT_REVISION`, and
+nothing else about the build environment (release builds are
+reproducible; see release_ci.md); a build outside a checkout of
 this crate (source tarball, no git, or a tarball unpacked inside another
 repository) records `unknown`. `gauntlet --version` prints the same as
 `<version> (<sha>[-dirty]|unknown)`; the table header prints a

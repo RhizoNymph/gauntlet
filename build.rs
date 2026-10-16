@@ -2,6 +2,10 @@
 //! `GAUNTLET_GIT_REVISION`: `<short sha>`, `<short sha>-dirty`, or
 //! `unknown` (no git, not a checkout of this crate — e.g. a source
 //! tarball, possibly unpacked inside some other repository).
+//!
+//! Nothing else is embedded — no build time, hostname or path — so the
+//! release binary is a pure function of the commit and the pinned toolchain
+//! (see docs/features/release_ci.md, "Reproducible builds").
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -36,10 +40,13 @@ fn revision(manifest_dir: &Path) -> Option<String> {
     if !same {
         return None;
     }
-    let sha = git(manifest_dir, &["rev-parse", "--short=12", "HEAD"])?;
-    if sha.is_empty() {
-        return None;
-    }
+    // The full sha cut to exactly 12 characters, not `--short=12`: git
+    // lengthens an abbreviation that is ambiguous among the objects of the
+    // local clone, so a shallow CI checkout and a full clone could embed
+    // different strings and the release binary would not rebuild
+    // bit-for-bit.
+    let full = git(manifest_dir, &["rev-parse", "HEAD"])?;
+    let sha = full.get(..12)?.to_string();
     // Tracked changes only: untracked scratch files do not change the build.
     let dirty = git(
         manifest_dir,
