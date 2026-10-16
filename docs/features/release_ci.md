@@ -8,7 +8,10 @@ Turning a `vX.Y.Z` tag into published artifacts:
 - Publication of those packages into the existing reprepro-managed APT
   repository on the `apt-repo` branch of `RhizoNymph/sysdui`, served over
   GitHub Pages at `https://rhizonymph.github.io/sysdui`.
-- A GitHub release carrying both `.deb` files and both `x86_64` tarballs.
+- A GitHub release carrying both `.deb` files, both `x86_64` tarballs, the
+  raw CLI binary and a `SHA256SUMS` file covering all of them.
+- Bit-for-bit reproducibility of the CLI artifacts (raw binary, tarball,
+  `.deb`), enforced by an independent rebuild before anything is published.
 - Publication of both crates to crates.io.
 
 ## Non-scope
@@ -22,6 +25,12 @@ Turning a `vX.Y.Z` tag into published artifacts:
   repository. Both already exist and are owned by `sysdui`.
 - Version bumping. The tag is the source of truth and the manifests must
   already agree with it; the workflow verifies but never edits versions.
+- Reproducibility of the viewer (`gauntlet-view` binary, tarball, `.deb`).
+  It is a native build at the runner's glibc that compiles C (vendored
+  freetype) with the runner's system compiler; its archives get
+  deterministic timestamps but nothing checks or guarantees its bytes.
+- Signing the release or `SHA256SUMS`. The checksums are protected only by
+  GitHub's release storage, and by anyone being able to rebuild them.
 
 ## Control flow
 
@@ -30,16 +39,25 @@ git tag vX.Y.Z && git push --tags
         |
         v
    [verify]  resolve tag -> version, check both manifests match the tag,
+        |    rustup toolchain install (the rust-toolchain.toml pin),
         |    cargo test --workspace --locked
         v
-   [build]   cargo zigbuild -p gauntlet-bench --target ...gnu.2.31
+   [build]   scripts/build-release-cli.sh
+        |      (cargo zigbuild -p gauntlet-bench --target ...gnu.2.31,
+        |       -Ztrim-paths, profile.release.trim-paths = "all")
         |    check newest GLIBC_* symbol <= 2.31
-        |    cargo deb -p gauntlet-bench --no-build --target ...gnu
-        |              --variant glibc-floor   (Depends: libc6 >= 2.31)
+        |    SOURCE_DATE_EPOCH = commit time of the tag
+        |    scripts/package-release-cli.sh -> raw binary, tarball,
+        |      cargo deb --no-build --no-strip --variant glibc-floor
+        |    cargo deb -p gauntlet-view (native) + viewer tarball
         |    check the .deb declares libc6 (>= GLIBC_FLOOR)
-        |    cargo deb -p gauntlet-view   (native)
-        |    tarballs from both target dirs
+        |    sha256sum dist/* > dist/SHA256SUMS
         |    -> uploads the `packages` artifact
+        v
+   [reproduce]  fresh runner, checkout at rebuild/src/gauntlet, separate
+        |       CARGO_HOME and CARGO_TARGET_DIR, no cache:
+        |       both scripts again, every rebuilt CLI artifact's sha256
+        |       must appear verbatim in dist/SHA256SUMS
         |
         +--------------------+--------------------+
         v                    v                    v
@@ -49,14 +67,19 @@ git tag vX.Y.Z && git push --tags
 ```
 
 `verify` is a hard gate: a tag whose version disagrees with the manifests
-fails before anything is pushed anywhere. The three terminal jobs run in
-parallel because they write to disjoint destinations.
+fails before anything is pushed anywhere. `reproduce` is the second gate: a
+CLI build that does not reproduce publishes nothing. The three terminal jobs
+run in parallel because they write to disjoint destinations.
 
 ## Files
 
 | File | Role |
 | --- | --- |
-| `.github/workflows/release.yml` | The whole pipeline. Triggered by `push` on `v*` tags, plus `workflow_dispatch` with a `tag` input for re-running a release. |
+| `.github/workflows/release.yml` | The whole pipeline. Triggered by `push` on `v*` tags, plus `workflow_dispatch` with a `tag` input for re-running a release. Pins zig, cargo-zigbuild and cargo-deb versions and `GLIBC_FLOOR`. |
+| `scripts/build-release-cli.sh` | The one definition of the release CLI build: `cargo zigbuild --release --locked -p gauntlet-bench --target $CLI_TARGET.$GLIBC_FLOOR` with path trimming enabled. Requires `CLI_TARGET` and `GLIBC_FLOOR`. Used by `build`, `reproduce` and humans. |
+| `scripts/package-release-cli.sh` | `<version> <out dir>`: copies the raw binary, writes the deterministic tarball and the glibc-floor `.deb`, with `SOURCE_DATE_EPOCH` set to HEAD's commit time. Requires `CLI_TARGET`. |
+| `rust-toolchain.toml` | Pins the compiler (`nightly-2026-08-20`) for every job and every rebuild; the workflow installs it with a bare `rustup toolchain install`. |
+| `build.rs`, `src/build_info.rs` | Embed the 12-character commit sha (plus `-dirty` / `unknown`) in the binary; the only build-environment input that reaches its bytes. |
 | `Cargo.toml` | Package `gauntlet-bench`; `[lib] name = "gauntlet"` and `[[bin]] name = "gauntlet"`; `[package.metadata.deb]` for the CLI package. |
 | `viewer/Cargo.toml` | Package `gauntlet-view`; depends on `gauntlet-bench` under the alias `gauntlet`; `[package.metadata.deb]` for the viewer package. |
 | `viewer/build.rs` | Pre-existing link shim for the unversioned `libxkbcommon-x11.so` symlink; a no-op when `libxkbcommon-x11-dev` is installed, as it is in CI. |
@@ -157,9 +180,112 @@ Set on the `RhizoNymph/gauntlet` repository:
   ssh deploy uploads whatever binary the operator is running. A
   `cargo build` on a newer distro produces an agent that older nodes
   cannot load. Install the release artifact, or build with
-  `cargo zigbuild --release --target x86_64-unknown-linux-gnu.2.31`, when
-  deploying to older nodes.
-- **Pinned build tools.** `ZIG_VERSION` (installed from the `ziglang` PyPI
-  wheel into `$RUNNER_TEMP`, since the runner's system Python is externally
-  managed) and `CARGO_ZIGBUILD_VERSION` are pinned in the workflow `env`,
-  alongside the existing `cargo-deb` pin.
+  `CLI_TARGET=x86_64-unknown-linux-gnu GLIBC_FLOOR=2.31
+  scripts/build-release-cli.sh` when deploying to older nodes.
+- **Pinned build tools.** The compiler is pinned by `rust-toolchain.toml`
+  and installed in every job by a bare `rustup toolchain install`, never a
+  floating channel. `ZIG_VERSION` (installed from the `ziglang` PyPI wheel
+  into `$RUNNER_TEMP`, since the runner's system Python is externally
+  managed), `CARGO_ZIGBUILD_VERSION` and `CARGO_DEB_VERSION` are pinned in
+  the workflow `env`. Each of them shapes the CLI artifacts' bytes, so
+  changing any one changes the published checksums (expected; the
+  `reproduce` job rebuilds with the same pins).
+- **The CLI build is defined once.** `scripts/build-release-cli.sh` and
+  `scripts/package-release-cli.sh` are what `build`, `reproduce` and a
+  human rebuild all run; do not inline a variant of either command in the
+  workflow.
+
+## Reproducible builds
+
+### What is guaranteed
+
+For a given tag, these release assets are bit-for-bit reproducible, and
+the `reproduce` job refuses to publish if they are not:
+
+| Asset | Reproducible | Inputs that determine it |
+| --- | --- | --- |
+| `gauntlet-<ver>-x86_64-unknown-linux-gnu` (raw CLI) | yes | commit, rust toolchain, zig, cargo-zigbuild, `GLIBC_FLOOR` |
+| `gauntlet-<ver>-x86_64-unknown-linux-gnu.tar.gz` | yes | the raw CLI + commit time; GNU tar and gzip |
+| `gauntlet_<ver>-1_amd64.deb` | yes | the raw CLI + commit time + cargo-deb version |
+| `gauntlet-view` tarball and `.deb` | no | native build; see Non-scope |
+| `SHA256SUMS` | only its CLI lines | lists every asset, including the viewer's |
+
+Verified locally (nightly-2026-08-20, zig 0.16.0, cargo-zigbuild 0.23.4,
+cargo-deb 3.7.0): two clones of the same commit — one full, one
+`--depth 1`, at different absolute paths, with different
+`CARGO_TARGET_DIR`s and different `CARGO_HOME`s — produced an identical
+raw binary, tarball and `.deb`.
+
+### Non-determinism found and removed
+
+- **`$CARGO_HOME` paths.** Panic locations and `file!()` in dependencies
+  embed the absolute path of the registry source, e.g.
+  `/home/<user>/.cargo/registry/src/index.crates.io-…/tokio-1.53.1/src/…`
+  (233 such strings in the 0.1.0 CLI). Two builds on one machine agree, but any
+  builder with a different home directory (CI's is `/home/runner`) does
+  not; changing only `CARGO_HOME` changed the binary's sha256. Fixed with
+  cargo's `trim-paths` (`-Ztrim-paths`, `profile.release.trim-paths =
+  "all"`), set as environment variables by `build-release-cli.sh`.
+  Registry sources then appear as `/cargo/registry/<hash>/<crate>-<ver>/…`,
+  workspace sources as relative paths, and the sysroot as
+  `/rustc/<commit>/…`. `trim-paths` was chosen over
+  `--remap-path-prefix` in `RUSTFLAGS` because it covers every path kind
+  without enumerating the builder's directories, and it leaves `RUSTFLAGS`
+  free. It is not in `Cargo.toml` because that needs `cargo-features =
+  ["trim-paths"]`, which would make the published crate unbuildable on
+  stable.
+- **The git revision.** `build.rs` used `git rev-parse --short=12`, which
+  git lengthens when 12 characters are ambiguous among the local clone's
+  objects, so a shallow CI checkout and a full clone could embed different
+  strings. It now takes the full sha and cuts it to exactly 12 characters.
+- **Archive timestamps and ownership.** `tar -czf` recorded the binary's
+  build-time mtime and the runner's uid/gid. Tarballs are now written with
+  `--sort=name --owner=0 --group=0 --numeric-owner
+  --mtime=@$SOURCE_DATE_EPOCH`, piped through `gzip -9n` so the gzip
+  header carries no name or timestamp. cargo-deb takes its archive mtimes
+  from `SOURCE_DATE_EPOCH`; without it the `.deb`'s entries carry a
+  build-time mtime and its sha256 differs. `SOURCE_DATE_EPOCH` is the tagged commit's
+  committer time.
+- **Host `strip`.** cargo-deb strips the binary with the host's binutils by
+  default, so the packaged binary depended on the runner image. The CLI
+  `.deb` is built with `--no-strip`; the release profile already strips
+  debug info (the difference was 176 bytes), and the packaged binary is now
+  the published raw binary byte for byte.
+- **Toolchain drift.** The workflow used `dtolnay/rust-toolchain@stable`,
+  which suggested stable but was silently overridden by
+  `rust-toolchain.toml`. Every job now runs `rustup toolchain install`,
+  which installs exactly the pinned toolchain and its components.
+
+Checked and found already deterministic: `build.rs` embeds no time,
+hostname or path (only the sha, `-dirty` and `unknown`); zig's lld emits no
+`.note.gnu.build-id`; `codegen-units = 1` and `lto = true` in the release
+profile and no incremental compilation in release builds; no C/C++ build
+dependencies in the CLI's graph; the checkout path and target directory do
+not reach the binary.
+
+### Rebuilding a release
+
+On x86_64 Linux with rustup, Python 3, git, GNU tar and gzip:
+
+```sh
+git clone https://github.com/RhizoNymph/gauntlet && cd gauntlet
+git checkout vX.Y.Z                   # a clean tree: edits embed "-dirty"
+rustup toolchain install              # the rust-toolchain.toml pin
+python3 -m pip install --target "$HOME/.local/zig-0.16.0" ziglang==0.16.0
+export PYTHONPATH="$HOME/.local/zig-0.16.0"
+cargo install cargo-zigbuild --version =0.23.4 --locked
+cargo install cargo-deb --version =3.7.0 --locked
+
+export CLI_TARGET=x86_64-unknown-linux-gnu GLIBC_FLOOR=2.31
+scripts/build-release-cli.sh
+scripts/package-release-cli.sh X.Y.Z out
+
+curl -LO https://github.com/RhizoNymph/gauntlet/releases/download/vX.Y.Z/SHA256SUMS
+(cd out && sha256sum --check --ignore-missing ../SHA256SUMS)
+```
+
+Use the tool versions from the tag's `.github/workflows/release.yml` `env`
+(and `GLIBC_FLOOR`) if they differ from the ones above. Build from a git
+checkout, not a source tarball: without git metadata the binary embeds
+`unknown` instead of the sha. `--ignore-missing` skips the viewer's
+entries, which are not reproducible.

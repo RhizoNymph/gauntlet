@@ -465,8 +465,15 @@ Features Index:
       partially failed release can be resumed via workflow_dispatch. The CLI
       (the binary deployed to nodes) is cross-linked with cargo-zigbuild
       against glibc 2.31, and a CI step enforces that floor. The viewer
-      stays a native build.
-    entry_points: [.github/workflows/release.yml, Cargo.toml, viewer/Cargo.toml]
+      stays a native build. The CLI's raw binary, tarball and .deb are
+      bit-for-bit reproducible (pinned toolchain and tools, cargo
+      trim-paths, SOURCE_DATE_EPOCH from the tagged commit); a `reproduce`
+      job rebuilds them on a fresh runner at different paths and blocks
+      publication unless they match, and the release carries a SHA256SUMS
+      of every asset. The build and packaging commands live in
+      scripts/build-release-cli.sh and scripts/package-release-cli.sh,
+      shared by CI and manual rebuilds.
+    entry_points: [.github/workflows/release.yml, scripts/build-release-cli.sh, scripts/package-release-cli.sh, rust-toolchain.toml, build.rs, Cargo.toml, viewer/Cargo.toml]
     depends_on: [viewer, reporting]
     doc: docs/features/release_ci.md
 ```
